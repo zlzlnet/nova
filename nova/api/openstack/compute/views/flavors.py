@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from nova.api.openstack import api_version_request
 from nova.api.openstack import common
 
 
@@ -20,8 +21,11 @@ class ViewBuilder(common.ViewBuilder):
 
     _collection_name = "flavors"
 
-    def basic(self, request, flavor):
-        return {
+    def basic(self, request, flavor, include_extra_specs=False):
+        # include_extra_specs is placeholder param which is not used in
+        # this method as basic() method is used by index() (GET /flavors)
+        # which does not return those keys in response.
+        flavor_dict = {
             "flavor": {
                 "id": flavor["flavorid"],
                 "name": flavor["name"],
@@ -31,19 +35,42 @@ class ViewBuilder(common.ViewBuilder):
             },
         }
 
-    def show(self, request, flavor):
+        if api_version_request.is_supported(request, '2.55'):
+            flavor_dict['flavor']['description'] = flavor.description
+
+        return flavor_dict
+
+    def show(self, request, flavor, include_extra_specs=False):
         flavor_dict = {
             "flavor": {
                 "id": flavor["flavorid"],
                 "name": flavor["name"],
                 "ram": flavor["memory_mb"],
                 "disk": flavor["root_gb"],
-                "vcpus": flavor.get("vcpus") or "",
+                "swap": flavor["swap"] or "",
+                "OS-FLV-EXT-DATA:ephemeral": flavor["ephemeral_gb"],
+                "OS-FLV-DISABLED:disabled": flavor["disabled"],
+                "vcpus": flavor["vcpus"],
+                "os-flavor-access:is_public": flavor['is_public'],
+                "rxtx_factor": flavor['rxtx_factor'] or "",
                 "links": self._get_links(request,
                                          flavor["flavorid"],
                                          self._collection_name),
             },
         }
+
+        if api_version_request.is_supported(request, '2.55'):
+            flavor_dict['flavor']['description'] = flavor.description
+
+        if include_extra_specs:
+            flavor_dict['flavor']['extra_specs'] = flavor.extra_specs
+
+        if api_version_request.is_supported(request, '2.75'):
+            flavor_dict['flavor']['swap'] = flavor["swap"] or 0
+
+        if api_version_request.is_supported(request, '2.102'):
+            del flavor_dict['flavor']['OS-FLV-DISABLED:disabled']
+            del flavor_dict['flavor']['rxtx_factor']
 
         return flavor_dict
 
@@ -52,12 +79,15 @@ class ViewBuilder(common.ViewBuilder):
         coll_name = self._collection_name
         return self._list_view(self.basic, request, flavors, coll_name)
 
-    def detail(self, request, flavors):
+    def detail(self, request, flavors, include_extra_specs=False):
         """Return the 'detail' view of flavors."""
         coll_name = self._collection_name + '/detail'
-        return self._list_view(self.show, request, flavors, coll_name)
+        return self._list_view(self.show, request, flavors, coll_name,
+                               include_extra_specs=include_extra_specs)
 
-    def _list_view(self, func, request, flavors, coll_name):
+    def _list_view(
+        self, func, request, flavors, coll_name, include_extra_specs=False
+    ):
         """Provide a view for a list of flavors.
 
         :param func: Function used to format the flavor data
@@ -65,29 +95,19 @@ class ViewBuilder(common.ViewBuilder):
         :param flavors: List of flavors in dictionary format
         :param coll_name: Name of collection, used to generate the next link
                           for a pagination query
+        :param include_extra_specs: If the flavor.extra_specs should be
+                                    included in the response dict.
 
         :returns: Flavor reply data in dictionary format
         """
-        flavor_list = [func(request, flavor)["flavor"] for flavor in flavors]
-        flavors_links = self._get_collection_links(request,
-                                                   flavors,
-                                                   coll_name,
-                                                   "flavorid")
-        flavors_dict = dict(flavors=flavor_list)
+        flavor_list = [
+            func(request, flavor, include_extra_specs)["flavor"]
+            for flavor in flavors]
+        flavors_links = self._get_collection_links(
+            request, flavors, coll_name, "flavorid")
+        flavors_dict = {"flavors": flavor_list}
 
         if flavors_links:
             flavors_dict["flavors_links"] = flavors_links
 
         return flavors_dict
-
-
-class V3ViewBuilder(ViewBuilder):
-    def show(self, request, flavor):
-        flavor_dict = super(V3ViewBuilder, self).show(request, flavor)
-        flavor_dict['flavor'].update({
-            "swap": flavor["swap"] or "",
-            "OS-FLV-EXT-DATA:ephemeral": flavor["ephemeral_gb"],
-            "OS-FLV-DISABLED:disabled": flavor["disabled"],
-            "vcpus": flavor["vcpus"],
-        })
-        return flavor_dict

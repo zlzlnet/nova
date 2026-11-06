@@ -17,57 +17,67 @@
 Tests dealing with HTTP rate-limiting.
 """
 
-import httplib
-import StringIO
+from http import client as httplib
+from io import StringIO
+from unittest import mock
 
-import mock
+from oslo_limit import fixture as limit_fixture
 from oslo_serialization import jsonutils
-import six
-from six.moves import range
-import webob
+from oslo_utils import encodeutils
 
-from nova.api.openstack.compute import limits
-from nova.api.openstack.compute.plugins.v3 import limits as limits_v21
+from nova.api.openstack.compute import limits as limits_v21
 from nova.api.openstack.compute import views
 from nova.api.openstack import wsgi
 import nova.context
+from nova import exception
+from nova.limit import local as local_limit
+from nova.limit import placement as placement_limit
+from nova import objects
+from nova.policies import limits as l_policies
 from nova import test
 from nova.tests.unit.api.openstack import fakes
 from nova.tests.unit import matchers
-from nova import utils
 
 
-TEST_LIMITS = [
-    limits.Limit("GET", "/delayed", "^/delayed", 1,
-                 utils.TIME_UNITS['MINUTE']),
-    limits.Limit("POST", "*", ".*", 7, utils.TIME_UNITS['MINUTE']),
-    limits.Limit("POST", "/servers", "^/servers", 3,
-                 utils.TIME_UNITS['MINUTE']),
-    limits.Limit("PUT", "*", "", 10, utils.TIME_UNITS['MINUTE']),
-    limits.Limit("PUT", "/servers", "^/servers", 5,
-                 utils.TIME_UNITS['MINUTE']),
-]
-NS = {
-    'atom': 'http://www.w3.org/2005/Atom',
-    'ns': 'http://docs.openstack.org/common/api/v1.0'
-}
+def fake_get_project_quotas(context, project_id, usages=True):
+    absolute_limits = {
+        'cores': -1,
+        'floating_ips': 10,
+        'injected_files': -1,
+        'injected_file_content_bytes': -1,
+        'injected_file_path_bytes': -1,
+        'instances': 5,
+        'key_pairs': -1,
+        'metadata_items': -1,
+        'ram': 512,
+        'server_groups': 10,
+        'server_group_members': -1,
+        'security_groups': 10,
+        'security_group_rules': 20,
+    }
+
+    return {
+        k: {'limit': v, 'in_use': max(-1, v // 2)}
+        for k, v in absolute_limits.items()
+    }
 
 
 class BaseLimitTestSuite(test.NoDBTestCase):
     """Base test suite which provides relevant stubs and time abstraction."""
 
     def setUp(self):
-        super(BaseLimitTestSuite, self).setUp()
+        super().setUp()
         self.time = 0.0
-        self.stubs.Set(limits.Limit, "_get_time", self._get_time)
-        self.absolute_limits = {}
 
-        def stub_get_project_quotas(context, project_id, usages=True):
-            return {k: dict(limit=v)
-                    for k, v in self.absolute_limits.items()}
-
-        self.stubs.Set(nova.quota.QUOTAS, "get_project_quotas",
-                       stub_get_project_quotas)
+        patcher_get_project_quotas = mock.patch.object(
+            nova.quota.QUOTAS,
+            "get_project_quotas",
+            side_effect=fake_get_project_quotas)
+        self.mock_get_project_quotas = patcher_get_project_quotas.start()
+        self.addCleanup(patcher_get_project_quotas.stop)
+        patcher = self.mock_can = mock.patch('nova.context.RequestContext.can')
+        self.mock_can = patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _get_time(self):
         """Return the "time" according to this test suite."""
@@ -85,44 +95,22 @@ class LimitsControllerTestV21(BaseLimitTestSuite):
         self.ctrler = self.limits_controller()
 
     def _get_index_request(self, accept_header="application/json",
-                           tenant_id=None):
+                           tenant_id=None, user_id='testuser',
+                           project_id='testproject'):
         """Helper to set routing arguments."""
-        request = webob.Request.blank("/")
+        request = fakes.HTTPRequest.blank('', version='2.1')
         if tenant_id:
-            request = webob.Request.blank("/?tenant_id=%s" % tenant_id)
+            request = fakes.HTTPRequest.blank('/?tenant_id=%s' % tenant_id,
+                                              version='2.1')
 
         request.accept = accept_header
         request.environ["wsgiorg.routing_args"] = (None, {
             "action": "index",
             "controller": "",
         })
-        context = nova.context.RequestContext('testuser', 'testproject')
+        context = nova.context.RequestContext(user_id, project_id)
         request.environ["nova.context"] = context
         return request
-
-    def _populate_limits(self, request):
-        """Put limit info into a request."""
-        _limits = [
-            limits.Limit("GET", "*", ".*", 10, 60).display(),
-            limits.Limit("POST", "*", ".*", 5, 60 * 60).display(),
-            limits.Limit("GET", "changes-since*", "changes-since",
-                         5, 60).display(),
-        ]
-        request.environ["nova.limits"] = _limits
-        return request
-
-    def test_empty_index_json(self):
-        # Test getting empty limit details in JSON.
-        request = self._get_index_request()
-        response = request.get_response(self.controller)
-        expected = {
-            "limits": {
-                "rate": [],
-                "absolute": {},
-            },
-        }
-        body = jsonutils.loads(response.body)
-        self.assertEqual(expected, body)
 
     def test_index_json(self):
         self._test_index_json()
@@ -137,588 +125,108 @@ class LimitsControllerTestV21(BaseLimitTestSuite):
         if tenant_id is None:
             tenant_id = context.project_id
 
-        request = self._populate_limits(request)
-        self.absolute_limits = {
-            'ram': 512,
-            'instances': 5,
-            'cores': 21,
-            'key_pairs': 10,
-            'floating_ips': 10,
-            'security_groups': 10,
-            'security_group_rules': 20,
-        }
         expected = {
             "limits": {
-                "rate": [
-                    {
-                        "regex": ".*",
-                        "uri": "*",
-                        "limit": [
-                            {
-                                "verb": "GET",
-                                "next-available": "1970-01-01T00:00:00Z",
-                                "unit": "MINUTE",
-                                "value": 10,
-                                "remaining": 10,
-                            },
-                            {
-                                "verb": "POST",
-                                "next-available": "1970-01-01T00:00:00Z",
-                                "unit": "HOUR",
-                                "value": 5,
-                                "remaining": 5,
-                            },
-                        ],
-                    },
-                    {
-                        "regex": "changes-since",
-                        "uri": "changes-since*",
-                        "limit": [
-                            {
-                                "verb": "GET",
-                                "next-available": "1970-01-01T00:00:00Z",
-                                "unit": "MINUTE",
-                                "value": 5,
-                                "remaining": 5,
-                            },
-                        ],
-                    },
-
-                ],
                 "absolute": {
-                    "maxTotalRAMSize": 512,
-                    "maxTotalInstances": 5,
-                    "maxTotalCores": 21,
-                    "maxTotalKeypairs": 10,
-                    "maxTotalFloatingIps": 10,
+                    "maxImageMeta": -1,
+                    "maxPersonality": -1,
+                    "maxPersonalitySize": -1,
                     "maxSecurityGroups": 10,
                     "maxSecurityGroupRules": 20,
-                    },
+                    "maxServerGroups": 10,
+                    "maxServerGroupMembers": -1,
+                    "maxServerMeta": -1,
+                    "maxTotalCores": -1,
+                    "maxTotalFloatingIps": 10,
+                    "maxTotalInstances": 5,
+                    "maxTotalKeypairs": -1,
+                    "maxTotalRAMSize": 512,
+                    "totalCoresUsed": -1,
+                    "totalFloatingIpsUsed": 5,
+                    "totalInstancesUsed": 2,
+                    "totalRAMUsed": 256,
+                    "totalSecurityGroupsUsed": 5,
+                    "totalServerGroupsUsed": 5,
+                },
+                "rate": [],
             },
         }
 
-        def _get_project_quotas(context, project_id, usages=True):
-            return {k: dict(limit=v) for k, v in self.absolute_limits.items()}
-
-        with mock.patch('nova.quota.QUOTAS.get_project_quotas') as \
-                get_project_quotas:
-            get_project_quotas.side_effect = _get_project_quotas
-
-            response = request.get_response(self.controller)
-
-            body = jsonutils.loads(response.body)
-            self.assertEqual(expected, body)
-            get_project_quotas.assert_called_once_with(context, tenant_id,
-                                                       usages=False)
-
-
-class LimitsControllerTestV2(LimitsControllerTestV21):
-    limits_controller = limits.LimitsController
-
-    def _populate_limits_diff_regex(self, request):
-        """Put limit info into a request."""
-        _limits = [
-            limits.Limit("GET", "*", ".*", 10, 60).display(),
-            limits.Limit("GET", "*", "*.*", 10, 60).display(),
-        ]
-        request.environ["nova.limits"] = _limits
-        return request
-
-    def test_index_diff_regex(self):
-        # Test getting limit details in JSON.
-        request = self._get_index_request()
-        request = self._populate_limits_diff_regex(request)
         response = request.get_response(self.controller)
-        expected = {
-            "limits": {
-                "rate": [
-                    {
-                        "regex": ".*",
-                        "uri": "*",
-                        "limit": [
-                            {
-                                "verb": "GET",
-                                "next-available": "1970-01-01T00:00:00Z",
-                                "unit": "MINUTE",
-                                "value": 10,
-                                "remaining": 10,
-                            },
-                        ],
-                    },
-                    {
-                        "regex": "*.*",
-                        "uri": "*",
-                        "limit": [
-                            {
-                                "verb": "GET",
-                                "next-available": "1970-01-01T00:00:00Z",
-                                "unit": "MINUTE",
-                                "value": 10,
-                                "remaining": 10,
-                            },
-                        ],
-                    },
 
-                ],
-                "absolute": {},
-            },
-        }
         body = jsonutils.loads(response.body)
         self.assertEqual(expected, body)
-
-    def _test_index_absolute_limits_json(self, expected):
-        request = self._get_index_request()
-        response = request.get_response(self.controller)
-        body = jsonutils.loads(response.body)
-        self.assertEqual(expected, body['limits']['absolute'])
-
-    def test_index_ignores_extra_absolute_limits_json(self):
-        self.absolute_limits = {'unknown_limit': 9001}
-        self._test_index_absolute_limits_json({})
-
-    def test_index_absolute_ram_json(self):
-        self.absolute_limits = {'ram': 1024}
-        self._test_index_absolute_limits_json({'maxTotalRAMSize': 1024})
-
-    def test_index_absolute_cores_json(self):
-        self.absolute_limits = {'cores': 17}
-        self._test_index_absolute_limits_json({'maxTotalCores': 17})
-
-    def test_index_absolute_instances_json(self):
-        self.absolute_limits = {'instances': 19}
-        self._test_index_absolute_limits_json({'maxTotalInstances': 19})
-
-    def test_index_absolute_metadata_json(self):
-        # NOTE: both server metadata and image metadata are overloaded
-        # into metadata_items
-        self.absolute_limits = {'metadata_items': 23}
-        expected = {
-            'maxServerMeta': 23,
-            'maxImageMeta': 23,
-        }
-        self._test_index_absolute_limits_json(expected)
-
-    def test_index_absolute_injected_files(self):
-        self.absolute_limits = {
-            'injected_files': 17,
-            'injected_file_content_bytes': 86753,
-        }
-        expected = {
-            'maxPersonality': 17,
-            'maxPersonalitySize': 86753,
-        }
-        self._test_index_absolute_limits_json(expected)
-
-    def test_index_absolute_security_groups(self):
-        self.absolute_limits = {
-            'security_groups': 8,
-            'security_group_rules': 16,
-        }
-        expected = {
-            'maxSecurityGroups': 8,
-            'maxSecurityGroupRules': 16,
-        }
-        self._test_index_absolute_limits_json(expected)
-
-    def test_limit_create(self):
-        req = fakes.HTTPRequest.blank('/v2/fake/limits')
-        self.assertRaises(webob.exc.HTTPNotImplemented, self.ctrler.create,
-                          req, {})
-
-    def test_limit_delete(self):
-        req = fakes.HTTPRequest.blank('/v2/fake/limits')
-        self.assertRaises(webob.exc.HTTPNotImplemented, self.ctrler.delete,
-                          req, 1)
-
-    def test_limit_show(self):
-        req = fakes.HTTPRequest.blank('/v2/fake/limits')
-        self.assertRaises(webob.exc.HTTPNotImplemented, self.ctrler.show,
-                          req, 1)
-
-    def test_limit_update(self):
-        req = fakes.HTTPRequest.blank('/v2/fake/limits')
-        self.assertRaises(webob.exc.HTTPNotImplemented, self.ctrler.update,
-                          req, 1, {})
-
-
-class MockLimiter(limits.Limiter):
-    pass
-
-
-class LimitMiddlewareTest(BaseLimitTestSuite):
-    """Tests for the `limits.RateLimitingMiddleware` class."""
-
-    @webob.dec.wsgify
-    def _empty_app(self, request):
-        """Do-nothing WSGI app."""
-        pass
-
-    def setUp(self):
-        """Prepare middleware for use through fake WSGI app."""
-        super(LimitMiddlewareTest, self).setUp()
-        _limits = '(GET, *, .*, 1, MINUTE)'
-        self.app = limits.RateLimitingMiddleware(self._empty_app, _limits,
-                                                 "%s.MockLimiter" %
-                                                 self.__class__.__module__)
-
-    def test_limit_class(self):
-        # Test that middleware selected correct limiter class.
-        self.assertIsInstance(self.app._limiter, MockLimiter)
-
-    def test_good_request(self):
-        # Test successful GET request through middleware.
-        request = webob.Request.blank("/")
-        response = request.get_response(self.app)
-        self.assertEqual(200, response.status_int)
-
-    def test_limited_request_json(self):
-        # Test a rate-limited (429) GET request through middleware.
-        request = webob.Request.blank("/")
-        response = request.get_response(self.app)
-        self.assertEqual(200, response.status_int)
-
-        request = webob.Request.blank("/")
-        response = request.get_response(self.app)
-        self.assertEqual(response.status_int, 429)
-
-        self.assertIn('Retry-After', response.headers)
-        retry_after = int(response.headers['Retry-After'])
-        self.assertAlmostEqual(retry_after, 60, 1)
-
-        body = jsonutils.loads(response.body)
-        expected = "Only 1 GET request(s) can be made to * every minute."
-        value = body["overLimit"]["details"].strip()
-        self.assertEqual(value, expected)
-
-        self.assertIn("retryAfter", body["overLimit"])
-        retryAfter = body["overLimit"]["retryAfter"]
-        self.assertEqual(retryAfter, "60")
-
-
-class LimitTest(BaseLimitTestSuite):
-    """Tests for the `limits.Limit` class."""
-
-    def test_GET_no_delay(self):
-        # Test a limit handles 1 GET per second.
-        limit = limits.Limit("GET", "*", ".*", 1, 1)
-        delay = limit("GET", "/anything")
-        self.assertIsNone(delay)
-        self.assertEqual(0, limit.next_request)
-        self.assertEqual(0, limit.last_request)
-
-    def test_GET_delay(self):
-        # Test two calls to 1 GET per second limit.
-        limit = limits.Limit("GET", "*", ".*", 1, 1)
-        delay = limit("GET", "/anything")
-        self.assertIsNone(delay)
-
-        delay = limit("GET", "/anything")
-        self.assertEqual(1, delay)
-        self.assertEqual(1, limit.next_request)
-        self.assertEqual(0, limit.last_request)
-
-        self.time += 4
-
-        delay = limit("GET", "/anything")
-        self.assertIsNone(delay)
-        self.assertEqual(4, limit.next_request)
-        self.assertEqual(4, limit.last_request)
-
-
-class ParseLimitsTest(BaseLimitTestSuite):
-    """Tests for the default limits parser in the in-memory
-    `limits.Limiter` class.
-    """
-
-    def test_invalid(self):
-        # Test that parse_limits() handles invalid input correctly.
-        self.assertRaises(ValueError, limits.Limiter.parse_limits,
-                          ';;;;;')
-
-    def test_bad_rule(self):
-        # Test that parse_limits() handles bad rules correctly.
-        self.assertRaises(ValueError, limits.Limiter.parse_limits,
-                          'GET, *, .*, 20, minute')
-
-    def test_missing_arg(self):
-        # Test that parse_limits() handles missing args correctly.
-        self.assertRaises(ValueError, limits.Limiter.parse_limits,
-                          '(GET, *, .*, 20)')
-
-    def test_bad_value(self):
-        # Test that parse_limits() handles bad values correctly.
-        self.assertRaises(ValueError, limits.Limiter.parse_limits,
-                          '(GET, *, .*, foo, minute)')
-
-    def test_bad_unit(self):
-        # Test that parse_limits() handles bad units correctly.
-        self.assertRaises(ValueError, limits.Limiter.parse_limits,
-                          '(GET, *, .*, 20, lightyears)')
-
-    def test_multiple_rules(self):
-        # Test that parse_limits() handles multiple rules correctly.
-        try:
-            l = limits.Limiter.parse_limits('(get, *, .*, 20, minute);'
-                                            '(PUT, /foo*, /foo.*, 10, hour);'
-                                            '(POST, /bar*, /bar.*, 5, second);'
-                                            '(Say, /derp*, /derp.*, 1, day)')
-        except ValueError as e:
-            assert False, six.text_type(e)
-
-        # Make sure the number of returned limits are correct
-        self.assertEqual(len(l), 4)
-
-        # Check all the verbs...
-        expected = ['GET', 'PUT', 'POST', 'SAY']
-        self.assertEqual([t.verb for t in l], expected)
-
-        # ...the URIs...
-        expected = ['*', '/foo*', '/bar*', '/derp*']
-        self.assertEqual([t.uri for t in l], expected)
-
-        # ...the regexes...
-        expected = ['.*', '/foo.*', '/bar.*', '/derp.*']
-        self.assertEqual([t.regex for t in l], expected)
-
-        # ...the values...
-        expected = [20, 10, 5, 1]
-        self.assertEqual([t.value for t in l], expected)
-
-        # ...and the units...
-        expected = [utils.TIME_UNITS['MINUTE'], utils.TIME_UNITS['HOUR'],
-                    utils.TIME_UNITS['SECOND'], utils.TIME_UNITS['DAY']]
-        self.assertEqual([t.unit for t in l], expected)
-
-
-class LimiterTest(BaseLimitTestSuite):
-    """Tests for the in-memory `limits.Limiter` class."""
-
-    def setUp(self):
-        """Run before each test."""
-        super(LimiterTest, self).setUp()
-        userlimits = {'limits.user3': '',
-                      'limits.user0': '(get, *, .*, 4, minute);'
-                                      '(put, *, .*, 2, minute)'}
-        self.limiter = limits.Limiter(TEST_LIMITS, **userlimits)
-
-    def _check(self, num, verb, url, username=None):
-        """Check and yield results from checks."""
-        for x in range(num):
-            yield self.limiter.check_for_delay(verb, url, username)[0]
-
-    def _check_sum(self, num, verb, url, username=None):
-        """Check and sum results from checks."""
-        results = self._check(num, verb, url, username)
-        return sum(item for item in results if item)
-
-    def test_no_delay_GET(self):
-        """Simple test to ensure no delay on a single call for a limit verb we
-        didn"t set.
-        """
-        delay = self.limiter.check_for_delay("GET", "/anything")
-        self.assertEqual(delay, (None, None))
-
-    def test_no_delay_PUT(self):
-        # Simple test to ensure no delay on a single call for a known limit.
-        delay = self.limiter.check_for_delay("PUT", "/anything")
-        self.assertEqual(delay, (None, None))
-
-    def test_delay_PUT(self):
-        """Ensure the 11th PUT will result in a delay of 6.0 seconds until
-        the next request will be granced.
-        """
-        expected = [None] * 10 + [6.0]
-        results = list(self._check(11, "PUT", "/anything"))
-
-        self.assertEqual(expected, results)
-
-    def test_delay_POST(self):
-        """Ensure the 8th POST will result in a delay of 6.0 seconds until
-        the next request will be granced.
-        """
-        expected = [None] * 7
-        results = list(self._check(7, "POST", "/anything"))
-        self.assertEqual(expected, results)
-
-        expected = 60.0 / 7.0
-        results = self._check_sum(1, "POST", "/anything")
-        self.assertAlmostEqual(expected, results, 8)
-
-    def test_delay_GET(self):
-        # Ensure the 11th GET will result in NO delay.
-        expected = [None] * 11
-        results = list(self._check(11, "GET", "/anything"))
-        self.assertEqual(expected, results)
-
-        expected = [None] * 4 + [15.0]
-        results = list(self._check(5, "GET", "/foo", "user0"))
-        self.assertEqual(expected, results)
-
-    def test_delay_PUT_servers(self):
-        """Ensure PUT on /servers limits at 5 requests, and PUT elsewhere is
-        still OK after 5 requests...but then after 11 total requests, PUT
-        limiting kicks in.
-        """
-        # First 6 requests on PUT /servers
-        expected = [None] * 5 + [12.0]
-        results = list(self._check(6, "PUT", "/servers"))
-        self.assertEqual(expected, results)
-
-        # Next 5 request on PUT /anything
-        expected = [None] * 4 + [6.0]
-        results = list(self._check(5, "PUT", "/anything"))
-        self.assertEqual(expected, results)
-
-    def test_delay_PUT_wait(self):
-        """Ensure after hitting the limit and then waiting for the correct
-        amount of time, the limit will be lifted.
-        """
-        expected = [None] * 10 + [6.0]
-        results = list(self._check(11, "PUT", "/anything"))
-        self.assertEqual(expected, results)
-
-        # Advance time
-        self.time += 6.0
-
-        expected = [None, 6.0]
-        results = list(self._check(2, "PUT", "/anything"))
-        self.assertEqual(expected, results)
-
-    def test_multiple_delays(self):
-        # Ensure multiple requests still get a delay.
-        expected = [None] * 10 + [6.0] * 10
-        results = list(self._check(20, "PUT", "/anything"))
-        self.assertEqual(expected, results)
-
-        self.time += 1.0
-
-        expected = [5.0] * 10
-        results = list(self._check(10, "PUT", "/anything"))
-        self.assertEqual(expected, results)
-
-        expected = [None] * 2 + [30.0] * 8
-        results = list(self._check(10, "PUT", "/anything", "user0"))
-        self.assertEqual(expected, results)
-
-    def test_user_limit(self):
-        # Test user-specific limits.
-        self.assertEqual(self.limiter.levels['user3'], [])
-        self.assertEqual(len(self.limiter.levels['user0']), 2)
-
-    def test_multiple_users(self):
-        # Tests involving multiple users.
-        # User0
-        expected = [None] * 2 + [30.0] * 8
-        results = list(self._check(10, "PUT", "/anything", "user0"))
-        self.assertEqual(expected, results)
-
-        # User1
-        expected = [None] * 10 + [6.0] * 10
-        results = list(self._check(20, "PUT", "/anything", "user1"))
-        self.assertEqual(expected, results)
-
-        # User2
-        expected = [None] * 10 + [6.0] * 5
-        results = list(self._check(15, "PUT", "/anything", "user2"))
-        self.assertEqual(expected, results)
-
-        # User3
-        expected = [None] * 20
-        results = list(self._check(20, "PUT", "/anything", "user3"))
-        self.assertEqual(expected, results)
-
-        self.time += 1.0
-
-        # User1 again
-        expected = [5.0] * 10
-        results = list(self._check(10, "PUT", "/anything", "user1"))
-        self.assertEqual(expected, results)
-
-        self.time += 1.0
-
-        # User1 again
-        expected = [4.0] * 5
-        results = list(self._check(5, "PUT", "/anything", "user2"))
-        self.assertEqual(expected, results)
-
-        # User0 again
-        expected = [28.0]
-        results = list(self._check(1, "PUT", "/anything", "user0"))
-        self.assertEqual(expected, results)
-
-        self.time += 28.0
-
-        expected = [None, 30.0]
-        results = list(self._check(2, "PUT", "/anything", "user0"))
-        self.assertEqual(expected, results)
-
-
-class WsgiLimiterTest(BaseLimitTestSuite):
-    """Tests for `limits.WsgiLimiter` class."""
-
-    def setUp(self):
-        """Run before each test."""
-        super(WsgiLimiterTest, self).setUp()
-        self.app = limits.WsgiLimiter(TEST_LIMITS)
-
-    def _request_data(self, verb, path):
-        """Get data describing a limit request verb/path."""
-        return jsonutils.dumps({"verb": verb, "path": path})
-
-    def _request(self, verb, url, username=None):
-        """Make sure that POSTing to the given url causes the given username
-        to perform the given action.  Make the internal rate limiter return
-        delay and make sure that the WSGI app returns the correct response.
-        """
-        if username:
-            request = webob.Request.blank("/%s" % username)
-        else:
-            request = webob.Request.blank("/")
-
-        request.method = "POST"
-        request.body = self._request_data(verb, url)
-        response = request.get_response(self.app)
-
-        if "X-Wait-Seconds" in response.headers:
-            self.assertEqual(response.status_int, 403)
-            return response.headers["X-Wait-Seconds"]
-
-        self.assertEqual(response.status_int, 204)
-
-    def test_invalid_methods(self):
-        # Only POSTs should work.
-        for method in ["GET", "PUT", "DELETE", "HEAD", "OPTIONS"]:
-            request = webob.Request.blank("/", method=method)
-            response = request.get_response(self.app)
-            self.assertEqual(response.status_int, 405)
-
-    def test_good_url(self):
-        delay = self._request("GET", "/something")
-        self.assertIsNone(delay)
-
-    def test_escaping(self):
-        delay = self._request("GET", "/something/jump%20up")
-        self.assertIsNone(delay)
-
-    def test_response_to_delays(self):
-        delay = self._request("GET", "/delayed")
-        self.assertIsNone(delay)
-
-        delay = self._request("GET", "/delayed")
-        self.assertEqual(delay, '60.00')
-
-    def test_response_to_delays_usernames(self):
-        delay = self._request("GET", "/delayed", "user1")
-        self.assertIsNone(delay)
-
-        delay = self._request("GET", "/delayed", "user2")
-        self.assertIsNone(delay)
-
-        delay = self._request("GET", "/delayed", "user1")
-        self.assertEqual(delay, '60.00')
-
-        delay = self._request("GET", "/delayed", "user2")
-        self.assertEqual(delay, '60.00')
+        self.mock_get_project_quotas.assert_called_once_with(
+            context, tenant_id, usages=True)
+
+    def test_admin_can_fetch_limits_for_a_given_tenant_id(self):
+        project_id = "123456"
+        user_id = "A1234"
+        tenant_id = 'abcd'
+        fake_req = self._get_index_request(tenant_id=tenant_id,
+                                           user_id=user_id,
+                                           project_id=project_id)
+        context = fake_req.environ["nova.context"]
+        self.mock_get_project_quotas.side_effect = None
+        self.mock_get_project_quotas.return_value = {}
+
+        fake_req.get_response(self.controller)
+        self.assertEqual(2, self.mock_can.call_count)
+        self.mock_can.assert_called_with(
+            l_policies.OTHER_PROJECT_LIMIT_POLICY_NAME)
+        self.mock_get_project_quotas.assert_called_once_with(
+            context, tenant_id, usages=True)
+
+    def _test_admin_can_fetch_used_limits_for_own_project(self, req_get):
+        project_id = "123456"
+        if 'tenant_id' in req_get:
+            project_id = req_get['tenant_id']
+
+        user_id = "A1234"
+        fake_req = self._get_index_request(user_id=user_id,
+                                           project_id=project_id)
+        context = fake_req.environ["nova.context"]
+
+        self.mock_get_project_quotas.side_effect = None
+        self.mock_get_project_quotas.return_value = {}
+
+        fake_req.get_response(self.controller)
+        self.mock_get_project_quotas.assert_called_once_with(
+            context, project_id, usages=True)
+
+    def test_admin_can_fetch_used_limits_for_own_project(self):
+        req_get = {}
+        self._test_admin_can_fetch_used_limits_for_own_project(req_get)
+
+    def test_admin_can_fetch_used_limits_for_dummy_only(self):
+        # for back compatible we allow additional param to be send to req.GET
+        # it can be removed when we add restrictions to query param later
+        req_get = {'dummy': 'dummy'}
+        self._test_admin_can_fetch_used_limits_for_own_project(req_get)
+
+    def test_admin_can_fetch_used_limits_with_positive_int(self):
+        req_get = {'tenant_id': 123}
+        self._test_admin_can_fetch_used_limits_for_own_project(req_get)
+
+    def test_admin_can_fetch_used_limits_with_negative_int(self):
+        req_get = {'tenant_id': -1}
+        self._test_admin_can_fetch_used_limits_for_own_project(req_get)
+
+    def test_admin_can_fetch_used_limits_with_unknown_param(self):
+        req_get = {'tenant_id': '123', 'unknown': 'unknown'}
+        self._test_admin_can_fetch_used_limits_for_own_project(req_get)
+
+    def test_used_limits_fetched_for_context_project_id(self):
+        project_id = "123456"
+        fake_req = self._get_index_request(project_id=project_id)
+        context = fake_req.environ["nova.context"]
+        self.mock_get_project_quotas.side_effect = None
+        self.mock_get_project_quotas.return_value = {}
+
+        fake_req.get_response(self.controller)
+
+        self.mock_get_project_quotas.assert_called_once_with(
+            context, project_id, usages=True)
 
 
 class FakeHttplibSocket(object):
@@ -726,7 +234,7 @@ class FakeHttplibSocket(object):
 
     def __init__(self, response_string):
         """Initialize new `FakeHttplibSocket`."""
-        self._buffer = StringIO.StringIO(response_string)
+        self._buffer = StringIO(response_string)
 
     def makefile(self, _mode, _other):
         """Returns the socket's internal buffer."""
@@ -749,11 +257,11 @@ class FakeHttplibConnection(object):
         if not headers:
             headers = {}
 
-        req = webob.Request.blank(path)
+        req = fakes.HTTPRequest.blank(path)
         req.method = method
         req.headers = headers
         req.host = self.host
-        req.body = body
+        req.body = encodeutils.safe_encode(body)
 
         resp = str(req.get_response(self.app))
         resp = "HTTP/1.0 %s" % resp
@@ -766,134 +274,253 @@ class FakeHttplibConnection(object):
         return self.http_response
 
 
-def wire_HTTPConnection_to_WSGI(host, app):
-    """Monkeypatches HTTPConnection so that if you try to connect to host, you
-    are instead routed straight to the given WSGI app.
-
-    After calling this method, when any code calls
-
-    httplib.HTTPConnection(host)
-
-    the connection object will be a fake.  Its requests will be sent directly
-    to the given WSGI app rather than through a socket.
-
-    Code connecting to hosts other than host will not be affected.
-
-    This method may be called multiple times to map different hosts to
-    different apps.
-
-    This method returns the original HTTPConnection object, so that the caller
-    can restore the default HTTPConnection interface (for all hosts).
-    """
-    class HTTPConnectionDecorator(object):
-        """Wraps the real HTTPConnection class so that when you instantiate
-        the class you might instead get a fake instance.
-        """
-
-        def __init__(self, wrapped):
-            self.wrapped = wrapped
-
-        def __call__(self, connection_host, *args, **kwargs):
-            if connection_host == host:
-                return FakeHttplibConnection(app, host)
-            else:
-                return self.wrapped(connection_host, *args, **kwargs)
-
-    oldHTTPConnection = httplib.HTTPConnection
-    httplib.HTTPConnection = HTTPConnectionDecorator(httplib.HTTPConnection)
-    return oldHTTPConnection
-
-
-class WsgiLimiterProxyTest(BaseLimitTestSuite):
-    """Tests for the `limits.WsgiLimiterProxy` class."""
-
-    def setUp(self):
-        """Do some nifty HTTP/WSGI magic which allows for WSGI to be called
-        directly by something like the `httplib` library.
-        """
-        super(WsgiLimiterProxyTest, self).setUp()
-        self.app = limits.WsgiLimiter(TEST_LIMITS)
-        self.oldHTTPConnection = (
-            wire_HTTPConnection_to_WSGI("169.254.0.1:80", self.app))
-        self.proxy = limits.WsgiLimiterProxy("169.254.0.1:80")
-
-    def test_200(self):
-        # Successful request test.
-        delay = self.proxy.check_for_delay("GET", "/anything")
-        self.assertEqual(delay, (None, None))
-
-    def test_403(self):
-        # Forbidden request test.
-        delay = self.proxy.check_for_delay("GET", "/delayed")
-        self.assertEqual(delay, (None, None))
-
-        delay, error = self.proxy.check_for_delay("GET", "/delayed")
-        error = error.strip()
-
-        expected = ("60.00", "403 Forbidden\n\nOnly 1 GET request(s) can be "
-                    "made to /delayed every minute.")
-
-        self.assertEqual((delay, error), expected)
-
-    def tearDown(self):
-        # restore original HTTPConnection object
-        httplib.HTTPConnection = self.oldHTTPConnection
-        super(WsgiLimiterProxyTest, self).tearDown()
-
-
 class LimitsViewBuilderTest(test.NoDBTestCase):
     def setUp(self):
         super(LimitsViewBuilderTest, self).setUp()
         self.view_builder = views.limits.ViewBuilder()
-        self.rate_limits = [{"URI": "*",
-                             "regex": ".*",
-                             "value": 10,
-                             "verb": "POST",
-                             "remaining": 2,
-                             "unit": "MINUTE",
-                             "resetTime": 1311272226},
-                            {"URI": "*/servers",
-                             "regex": "^/servers",
-                             "value": 50,
-                             "verb": "POST",
-                             "remaining": 10,
-                             "unit": "DAY",
-                             "resetTime": 1311272226}]
-        self.absolute_limits = {"metadata_items": 1,
-                                "injected_files": 5,
-                                "injected_file_content_bytes": 5}
+        self.req = fakes.HTTPRequest.blank('/?tenant_id=None')
 
     def test_build_limits(self):
-        expected_limits = {"limits": {
-                "rate": [{
-                      "uri": "*",
-                      "regex": ".*",
-                      "limit": [{"value": 10,
-                                 "verb": "POST",
-                                 "remaining": 2,
-                                 "unit": "MINUTE",
-                                 "next-available": "2011-07-21T18:17:06Z"}]},
-                   {"uri": "*/servers",
-                    "regex": "^/servers",
-                    "limit": [{"value": 50,
-                               "verb": "POST",
-                               "remaining": 10,
-                               "unit": "DAY",
-                               "next-available": "2011-07-21T18:17:06Z"}]}],
-                "absolute": {"maxServerMeta": 1,
-                             "maxImageMeta": 1,
-                             "maxPersonality": 5,
-                             "maxPersonalitySize": 5}}}
+        quotas = {
+            "metadata_items": {'limit': 1, 'in_use': 1},
+            "injected_files": {'limit': 5, 'in_use': 1},
+            "injected_file_content_bytes": {'limit': 5, 'in_use': 1},
+        }
+        expected_limits = {
+            "limits": {
+                "rate": [],
+                "absolute": {
+                    "maxServerMeta": 1,
+                    "maxImageMeta": 1,
+                    "maxPersonality": 5,
+                    "maxPersonalitySize": 5,
+                }
+            },
+        }
 
-        output = self.view_builder.build(self.rate_limits,
-                                         self.absolute_limits)
+        output = self.view_builder.build(self.req, quotas)
         self.assertThat(output, matchers.DictMatches(expected_limits))
 
     def test_build_limits_empty_limits(self):
-        expected_limits = {"limits": {"rate": [],
-                           "absolute": {}}}
+        quotas = {}
+        expected_limits = {"limits": {"rate": [], "absolute": {}}}
 
-        abs_limits = {}
-        rate_limits = []
-        output = self.view_builder.build(rate_limits, abs_limits)
+        output = self.view_builder.build(self.req, quotas)
         self.assertThat(output, matchers.DictMatches(expected_limits))
+
+
+class LimitsControllerTestV236(BaseLimitTestSuite):
+
+    def setUp(self):
+        super(LimitsControllerTestV236, self).setUp()
+        self.controller = limits_v21.LimitsController()
+        self.req = fakes.HTTPRequest.blank("/?tenant_id=faketenant",
+                                           version='2.36')
+
+    def test_index_filtered(self):
+        response = self.controller.index(self.req)
+        expected_response = {
+            "limits": {
+                "rate": [],
+                "absolute": {
+                    "maxImageMeta": -1,
+                    "maxPersonality": -1,
+                    "maxPersonalitySize": -1,
+                    "maxServerGroups": 10,
+                    "maxServerGroupMembers": -1,
+                    "maxServerMeta": -1,
+                    "maxTotalCores": -1,
+                    "maxTotalInstances": 5,
+                    "maxTotalKeypairs": -1,
+                    "maxTotalRAMSize": 512,
+                    "totalCoresUsed": -1,
+                    "totalInstancesUsed": 2,
+                    "totalRAMUsed": 256,
+                    "totalServerGroupsUsed": 5,
+                },
+            },
+        }
+        self.assertEqual(expected_response, response)
+
+
+class LimitsControllerTestV239(BaseLimitTestSuite):
+
+    def setUp(self):
+        super(LimitsControllerTestV239, self).setUp()
+        self.controller = limits_v21.LimitsController()
+        self.req = fakes.HTTPRequest.blank("/?tenant_id=faketenant",
+                                           version='2.39')
+
+    def test_index_filtered_no_max_image_meta(self):
+        response = self.controller.index(self.req)
+        # starting from version 2.39 there is no 'maxImageMeta' field
+        # in response after removing 'image-metadata' proxy API
+        self.assertNotIn('maxImageMeta', response['limits']['absolute'])
+        self.assertIn('maxServerMeta', response['limits']['absolute'])
+
+
+class LimitsControllerTestV275(BaseLimitTestSuite):
+    def setUp(self):
+        super(LimitsControllerTestV275, self).setUp()
+        self.controller = limits_v21.LimitsController()
+
+    def test_index_additional_query_param_old_version(self):
+        req = fakes.HTTPRequest.blank("/?unknown=fake", version='2.74')
+        self.controller.index(req)
+        self.controller.index(req)
+
+    def test_index_additional_query_param(self):
+        req = fakes.HTTPRequest.blank("/?unknown=fake", version='2.75')
+        self.assertRaises(
+            exception.ValidationError,
+            self.controller.index, req=req)
+
+
+class NoopLimitsControllerTest(test.NoDBTestCase):
+    quota_driver = "nova.quota.NoopQuotaDriver"
+
+    def setUp(self):
+        super(NoopLimitsControllerTest, self).setUp()
+        self.flags(driver=self.quota_driver, group="quota")
+        self.controller = limits_v21.LimitsController()
+        # remove policy checks
+        patcher = self.mock_can = mock.patch('nova.context.RequestContext.can')
+        self.mock_can = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_index_v21(self):
+        req = fakes.HTTPRequest.blank("/")
+        response = self.controller.index(req)
+        expected_response = {
+            "limits": {
+                "rate": [],
+                "absolute": {
+                    'maxImageMeta': -1,
+                    'maxPersonality': -1,
+                    'maxPersonalitySize': -1,
+                    'maxSecurityGroupRules': -1,
+                    'maxSecurityGroups': -1,
+                    'maxServerGroupMembers': -1,
+                    'maxServerGroups': -1,
+                    'maxServerMeta': -1,
+                    'maxTotalCores': -1,
+                    'maxTotalFloatingIps': -1,
+                    'maxTotalInstances': -1,
+                    'maxTotalKeypairs': -1,
+                    'maxTotalRAMSize': -1,
+                    'totalCoresUsed': -1,
+                    'totalFloatingIpsUsed': -1,
+                    'totalInstancesUsed': -1,
+                    'totalRAMUsed': -1,
+                    'totalSecurityGroupsUsed': -1,
+                    'totalServerGroupsUsed': -1,
+                },
+            },
+        }
+        self.assertEqual(expected_response, response)
+
+    def test_index_v275(self):
+        req = fakes.HTTPRequest.blank("/?tenant_id=faketenant",
+                                      version='2.75')
+        response = self.controller.index(req)
+        expected_response = {
+            "limits": {
+                "rate": [],
+                "absolute": {
+                    'maxServerGroupMembers': -1,
+                    'maxServerGroups': -1,
+                    'maxServerMeta': -1,
+                    'maxTotalCores': -1,
+                    'maxTotalInstances': -1,
+                    'maxTotalKeypairs': -1,
+                    'maxTotalRAMSize': -1,
+                    'totalCoresUsed': -1,
+                    'totalInstancesUsed': -1,
+                    'totalRAMUsed': -1,
+                    'totalServerGroupsUsed': -1,
+                },
+            },
+        }
+        self.assertEqual(expected_response, response)
+
+
+class UnifiedLimitsControllerTest(NoopLimitsControllerTest):
+    quota_driver = "nova.quota.UnifiedLimitsDriver"
+
+    def setUp(self):
+        super(UnifiedLimitsControllerTest, self).setUp()
+        reglimits = {local_limit.SERVER_METADATA_ITEMS: 128,
+                     local_limit.INJECTED_FILES: 5,
+                     local_limit.INJECTED_FILES_CONTENT: 10 * 1024,
+                     local_limit.INJECTED_FILES_PATH: 255,
+                     local_limit.KEY_PAIRS: 100,
+                     local_limit.SERVER_GROUPS: 12,
+                     local_limit.SERVER_GROUP_MEMBERS: 10}
+        self.useFixture(limit_fixture.LimitFixture(reglimits, {}))
+
+    @mock.patch.object(placement_limit, "get_legacy_counts")
+    @mock.patch.object(placement_limit, "get_legacy_project_limits")
+    @mock.patch.object(objects.InstanceGroupList, "get_counts")
+    def test_index_v21(self, mock_count, mock_proj, mock_kcount):
+        mock_proj.return_value = {"instances": 1, "cores": 2, "ram": 3}
+        mock_kcount.return_value = {"instances": 4, "cores": 5, "ram": 6}
+        mock_count.return_value = {'project': {'server_groups': 9}}
+        req = fakes.HTTPRequest.blank("/")
+        response = self.controller.index(req)
+        expected_response = {
+            "limits": {
+                "rate": [],
+                "absolute": {
+                    'maxImageMeta': 128,
+                    'maxPersonality': 5,
+                    'maxPersonalitySize': 10240,
+                    'maxSecurityGroupRules': -1,
+                    'maxSecurityGroups': -1,
+                    'maxServerGroupMembers': 10,
+                    'maxServerGroups': 12,
+                    'maxServerMeta': 128,
+                    'maxTotalCores': 2,
+                    'maxTotalFloatingIps': -1,
+                    'maxTotalInstances': 1,
+                    'maxTotalKeypairs': 100,
+                    'maxTotalRAMSize': 3,
+                    'totalCoresUsed': 5,
+                    'totalFloatingIpsUsed': 0,
+                    'totalInstancesUsed': 4,
+                    'totalRAMUsed': 6,
+                    'totalSecurityGroupsUsed': 0,
+                    'totalServerGroupsUsed': 9,
+                },
+            },
+        }
+        self.assertEqual(expected_response, response)
+
+    @mock.patch.object(placement_limit, "get_legacy_counts")
+    @mock.patch.object(placement_limit, "get_legacy_project_limits")
+    @mock.patch.object(objects.InstanceGroupList, "get_counts")
+    def test_index_v275(self, mock_count, mock_proj, mock_kcount):
+        mock_proj.return_value = {"instances": 1, "cores": 2, "ram": 3}
+        mock_kcount.return_value = {"instances": 4, "cores": 5, "ram": 6}
+        mock_count.return_value = {'project': {'server_groups': 9}}
+        req = fakes.HTTPRequest.blank("/?tenant_id=faketenant",
+                                      version='2.75')
+        response = self.controller.index(req)
+        expected_response = {
+            "limits": {
+                "rate": [],
+                "absolute": {
+                    'maxServerGroupMembers': 10,
+                    'maxServerGroups': 12,
+                    'maxServerMeta': 128,
+                    'maxTotalCores': 2,
+                    'maxTotalInstances': 1,
+                    'maxTotalKeypairs': 100,
+                    'maxTotalRAMSize': 3,
+                    'totalCoresUsed': 5,
+                    'totalInstancesUsed': 4,
+                    'totalRAMUsed': 6,
+                    'totalServerGroupsUsed': 9,
+                },
+            },
+        }
+        self.assertEqual(expected_response, response)

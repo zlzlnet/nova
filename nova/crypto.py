@@ -17,156 +17,89 @@
 """Wrappers around standard crypto data elements.
 
 Includes root and intermediate CAs, SSH key_pairs and x509 certificates.
-
 """
-
-from __future__ import absolute_import
 
 import base64
 import binascii
+import hashlib
+import io
 import os
-import re
-import string
-import struct
 
+from castellan.common import exception as castellan_exception
+from castellan.common.objects import passphrase
+from castellan import key_manager
+from cryptography.hazmat import backends
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import serialization
+from cryptography import x509
 from oslo_concurrency import processutils
-from oslo_config import cfg
 from oslo_log import log as logging
-from oslo_utils import excutils
-from oslo_utils import timeutils
+from oslo_serialization import base64 as oslo_base64
 import paramiko
-from pyasn1.codec.der import encoder as der_encoder
-from pyasn1.type import univ
-import six
 
-from nova import context
-from nova import db
+import nova.conf
+from nova import context as nova_context
 from nova import exception
-from nova.i18n import _, _LE
-from nova.openstack.common import fileutils
-from nova import paths
+from nova.i18n import _
+from nova import objects
 from nova import utils
+from nova.virt import block_device as driver_block_device
 
 
 LOG = logging.getLogger(__name__)
 
-crypto_opts = [
-    cfg.StrOpt('ca_file',
-               default='cacert.pem',
-               help=_('Filename of root CA')),
-    cfg.StrOpt('key_file',
-               default=os.path.join('private', 'cakey.pem'),
-               help=_('Filename of private key')),
-    cfg.StrOpt('crl_file',
-               default='crl.pem',
-               help=_('Filename of root Certificate Revocation List')),
-    cfg.StrOpt('keys_path',
-               default=paths.state_path_def('keys'),
-               help=_('Where we keep our keys')),
-    cfg.StrOpt('ca_path',
-               default=paths.state_path_def('CA'),
-               help=_('Where we keep our root CA')),
-    cfg.BoolOpt('use_project_ca',
-                default=False,
-                help=_('Should we use a CA for each project?')),
-    cfg.StrOpt('user_cert_subject',
-               default='/C=US/ST=California/O=OpenStack/'
-                       'OU=NovaDev/CN=%.16s-%.16s-%s',
-               help=_('Subject for certificate for users, %s for '
-                      'project, user, timestamp')),
-    cfg.StrOpt('project_cert_subject',
-               default='/C=US/ST=California/O=OpenStack/'
-                       'OU=NovaDev/CN=project-ca-%.16s-%s',
-               help=_('Subject for certificate for projects, %s for '
-                      'project, timestamp')),
-    ]
+CONF = nova.conf.CONF
 
-CONF = cfg.CONF
-CONF.register_opts(crypto_opts)
+_KEYMGR = None
+
+_VTPM_SECRET_BYTE_LENGTH = 384
+
+_EPHEMERAL_ENCRYPTION_SECRET_BYTE_LENGTH = 64
 
 
-def ca_folder(project_id=None):
-    if CONF.use_project_ca and project_id:
-        return os.path.join(CONF.ca_path, 'projects', project_id)
-    return CONF.ca_path
+def _get_key_manager():
+    global _KEYMGR
+    if _KEYMGR is None:
+        _KEYMGR = key_manager.API(configuration=CONF)
+    return _KEYMGR
 
 
-def ca_path(project_id=None):
-    return os.path.join(ca_folder(project_id), CONF.ca_file)
-
-
-def key_path(project_id=None):
-    return os.path.join(ca_folder(project_id), CONF.key_file)
-
-
-def crl_path(project_id=None):
-    return os.path.join(ca_folder(project_id), CONF.crl_file)
-
-
-def fetch_ca(project_id=None):
-    if not CONF.use_project_ca:
-        project_id = None
-    ca_file_path = ca_path(project_id)
-    if not os.path.exists(ca_file_path):
-        raise exception.CryptoCAFileNotFound(project=project_id)
-    with open(ca_file_path, 'r') as cafile:
-        return cafile.read()
-
-
-def ensure_ca_filesystem():
-    """Ensure the CA filesystem exists."""
-    ca_dir = ca_folder()
-    if not os.path.exists(ca_path()):
-        genrootca_sh_path = os.path.abspath(
-                os.path.join(os.path.dirname(__file__), 'CA', 'genrootca.sh'))
-
-        start = os.getcwd()
-        fileutils.ensure_tree(ca_dir)
-        os.chdir(ca_dir)
-        try:
-            utils.execute("sh", genrootca_sh_path)
-        finally:
-            os.chdir(start)
-
-
-def generate_fingerprint(public_key):
+def generate_fingerprint(public_key: str) -> str:
     try:
-        parts = public_key.split(' ')
-        ssh_alg = parts[0]
-        pub_data = parts[1].decode('base64')
-        if ssh_alg == 'ssh-rsa':
-            pkey = paramiko.RSAKey(data=pub_data)
-        elif ssh_alg == 'ssh-dss':
-            pkey = paramiko.DSSKey(data=pub_data)
-        elif ssh_alg == 'ecdsa-sha2-nistp256':
-            pkey = paramiko.ECDSAKey(data=pub_data, validate_point=False)
-        else:
-            raise exception.InvalidKeypair(
-                reason=_('Unknown ssh key type %s') % ssh_alg)
-        raw_fp = binascii.hexlify(pkey.get_fingerprint())
+        pub_bytes = public_key.encode('utf-8')
+        # Test that the given public_key string is a proper ssh key. The
+        # returned object is unused since pyca/cryptography does not have a
+        # fingerprint method.
+        serialization.load_ssh_public_key(
+            pub_bytes, backends.default_backend())
+        pub_data = base64.b64decode(public_key.split(' ')[1])
+        raw_fp = hashlib.md5(pub_data, usedforsecurity=False).hexdigest()
         return ':'.join(a + b for a, b in zip(raw_fp[::2], raw_fp[1::2]))
-    except (IndexError, UnicodeDecodeError, binascii.Error,
-            paramiko.ssh_exception.SSHException):
+    except Exception:
         raise exception.InvalidKeypair(
             reason=_('failed to generate fingerprint'))
 
 
-def generate_x509_fingerprint(pem_key):
+def generate_x509_fingerprint(pem_key: bytes | str) -> str:
     try:
-        (out, _err) = utils.execute('openssl', 'x509', '-inform', 'PEM',
-                                    '-fingerprint', '-noout',
-                                    process_input=pem_key)
-        fingerprint = string.strip(out.rpartition('=')[2])
-        return fingerprint.lower()
-    except processutils.ProcessExecutionError as ex:
+        if isinstance(pem_key, str):
+            pem_key = pem_key.encode('utf-8')
+        cert = x509.load_pem_x509_certificate(
+            pem_key, backends.default_backend())
+        raw_fp = binascii.hexlify(
+            cert.fingerprint(hashes.SHA1())
+        ).decode('ascii')
+        return ':'.join(a + b for a, b in zip(raw_fp[::2], raw_fp[1::2]))
+    except (ValueError, TypeError, binascii.Error) as ex:
         raise exception.InvalidKeypair(
             reason=_('failed to generate X509 fingerprint. '
                      'Error message: %s') % ex)
 
 
-def generate_key_pair(bits=2048):
+def generate_key_pair(bits: int = 2048) -> tuple[str, str, str]:
     key = paramiko.RSAKey.generate(bits)
-    keyout = six.BytesIO()
+    keyout = io.StringIO()
     key.write_private_key(keyout)
     private_key = keyout.getvalue()
     public_key = '%s %s Generated-by-Nova' % (key.get_name(), key.get_base64())
@@ -174,193 +107,26 @@ def generate_key_pair(bits=2048):
     return (private_key, public_key, fingerprint)
 
 
-def fetch_crl(project_id):
-    """Get crl file for project."""
-    if not CONF.use_project_ca:
-        project_id = None
-    crl_file_path = crl_path(project_id)
-    if not os.path.exists(crl_file_path):
-        raise exception.CryptoCRLFileNotFound(project=project_id)
-    with open(crl_file_path, 'r') as crlfile:
-        return crlfile.read()
-
-
-def decrypt_text(project_id, text):
-    private_key = key_path(project_id)
-    if not os.path.exists(private_key):
-        raise exception.ProjectNotFound(project_id=project_id)
-    try:
-        dec, _err = utils.execute('openssl',
-                                  'rsautl',
-                                  '-decrypt',
-                                  '-inkey', '%s' % private_key,
-                                  process_input=text)
-        return dec
-    except processutils.ProcessExecutionError as exc:
-        raise exception.DecryptionFailure(reason=exc.stderr)
-
-
-_RSA_OID = univ.ObjectIdentifier('1.2.840.113549.1.1.1')
-
-
-def _to_sequence(*vals):
-    seq = univ.Sequence()
-    for i in range(len(vals)):
-        seq.setComponentByPosition(i, vals[i])
-    return seq
-
-
-def convert_from_sshrsa_to_pkcs8(pubkey):
-    """Convert a ssh public key to openssl format
-       Equivalent to the ssh-keygen's -m option
-    """
-    # get the second field from the public key file.
-    try:
-        keydata = base64.b64decode(pubkey.split(None)[1])
-    except IndexError:
-        msg = _("Unable to find the key")
-        raise exception.EncryptionFailure(reason=msg)
-
-    # decode the parts of the key
-    parts = []
-    while keydata:
-        dlen = struct.unpack('>I', keydata[:4])[0]
-        data = keydata[4:dlen + 4]
-        keydata = keydata[4 + dlen:]
-        parts.append(data)
-
-    # Use asn to build the openssl key structure
-    #
-    #  SEQUENCE(2 elem)
-    #    +- SEQUENCE(2 elem)
-    #    |    +- OBJECT IDENTIFIER (1.2.840.113549.1.1.1)
-    #    |    +- NULL
-    #    +- BIT STRING(1 elem)
-    #         +- SEQUENCE(2 elem)
-    #              +- INTEGER(2048 bit)
-    #              +- INTEGER 65537
-
-    # Build the sequence for the bit string
-    n_val = int(
-        ''.join(['%02X' % struct.unpack('B', x)[0] for x in parts[2]]), 16)
-    e_val = int(
-        ''.join(['%02X' % struct.unpack('B', x)[0] for x in parts[1]]), 16)
-    pkinfo = _to_sequence(univ.Integer(n_val), univ.Integer(e_val))
-
-    # Convert the sequence into a bit string
-    pklong = long(der_encoder.encode(pkinfo).encode('hex'), 16)
-    pkbitstring = univ.BitString("'00%s'B" % bin(pklong)[2:])
-
-    # Build the key data structure
-    oid = _to_sequence(_RSA_OID, univ.Null())
-    pkcs1_seq = _to_sequence(oid, pkbitstring)
-    pkcs8 = base64.encodestring(der_encoder.encode(pkcs1_seq))
-
-    # Remove the embedded new line and format the key, each line
-    # should be 64 characters long
-    return ('-----BEGIN PUBLIC KEY-----\n%s\n-----END PUBLIC KEY-----\n' %
-            re.sub("(.{64})", "\\1\n", pkcs8.replace('\n', ''), re.DOTALL))
-
-
-def ssh_encrypt_text(ssh_public_key, text):
+def ssh_encrypt_text(ssh_public_key: str, text: str | bytes) -> bytes:
     """Encrypt text with an ssh public key.
+
+    If text is a Unicode string, encode it to UTF-8.
     """
-    with utils.tempdir() as tmpdir:
-        sslkey = os.path.abspath(os.path.join(tmpdir, 'ssl.key'))
-        try:
-            out = convert_from_sshrsa_to_pkcs8(ssh_public_key)
-            with open(sslkey, 'w') as f:
-                f.write(out)
-            enc, _err = utils.execute('openssl',
-                                      'rsautl',
-                                      '-encrypt',
-                                      '-pubin',
-                                      '-inkey', sslkey,
-                                      '-keyform', 'PEM',
-                                      process_input=text)
-            return enc
-        except processutils.ProcessExecutionError as exc:
-            raise exception.EncryptionFailure(reason=exc.stderr)
-
-
-def revoke_cert(project_id, file_name):
-    """Revoke a cert by file name."""
-    start = os.getcwd()
+    if isinstance(text, str):
+        text = text.encode('utf-8')
     try:
-        os.chdir(ca_folder(project_id))
-    except OSError:
-        raise exception.ProjectNotFound(project_id=project_id)
-    try:
-        # NOTE(vish): potential race condition here
-        utils.execute('openssl', 'ca', '-config', './openssl.cnf', '-revoke',
-                      file_name)
-        utils.execute('openssl', 'ca', '-gencrl', '-config', './openssl.cnf',
-                      '-out', CONF.crl_file)
-    except processutils.ProcessExecutionError:
-        raise exception.RevokeCertFailure(project_id=project_id)
-    finally:
-        os.chdir(start)
+        pub_bytes = ssh_public_key.encode('utf-8')
+        pub_key = serialization.load_ssh_public_key(
+            pub_bytes, backends.default_backend())
+        return pub_key.encrypt(text, padding.PKCS1v15())
+    except Exception as exc:
+        raise exception.EncryptionFailure(reason=str(exc))
 
 
-def revoke_certs_by_user(user_id):
-    """Revoke all user certs."""
-    admin = context.get_admin_context()
-    for cert in db.certificate_get_all_by_user(admin, user_id):
-        revoke_cert(cert['project_id'], cert['file_name'])
-
-
-def revoke_certs_by_project(project_id):
-    """Revoke all project certs."""
-    # NOTE(vish): This is somewhat useless because we can just shut down
-    #             the vpn.
-    admin = context.get_admin_context()
-    for cert in db.certificate_get_all_by_project(admin, project_id):
-        revoke_cert(cert['project_id'], cert['file_name'])
-
-
-def revoke_certs_by_user_and_project(user_id, project_id):
-    """Revoke certs for user in project."""
-    admin = context.get_admin_context()
-    for cert in db.certificate_get_all_by_user_and_project(admin,
-                                            user_id, project_id):
-        revoke_cert(cert['project_id'], cert['file_name'])
-
-
-def _project_cert_subject(project_id):
-    """Helper to generate user cert subject."""
-    return CONF.project_cert_subject % (project_id, timeutils.isotime())
-
-
-def _user_cert_subject(user_id, project_id):
-    """Helper to generate user cert subject."""
-    return CONF.user_cert_subject % (project_id, user_id, timeutils.isotime())
-
-
-def generate_x509_cert(user_id, project_id, bits=2048):
-    """Generate and sign a cert for user in project."""
-    subject = _user_cert_subject(user_id, project_id)
-
-    with utils.tempdir() as tmpdir:
-        keyfile = os.path.abspath(os.path.join(tmpdir, 'temp.key'))
-        csrfile = os.path.abspath(os.path.join(tmpdir, 'temp.csr'))
-        utils.execute('openssl', 'genrsa', '-out', keyfile, str(bits))
-        utils.execute('openssl', 'req', '-new', '-key', keyfile, '-out',
-                      csrfile, '-batch', '-subj', subject)
-        with open(keyfile) as f:
-            private_key = f.read()
-        with open(csrfile) as f:
-            csr = f.read()
-
-    (serial, signed_csr) = sign_csr(csr, project_id)
-    fname = os.path.join(ca_folder(project_id), 'newcerts/%s.pem' % serial)
-    cert = {'user_id': user_id,
-            'project_id': project_id,
-            'file_name': fname}
-    db.certificate_create(context.get_admin_context(), cert)
-    return (private_key, signed_csr)
-
-
-def generate_winrm_x509_cert(user_id, bits=2048):
+def generate_winrm_x509_cert(
+    user_id: str,
+    bits: int = 2048
+) -> tuple[str, str, str]:
     """Generate a cert for passwordless auth for user in project."""
     subject = '/CN=%s' % user_id
     upn = '%s@localhost' % user_id
@@ -371,23 +137,26 @@ def generate_winrm_x509_cert(user_id, bits=2048):
 
         _create_x509_openssl_config(conffile, upn)
 
-        (certificate, _err) = utils.execute(
-             'openssl', 'req', '-x509', '-nodes', '-days', '3650',
-             '-config', conffile, '-newkey', 'rsa:%s' % bits,
-             '-outform', 'PEM', '-keyout', keyfile, '-subj', subject,
-             '-extensions', 'v3_req_client')
+        out, _ = processutils.execute(
+            'openssl', 'req', '-x509', '-nodes', '-days', '3650',
+            '-config', conffile, '-newkey', 'rsa:%s' % bits,
+            '-outform', 'PEM', '-keyout', keyfile, '-subj', subject,
+            '-extensions', 'v3_req_client',
+            binary=True)
 
-        (out, _err) = utils.execute('openssl', 'pkcs12', '-export',
-                                    '-inkey', keyfile, '-password', 'pass:',
-                                    process_input=certificate)
+        certificate = out.decode('utf-8')
 
-        private_key = out.encode('base64')
+        out, _ = processutils.execute(
+            'openssl', 'pkcs12', '-export', '-inkey', keyfile, '-password',
+            'pass:', process_input=out, binary=True)
+
+        private_key = base64.b64encode(out).decode('ascii')
         fingerprint = generate_x509_fingerprint(certificate)
 
     return (private_key, certificate, fingerprint)
 
 
-def _create_x509_openssl_config(conffile, upn):
+def _create_x509_openssl_config(conffile: str, upn: str):
     content = ("distinguished_name  = req_distinguished_name\n"
                "[req_distinguished_name]\n"
                "[v3_req_client]\n"
@@ -398,69 +167,163 @@ def _create_x509_openssl_config(conffile, upn):
         file.write(content % upn)
 
 
-def _ensure_project_folder(project_id):
-    if not os.path.exists(ca_path(project_id)):
-        geninter_sh_path = os.path.abspath(
-                os.path.join(os.path.dirname(__file__), 'CA', 'geninter.sh'))
-        start = os.getcwd()
-        os.chdir(ca_folder())
-        utils.execute('sh', geninter_sh_path, project_id,
-                      _project_cert_subject(project_id))
-        os.chdir(start)
+def _handle_key_manager_error_forbidden(e, instance):
+    # Castellan catches the HTTPClientError from barbicanclient and
+    # re-raises it without its status_code attribute. It also does not
+    # include the status code in its exception message, so the best we can
+    # do is look for the word "Forbidden". Example error message:
+    #   "Key manager error: Forbidden: Secret payload retrieval attempt not
+    #   allowed - please review your user/project privileges"
+    if 'Forbidden' not in str(e):
+        raise
+    LOG.error(str(e), instance=instance)
+    raise exception.VTPMSecretForbidden(str(e)) from None
 
 
-def generate_vpn_files(project_id):
-    project_folder = ca_folder(project_id)
-    key_fn = os.path.join(project_folder, 'server.key')
-    crt_fn = os.path.join(project_folder, 'server.crt')
+def ensure_vtpm_secret(
+    context: nova_context.RequestContext,
+    instance: 'objects.Instance',
+) -> tuple[str, bytes]:
+    """Communicates with the key manager service to retrieve or create a secret
+    for an instance's emulated TPM.
 
-    if os.path.exists(crt_fn):
-        return
-    # NOTE(vish): The 2048 is to maintain compatibility with the old script.
-    #             We are using "project-vpn" as the user_id for the cert
-    #             even though that user may not really exist. Ultimately
-    #             this will be changed to be launched by a real user.  At
-    #             that point we will can delete this helper method.
-    key, csr = generate_x509_cert('project-vpn', project_id, 2048)
-    with open(key_fn, 'w') as keyfile:
-        keyfile.write(key)
-    with open(crt_fn, 'w') as crtfile:
-        crtfile.write(csr)
+    When creating a secret, its UUID is saved to the instance's system_metadata
+    as ``vtpm_secret_uuid``.
 
+    :param context: Nova auth context.
+    :param instance: Instance object.
+    :return: A tuple comprising (secret_uuid, passphrase).
+    :raise: castellan_exception.ManagedObjectNotFoundError if communication
+        with the key manager API fails, or if a vtpm_secret_uuid was present in
+        the instance's system metadata but could not be found in the key
+        manager service.
+    """
+    key_mgr = _get_key_manager()
 
-def sign_csr(csr_text, project_id=None):
-    if not CONF.use_project_ca:
-        project_id = None
-    if not project_id:
-        return _sign_csr(csr_text, ca_folder())
-    _ensure_project_folder(project_id)
-    return _sign_csr(csr_text, ca_folder(project_id))
-
-
-def _sign_csr(csr_text, ca_folder):
-    with utils.tempdir() as tmpdir:
-        inbound = os.path.join(tmpdir, 'inbound.csr')
-        outbound = os.path.join(tmpdir, 'outbound.csr')
-
+    secret_uuid = instance.system_metadata.get('vtpm_secret_uuid')
+    if secret_uuid is not None:
+        # Try to retrieve the secret from the key manager
         try:
-            with open(inbound, 'w') as csrfile:
-                csrfile.write(csr_text)
-        except IOError:
-            with excutils.save_and_reraise_exception():
-                LOG.exception(_LE('Failed to write inbound.csr'))
+            secret = key_mgr.get(context, secret_uuid)
+            # assert secret_uuid == secret.id ?
+            LOG.debug(
+                "Found existing vTPM secret with UUID %s.",
+                secret_uuid, instance=instance)
+            return secret.id, secret.get_encoded()
+        except castellan_exception.ManagedObjectNotFoundError:
+            LOG.warning(
+                "Despite being set on the instance, failed to find a vTPM "
+                "secret with UUID %s. This should only happen if the secret "
+                "was manually deleted from the key manager service. Your vTPM "
+                "is likely to be unrecoverable.",
+                secret_uuid, instance=instance)
+            raise
+        except castellan_exception.KeyManagerError as e:
+            _handle_key_manager_error_forbidden(e, instance)
 
-        LOG.debug('Flags path: %s', ca_folder)
-        start = os.getcwd()
+    # If we get here, the instance has no vtpm_secret_uuid. Create a new one
+    # and register it with the key manager.
+    secret = base64.b64encode(os.urandom(_VTPM_SECRET_BYTE_LENGTH))
+    # Castellan ManagedObject
+    cmo = passphrase.Passphrase(
+        secret, name="vTPM secret for instance %s" % instance.uuid)
+    try:
+        secret_uuid = key_mgr.store(context, cmo)
+        LOG.debug("Created vTPM secret with UUID %s",
+                  secret_uuid, instance=instance)
+    except castellan_exception.KeyManagerError as e:
+        _handle_key_manager_error_forbidden(e, instance)
 
-        # Change working dir to CA
-        fileutils.ensure_tree(ca_folder)
-        os.chdir(ca_folder)
-        utils.execute('openssl', 'ca', '-batch', '-out', outbound, '-config',
-                      './openssl.cnf', '-infiles', inbound)
-        out, _err = utils.execute('openssl', 'x509', '-in', outbound,
-                                  '-serial', '-noout')
-        serial = string.strip(out.rpartition('=')[2])
-        os.chdir(start)
+    instance.system_metadata['vtpm_secret_uuid'] = secret_uuid
+    instance.save()
+    return secret_uuid, secret
 
-        with open(outbound, 'r') as crtfile:
-            return (serial, crtfile.read())
+
+def delete_vtpm_secret(
+    context: nova_context.RequestContext,
+    instance: 'objects.Instance',
+):
+    """Communicates with the key manager service to destroy the secret for an
+    instance's emulated TPM.
+
+    This operation is idempotent: if the instance never had a vTPM secret, OR
+    if the secret has already been deleted, it is a no-op.
+
+    The ``vtpm_secret_uuid`` member of the instance's system_metadata is
+    cleared as a side effect of this method.
+
+    :param context: Nova auth context.
+    :param instance: Instance object.
+    :return: None
+    :raise: castellan_exception.ManagedObjectNotFoundError if communication
+        with the key manager API.
+    """
+    secret_uuid = instance.system_metadata.get('vtpm_secret_uuid')
+    if not secret_uuid:
+        return
+
+    key_mgr = _get_key_manager()
+    try:
+        key_mgr.delete(context, secret_uuid)
+        LOG.debug("Deleted vTPM secret with UUID %s",
+                  secret_uuid, instance=instance)
+    except castellan_exception.ManagedObjectNotFoundError:
+        LOG.debug("vTPM secret with UUID %s already deleted or never existed.",
+                  secret_uuid, instance=instance)
+    except castellan_exception.KeyManagerError as e:
+        _handle_key_manager_error_forbidden(e, instance)
+
+    del instance.system_metadata['vtpm_secret_uuid']
+    instance.save()
+
+
+def create_encryption_secret(
+    context: nova_context.RequestContext,
+    instance: 'objects.Instance',
+    driver_bdm: 'driver_block_device.DriverBlockDevice',
+    for_detail: str | None = None,
+):
+    # Use oslo.serialization to encode some random data as passphrase
+    secret = oslo_base64.encode_as_text(
+        os.urandom(_EPHEMERAL_ENCRYPTION_SECRET_BYTE_LENGTH))
+    if for_detail is None:
+        for_detail = f"instance {instance.uuid} BDM {driver_bdm['uuid']}"
+    secret_name = f'Ephemeral encryption secret for {for_detail}'
+    cmo = passphrase.Passphrase(secret, name=secret_name)
+    key_mgr = _get_key_manager()
+    secret_uuid = key_mgr.store(context, cmo)
+    LOG.debug(
+        'Created "%s" with UUID %s', secret_name, secret_uuid,
+        instance=instance
+    )
+    return secret_uuid, secret
+
+
+def get_encryption_secret(
+    context: nova_context.RequestContext,
+    secret_uuid: str,
+) -> str | None:
+    key_mgr = _get_key_manager()
+    try:
+        key = key_mgr.get(context, secret_uuid)
+        LOG.debug("Retrieved secret with UUID %s", secret_uuid)
+        return key.get_encoded()
+    except castellan_exception.ManagedObjectNotFoundError:
+        LOG.debug("Encryption secret with UUID %s was not found.", secret_uuid)
+    return None
+
+
+def delete_encryption_secret(
+    context: nova_context.RequestContext,
+    instance_uuid: str,
+    secret_uuid: str,
+):
+    key_mgr = _get_key_manager()
+    try:
+        key_mgr.delete(context, secret_uuid)
+        LOG.debug("Deleted secret with UUID %s", secret_uuid,
+                  instance_uuid=instance_uuid)
+    except castellan_exception.ManagedObjectNotFoundError:
+        LOG.debug(
+            "Encryption secret with UUID %s already deleted or never existed.",
+            secret_uuid, instance_uuid=instance_uuid)

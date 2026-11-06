@@ -10,13 +10,12 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from nova.compute import arch
-from nova.compute import cpumodel
 from nova import objects
+from nova.objects import fields as obj_fields
 from nova.tests.unit.objects import test_objects
 
 fake_cpu_model_feature = {
-    'policy': cpumodel.POLICY_REQUIRE,
+    'policy': obj_fields.CPUFeaturePolicy.REQUIRE,
     'name': 'sse2',
 }
 
@@ -24,12 +23,12 @@ fake_cpu_model_feature_obj = objects.VirtCPUFeature(
     **fake_cpu_model_feature)
 
 fake_vcpumodel_dict = {
-    'arch': arch.I686,
+    'arch': obj_fields.Architecture.I686,
     'vendor': 'fake-vendor',
-    'match': cpumodel.MATCH_EXACT,
+    'match': obj_fields.CPUMatch.EXACT,
     'topology': objects.VirtCPUTopology(sockets=1, cores=1, threads=1),
     'features': [fake_cpu_model_feature_obj],
-    'mode': cpumodel.MODE_HOST_MODEL,
+    'mode': obj_fields.CPUMode.HOST_MODEL,
     'model': 'fake-model',
 }
 fake_vcpumodel = objects.VirtCPUModel(**fake_vcpumodel_dict)
@@ -55,7 +54,7 @@ class _TestVirtCPUModel(object):
     def test_create(self):
         model = objects.VirtCPUModel(**fake_vcpumodel_dict)
         self.assertEqual(fake_vcpumodel_dict['model'], model.model)
-        self.assertEqual(fake_vcpumodel_dict['topology']['sockets'],
+        self.assertEqual(fake_vcpumodel_dict['topology'].sockets,
                          model.topology.sockets)
         feature = model.features[0]
         self.assertEqual(fake_cpu_model_feature['policy'],
@@ -76,20 +75,20 @@ class _TestVirtCPUModel(object):
         self.assertRaises(ValueError, setattr, model, 'arch', 'foo')
 
     def test_serialize(self):
-        modelin = objects.VirtCPUModel(**fake_vcpumodel_dict)
-        modelout = objects.VirtCPUModel.from_json(modelin.to_json())
+        model_in = objects.VirtCPUModel(**fake_vcpumodel_dict)
+        model_out = objects.VirtCPUModel.from_json(model_in.to_json())
 
-        self.assertEqual(modelin.mode, modelout.mode)
-        self.assertEqual(modelin.model, modelout.model)
-        self.assertEqual(modelin.vendor, modelout.vendor)
-        self.assertEqual(modelin.arch, modelout.arch)
-        self.assertEqual(modelin.match, modelout.match)
-        self.assertEqual(modelin.features[0].policy,
-                         modelout.features[0].policy)
-        self.assertEqual(modelin.features[0].name, modelout.features[0].name)
-        self.assertEqual(modelin.topology.sockets, modelout.topology.sockets)
-        self.assertEqual(modelin.topology.cores, modelout.topology.cores)
-        self.assertEqual(modelin.topology.threads, modelout.topology.threads)
+        self.assertEqual(model_in.mode, model_out.mode)
+        self.assertEqual(model_in.model, model_out.model)
+        self.assertEqual(model_in.vendor, model_out.vendor)
+        self.assertEqual(model_in.arch, model_out.arch)
+        self.assertEqual(model_in.match, model_out.match)
+        self.assertEqual(model_in.features[0].policy,
+                         model_out.features[0].policy)
+        self.assertEqual(model_in.features[0].name, model_out.features[0].name)
+        self.assertEqual(model_in.topology.sockets, model_out.topology.sockets)
+        self.assertEqual(model_in.topology.cores, model_out.topology.cores)
+        self.assertEqual(model_in.topology.threads, model_out.topology.threads)
 
 
 class TestVirtCPUModel(test_objects._LocalTest,

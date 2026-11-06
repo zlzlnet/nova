@@ -11,14 +11,13 @@
 #    under the License.
 
 import datetime
+from unittest import mock
 
-import iso8601
-import mock
 from oslo_utils import timeutils
 
 from nova import objects
 from nova.tests.unit.objects import test_objects
-
+from nova import utils
 
 NOW = timeutils.utcnow().replace(microsecond=0)
 
@@ -40,7 +39,7 @@ fake_task_log = {
 
 
 class _TestTaskLog(object):
-    @mock.patch('nova.db.task_log_get', return_value=fake_task_log)
+    @mock.patch('nova.db.main.api.task_log_get', return_value=fake_task_log)
     def test_get(self, mock_get):
         task_log = objects.TaskLog.get(self.context,
                                        fake_task_log['task_name'],
@@ -51,13 +50,13 @@ class _TestTaskLog(object):
         mock_get.assert_called_once_with(
             self.context,
             fake_task_log['task_name'],
-            timeutils.strtime(at=fake_task_log['period_beginning']),
-            timeutils.strtime(at=fake_task_log['period_ending']),
+            utils.strtime(fake_task_log['period_beginning']),
+            utils.strtime(fake_task_log['period_ending']),
             fake_task_log['host'],
             state=fake_task_log['state'])
         self.compare_obj(task_log, fake_task_log)
 
-    @mock.patch('nova.db.task_log_begin_task')
+    @mock.patch('nova.db.main.api.task_log_begin_task')
     def test_begin_task(self, mock_begin_task):
         task_log = objects.TaskLog(self.context)
         task_log.task_name = fake_task_log['task_name']
@@ -71,14 +70,14 @@ class _TestTaskLog(object):
             self.context,
             fake_task_log['task_name'],
             fake_task_log['period_beginning'].replace(
-                tzinfo=iso8601.iso8601.Utc()),
+                tzinfo=datetime.UTC),
             fake_task_log['period_ending'].replace(
-                tzinfo=iso8601.iso8601.Utc()),
+                tzinfo=datetime.UTC),
             fake_task_log['host'],
             task_items=fake_task_log['task_items'],
             message=fake_task_log['message'])
 
-    @mock.patch('nova.db.task_log_end_task')
+    @mock.patch('nova.db.main.api.task_log_end_task')
     def test_end_task(self, mock_end_task):
         task_log = objects.TaskLog(self.context)
         task_log.task_name = fake_task_log['task_name']
@@ -92,9 +91,9 @@ class _TestTaskLog(object):
             self.context,
             fake_task_log['task_name'],
             fake_task_log['period_beginning'].replace(
-                tzinfo=iso8601.iso8601.Utc()),
+                tzinfo=datetime.UTC),
             fake_task_log['period_ending'].replace(
-                tzinfo=iso8601.iso8601.Utc()),
+                tzinfo=datetime.UTC),
             fake_task_log['host'],
             errors=fake_task_log['errors'],
             message=fake_task_log['message'])
@@ -109,7 +108,7 @@ class TestRemoteTaskLog(test_objects._RemoteTest, _TestTaskLog):
 
 
 class _TestTaskLogList(object):
-    @mock.patch('nova.db.task_log_get_all')
+    @mock.patch('nova.db.main.api.task_log_get_all')
     def test_get_all(self, mock_get_all):
         fake_task_logs = [dict(fake_task_log, id=1), dict(fake_task_log, id=2)]
         mock_get_all.return_value = fake_task_logs
@@ -123,8 +122,8 @@ class _TestTaskLogList(object):
         mock_get_all.assert_called_once_with(
             self.context,
             fake_task_log['task_name'],
-            timeutils.strtime(at=fake_task_log['period_beginning']),
-            timeutils.strtime(at=fake_task_log['period_ending']),
+            utils.strtime(fake_task_log['period_beginning']),
+            utils.strtime(fake_task_log['period_ending']),
             host=fake_task_log['host'],
             state=fake_task_log['state'])
         for index, task_log in enumerate(task_logs):

@@ -16,13 +16,21 @@ import contextlib
 
 
 class VirtAPI(object):
-    def provider_fw_rule_get_all(self, context):
-        """Get the provider firewall rules
-        :param context: security context
-        """
+    @contextlib.contextmanager
+    def wait_for_instance_event(self, instance, event_names, timeout=300,
+                                error_callback=None):
         raise NotImplementedError()
 
-    @contextlib.contextmanager
-    def wait_for_instance_event(self, instance, event_names, deadline=300,
-                                error_callback=None):
+    def exit_wait_early(self, events):
+        raise NotImplementedError()
+
+    def update_compute_provider_status(self, context, rp_uuid, enabled):
+        """Used to add/remove the COMPUTE_STATUS_DISABLED trait on the provider
+
+        :param context: nova auth RequestContext
+        :param rp_uuid: UUID of a compute node resource provider in Placement
+        :param enabled: True if the node is enabled in which case the trait
+            would be removed, False if the node is disabled in which case
+            the trait would be added.
+        """
         raise NotImplementedError()

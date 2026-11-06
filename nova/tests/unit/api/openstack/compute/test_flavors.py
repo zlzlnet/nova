@@ -13,84 +13,19 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import six
-import six.moves.urllib.parse as urlparse
+from unittest import mock
+from urllib import parse as urlparse
+
 import webob
 
 from nova.api.openstack import common
-from nova.api.openstack.compute import flavors as flavors_v2
-from nova.api.openstack.compute.plugins.v3 import flavors as flavors_v21
-import nova.compute.flavors
+from nova.api.openstack.compute import flavors
 from nova import context
-from nova import db
 from nova import exception
+from nova import objects
 from nova import test
 from nova.tests.unit.api.openstack import fakes
 from nova.tests.unit import matchers
-
-NS = "{http://docs.openstack.org/compute/api/v1.1}"
-ATOMNS = "{http://www.w3.org/2005/Atom}"
-
-
-FAKE_FLAVORS = {
-    'flavor 1': {
-        "flavorid": '1',
-        "name": 'flavor 1',
-        "memory_mb": '256',
-        "root_gb": '10',
-        "ephemeral_gb": '20',
-        "swap": '10',
-        "disabled": False,
-        "vcpus": '',
-    },
-    'flavor 2': {
-        "flavorid": '2',
-        "name": 'flavor 2',
-        "memory_mb": '512',
-        "root_gb": '20',
-        "ephemeral_gb": '10',
-        "swap": '5',
-        "disabled": False,
-        "vcpus": '',
-    },
-}
-
-
-def fake_flavor_get_by_flavor_id(flavorid, ctxt=None):
-    return FAKE_FLAVORS['flavor %s' % flavorid]
-
-
-def fake_get_all_flavors_sorted_list(context=None, inactive=False,
-                                     filters=None, sort_key='flavorid',
-                                     sort_dir='asc', limit=None, marker=None):
-    if marker in ['99999']:
-        raise exception.MarkerNotFound(marker)
-
-    def reject_min(db_attr, filter_attr):
-        return (filter_attr in filters and
-                int(flavor[db_attr]) < int(filters[filter_attr]))
-
-    filters = filters or {}
-    res = []
-    for (flavor_name, flavor) in FAKE_FLAVORS.items():
-        if reject_min('memory_mb', 'min_memory_mb'):
-            continue
-        elif reject_min('root_gb', 'min_root_gb'):
-            continue
-
-        res.append(flavor)
-
-    res = sorted(res, key=lambda item: item[sort_key])
-    output = []
-    marker_found = True if marker is None else False
-    for flavor in res:
-        if not marker_found and marker == flavor['flavorid']:
-            marker_found = True
-        elif marker_found:
-            if limit is None or len(output) < int(limit):
-                output.append(flavor)
-
-    return output
 
 
 def fake_get_limit_and_marker(request, max_limit=1):
@@ -102,431 +37,429 @@ def fake_get_limit_and_marker(request, max_limit=1):
     return limit, marker
 
 
-def empty_get_all_flavors_sorted_list(context=None, inactive=False,
-                                      filters=None, sort_key='flavorid',
-                                      sort_dir='asc', limit=None, marker=None):
-    return []
-
-
-def return_flavor_not_found(flavor_id, ctxt=None):
+def return_flavor_not_found(context, flavor_id, read_deleted=None):
     raise exception.FlavorNotFound(flavor_id=flavor_id)
 
 
 class FlavorsTestV21(test.TestCase):
-    _prefix = "/v3"
-    Controller = flavors_v21.FlavorsController
-    fake_request = fakes.HTTPRequestV3
-    _rspv = "v3"
-    _fake = ""
+    microversion = '2.1'
+    # Flag to tell the test if a description should be expected in a response.
+    expect_description = False
+    # Flag to tell the test if a extra_specs should be expected in a response.
+    expect_extra_specs = False
+    # Flag to tell the test if legacy fields should be omitted from responses.
+    omit_legacy_fields = False
 
     def setUp(self):
-        super(FlavorsTestV21, self).setUp()
-        self.flags(osapi_compute_extension=[])
-        fakes.stub_out_networking(self.stubs)
-        fakes.stub_out_rate_limiting(self.stubs)
-        self.stubs.Set(nova.compute.flavors, "get_all_flavors_sorted_list",
-                       fake_get_all_flavors_sorted_list)
-        self.stubs.Set(nova.compute.flavors,
-                       "get_flavor_by_flavor_id",
-                       fake_flavor_get_by_flavor_id)
-        self.controller = self.Controller()
+        super().setUp()
+        fakes.stub_out_networking(self)
+        fakes.stub_out_flavor_get_all(self)
+        fakes.stub_out_flavor_get_by_flavor_id(self)
+        self.controller = flavors.FlavorsController()
 
-    def _set_expected_body(self, expected, ephemeral, swap, disabled):
-        # NOTE(oomichi): On v2.1 API, some extensions of v2.0 are merged
-        # as core features and we can get the following parameters as the
-        # default.
-        expected['OS-FLV-EXT-DATA:ephemeral'] = ephemeral
-        expected['OS-FLV-DISABLED:disabled'] = disabled
-        expected['swap'] = swap
+    def _build_request(self, url):
+        return fakes.HTTPRequestV21.blank(
+            url, version=self.microversion, base_url='http://localhost/v2.1')
 
-    def test_get_flavor_by_invalid_id(self):
-        self.stubs.Set(nova.compute.flavors,
-                       "get_flavor_by_flavor_id",
-                       return_flavor_not_found)
-        req = self.fake_request.blank(self._prefix + '/flavors/asdf')
+    def _set_expected_body(self, expected, flavor):
+        expected['OS-FLV-EXT-DATA:ephemeral'] = flavor.ephemeral_gb
+        expected['OS-FLV-DISABLED:disabled'] = flavor.disabled
+        expected['swap'] = flavor.swap
+        if self.expect_description:
+            expected['description'] = flavor.description
+        if self.expect_extra_specs:
+            expected['extra_specs'] = flavor.extra_specs
+        if self.omit_legacy_fields:
+            expected.pop('rxtx_factor', None)
+            expected.pop('OS-FLV-DISABLED:disabled', None)
+
+    @mock.patch('nova.objects.Flavor.get_by_flavor_id',
+                side_effect=return_flavor_not_found)
+    def test_get_flavor_by_invalid_id(self, mock_get):
+        req = self._build_request('/flavors/asdf')
         self.assertRaises(webob.exc.HTTPNotFound,
                           self.controller.show, req, 'asdf')
 
     def test_get_flavor_by_id(self):
-        req = self.fake_request.blank(self._prefix + '/flavors/1')
+        req = self._build_request('/flavors/1')
         flavor = self.controller.show(req, '1')
         expected = {
             "flavor": {
-                "id": "1",
-                "name": "flavor 1",
-                "ram": "256",
-                "disk": "10",
-                "vcpus": "",
+                "id": fakes.FLAVORS['1'].flavorid,
+                "name": fakes.FLAVORS['1'].name,
+                "ram": fakes.FLAVORS['1'].memory_mb,
+                "disk": fakes.FLAVORS['1'].root_gb,
+                "vcpus": fakes.FLAVORS['1'].vcpus,
+                "os-flavor-access:is_public": True,
+                "rxtx_factor": 1.0,
                 "links": [
                     {
                         "rel": "self",
-                        "href": "http://localhost/" + self._rspv +
-                             "/flavors/1",
+                        "href": "http://localhost/v2.1/flavors/1",
                     },
                     {
                         "rel": "bookmark",
-                        "href": "http://localhost" + self._fake +
-                             "/flavors/1",
+                        "href": "http://localhost/flavors/1",
                     },
                 ],
             },
         }
-        self._set_expected_body(expected['flavor'], ephemeral='20',
-                                swap='10', disabled=False)
+        self._set_expected_body(expected['flavor'], fakes.FLAVORS['1'])
         self.assertEqual(flavor, expected)
 
     def test_get_flavor_with_custom_link_prefix(self):
-        self.flags(osapi_compute_link_prefix='http://zoo.com:42',
-                   osapi_glance_link_prefix='http://circus.com:34')
-        req = self.fake_request.blank(self._prefix + '/flavors/1')
+        self.flags(compute_link_prefix='http://zoo.com:42',
+                   glance_link_prefix='http://circus.com:34',
+                   group='api')
+        req = self._build_request('/flavors/1')
         flavor = self.controller.show(req, '1')
         expected = {
             "flavor": {
-                "id": "1",
-                "name": "flavor 1",
-                "ram": "256",
-                "disk": "10",
-                "vcpus": "",
+                "id": fakes.FLAVORS['1'].flavorid,
+                "name": fakes.FLAVORS['1'].name,
+                "ram": fakes.FLAVORS['1'].memory_mb,
+                "disk": fakes.FLAVORS['1'].root_gb,
+                "vcpus": fakes.FLAVORS['1'].vcpus,
+                "os-flavor-access:is_public": True,
+                "rxtx_factor": 1.0,
                 "links": [
                     {
                         "rel": "self",
-                        "href": "http://zoo.com:42/" + self._rspv +
-                             "/flavors/1",
+                        "href": "http://zoo.com:42/v2.1/flavors/1",
                     },
                     {
                         "rel": "bookmark",
-                        "href": "http://zoo.com:42" + self._fake +
-                             "/flavors/1",
+                        "href": "http://zoo.com:42/flavors/1",
                     },
                 ],
             },
         }
-        self._set_expected_body(expected['flavor'], ephemeral='20',
-                                swap='10', disabled=False)
+        self._set_expected_body(expected['flavor'], fakes.FLAVORS['1'])
         self.assertEqual(expected, flavor)
 
     def test_get_flavor_list(self):
-        req = self.fake_request.blank(self._prefix + '/flavors')
+        req = self._build_request('/flavors')
         flavor = self.controller.index(req)
         expected = {
             "flavors": [
                 {
-                    "id": "1",
-                    "name": "flavor 1",
+                    "id": fakes.FLAVORS['1'].flavorid,
+                    "name": fakes.FLAVORS['1'].name,
                     "links": [
                         {
                             "rel": "self",
-                            "href": "http://localhost/" + self._rspv +
-                                 "/flavors/1",
+                            "href": "http://localhost/v2.1/flavors/1",
                         },
                         {
                             "rel": "bookmark",
-                            "href": "http://localhost" + self._fake +
-                                 "/flavors/1",
+                            "href": "http://localhost/flavors/1",
                         },
                     ],
                 },
                 {
-                    "id": "2",
-                    "name": "flavor 2",
+                    "id": fakes.FLAVORS['2'].flavorid,
+                    "name": fakes.FLAVORS['2'].name,
                     "links": [
                         {
                             "rel": "self",
-                            "href": "http://localhost/" + self._rspv +
-                                 "/flavors/2",
+                            "href": "http://localhost/v2.1/flavors/2",
                         },
                         {
                             "rel": "bookmark",
-                            "href": "http://localhost" + self._fake +
-                                 "/flavors/2",
+                            "href": "http://localhost/flavors/2",
                         },
                     ],
                 },
             ],
         }
+        if self.expect_description:
+            for idx, _flavor in enumerate(expected['flavors']):
+                expected['flavors'][idx]['description'] = (
+                    fakes.FLAVORS[_flavor['id']].description)
         self.assertEqual(flavor, expected)
 
     def test_get_flavor_list_with_marker(self):
         self.maxDiff = None
-        url = self._prefix + '/flavors?limit=1&marker=1'
-        req = self.fake_request.blank(url)
+        url = '/flavors?limit=1&marker=1'
+        req = self._build_request(url)
         flavor = self.controller.index(req)
         expected = {
             "flavors": [
                 {
-                    "id": "2",
-                    "name": "flavor 2",
+                    "id": fakes.FLAVORS['2'].flavorid,
+                    "name": fakes.FLAVORS['2'].name,
                     "links": [
                         {
                             "rel": "self",
-                            "href": "http://localhost/" + self._rspv +
-                                 "/flavors/2",
+                            "href": "http://localhost/v2.1/flavors/2",
                         },
                         {
                             "rel": "bookmark",
-                            "href": "http://localhost" + self._fake +
-                                 "/flavors/2",
+                            "href": "http://localhost/flavors/2",
                         },
                     ],
                 },
             ],
             'flavors_links': [
-                {'href': 'http://localhost/' + self._rspv +
-                    '/flavors?limit=1&marker=2',
+                {'href': 'http://localhost/v2.1/flavors?limit=1&marker=2',
                  'rel': 'next'}
             ]
         }
+        if self.expect_description:
+            expected['flavors'][0]['description'] = (
+                fakes.FLAVORS['2'].description)
         self.assertThat(flavor, matchers.DictMatches(expected))
 
     def test_get_flavor_list_with_invalid_marker(self):
-        req = self.fake_request.blank(self._prefix + '/flavors?marker=99999')
+        req = self._build_request('/flavors?marker=99999')
         self.assertRaises(webob.exc.HTTPBadRequest,
                           self.controller.index, req)
 
     def test_get_flavor_detail_with_limit(self):
-        url = self._prefix + '/flavors/detail?limit=1'
-        req = self.fake_request.blank(url)
+        url = '/flavors/detail?limit=1'
+        req = self._build_request(url)
         response = self.controller.detail(req)
         response_list = response["flavors"]
         response_links = response["flavors_links"]
 
         expected_flavors = [
             {
-                "id": "1",
-                "name": "flavor 1",
-                "ram": "256",
-                "disk": "10",
-                "vcpus": "",
+                "id": fakes.FLAVORS['1'].flavorid,
+                "name": fakes.FLAVORS['1'].name,
+                "ram": fakes.FLAVORS['1'].memory_mb,
+                "disk": fakes.FLAVORS['1'].root_gb,
+                "vcpus": fakes.FLAVORS['1'].vcpus,
+                "os-flavor-access:is_public": True,
+                "rxtx_factor": 1.0,
                 "links": [
                     {
                         "rel": "self",
-                        "href": "http://localhost/" + self._rspv +
-                             "/flavors/1",
+                        "href": "http://localhost/v2.1/flavors/1",
                     },
                     {
                         "rel": "bookmark",
-                        "href": "http://localhost" + self._fake +
-                             "/flavors/1",
+                        "href": "http://localhost/flavors/1",
                     },
                 ],
             },
         ]
-        self._set_expected_body(expected_flavors[0], ephemeral='20',
-                                swap='10', disabled=False)
+        self._set_expected_body(expected_flavors[0], fakes.FLAVORS['1'])
 
         self.assertEqual(response_list, expected_flavors)
         self.assertEqual(response_links[0]['rel'], 'next')
 
         href_parts = urlparse.urlparse(response_links[0]['href'])
-        self.assertEqual('/' + self._rspv + '/flavors/detail', href_parts.path)
+        self.assertEqual('/v2.1/flavors/detail', href_parts.path)
         params = urlparse.parse_qs(href_parts.query)
         self.assertThat({'limit': ['1'], 'marker': ['1']},
                         matchers.DictMatches(params))
 
-    def test_get_flavor_with_limit(self):
-        req = self.fake_request.blank(self._prefix + '/flavors?limit=2')
+    def test_get_flavor_list_with_limit(self):
+        req = self._build_request('/flavors?limit=2')
         response = self.controller.index(req)
         response_list = response["flavors"]
         response_links = response["flavors_links"]
 
         expected_flavors = [
             {
-                "id": "1",
-                "name": "flavor 1",
+                "id": fakes.FLAVORS['1'].flavorid,
+                "name": fakes.FLAVORS['1'].name,
                 "links": [
                     {
                         "rel": "self",
-                        "href": "http://localhost/" + self._rspv +
-                             "/flavors/1",
+                        "href": "http://localhost/v2.1/flavors/1",
                     },
                     {
                         "rel": "bookmark",
-                        "href": "http://localhost" + self._fake +
-                             "/flavors/1",
+                        "href": "http://localhost/flavors/1",
                     },
                 ],
             },
             {
-                "id": "2",
-                "name": "flavor 2",
+                "id": fakes.FLAVORS['2'].flavorid,
+                "name": fakes.FLAVORS['2'].name,
                 "links": [
                     {
                         "rel": "self",
-                        "href": "http://localhost/" + self._rspv +
-                             "/flavors/2",
+                        "href": "http://localhost/v2.1/flavors/2",
                     },
                     {
                         "rel": "bookmark",
-                        "href": "http://localhost" + self._fake +
-                             "/flavors/2",
+                        "href": "http://localhost/flavors/2",
                     },
                 ],
             }
         ]
+        if self.expect_description:
+            for idx, _flavor in enumerate(expected_flavors):
+                expected_flavors[idx]['description'] = (
+                    fakes.FLAVORS[_flavor['id']].description)
         self.assertEqual(response_list, expected_flavors)
         self.assertEqual(response_links[0]['rel'], 'next')
 
         href_parts = urlparse.urlparse(response_links[0]['href'])
-        self.assertEqual('/' + self._rspv + '/flavors', href_parts.path)
+        self.assertEqual('/v2.1/flavors', href_parts.path)
         params = urlparse.parse_qs(href_parts.query)
         self.assertThat({'limit': ['2'], 'marker': ['2']},
                         matchers.DictMatches(params))
 
-    def test_get_flavor_with_default_limit(self):
-        self.stubs.Set(common, "get_limit_and_marker",
-                       fake_get_limit_and_marker)
-        self.flags(osapi_max_limit=1)
-        req = fakes.HTTPRequest.blank('/v2/fake/flavors?limit=2')
+    def test_get_flavor_list_with_default_limit(self):
+        self.stub_out('nova.api.openstack.common.get_limit_and_marker',
+                      fake_get_limit_and_marker)
+        self.flags(max_limit=1, group='api')
+        req = self._build_request('/flavors?limit=2')
         response = self.controller.index(req)
         response_list = response["flavors"]
         response_links = response["flavors_links"]
 
         expected_flavors = [
             {
-                "id": "1",
-                "name": "flavor 1",
+                "id": fakes.FLAVORS['1'].flavorid,
+                "name": fakes.FLAVORS['1'].name,
                 "links": [
                     {
                         "rel": "self",
-                        "href": "http://localhost/v2/fake/flavors/1",
+                        "href": "http://localhost/v2.1/flavors/1",
                     },
                     {
                         "rel": "bookmark",
-                        "href": "http://localhost/fake/flavors/1",
+                        "href": "http://localhost/flavors/1",
                     }
                 ]
-           }
+            }
         ]
+        if self.expect_description:
+            expected_flavors[0]['description'] = (
+                fakes.FLAVORS['1'].description)
 
         self.assertEqual(response_list, expected_flavors)
         self.assertEqual(response_links[0]['rel'], 'next')
         href_parts = urlparse.urlparse(response_links[0]['href'])
-        self.assertEqual('/v2/fake/flavors', href_parts.path)
+        self.assertEqual('/v2.1/flavors', href_parts.path)
         params = urlparse.parse_qs(href_parts.query)
         self.assertThat({'limit': ['2'], 'marker': ['1']},
                         matchers.DictMatches(params))
 
     def test_get_flavor_list_detail(self):
-        req = self.fake_request.blank(self._prefix + '/flavors/detail')
+        req = self._build_request('/flavors/detail')
         flavor = self.controller.detail(req)
         expected = {
             "flavors": [
                 {
-                    "id": "1",
-                    "name": "flavor 1",
-                    "ram": "256",
-                    "disk": "10",
-                    "vcpus": "",
+                    "id": fakes.FLAVORS['1'].flavorid,
+                    "name": fakes.FLAVORS['1'].name,
+                    "ram": fakes.FLAVORS['1'].memory_mb,
+                    "disk": fakes.FLAVORS['1'].root_gb,
+                    "vcpus": fakes.FLAVORS['1'].vcpus,
+                    "os-flavor-access:is_public": True,
+                    "rxtx_factor": 1.0,
                     "links": [
                         {
                             "rel": "self",
-                            "href": "http://localhost/" + self._rspv +
-                                 "/flavors/1",
+                            "href": "http://localhost/v2.1/flavors/1",
                         },
                         {
                             "rel": "bookmark",
-                            "href": "http://localhost" + self._fake +
-                                 "/flavors/1",
+                            "href": "http://localhost/flavors/1",
                         },
                     ],
                 },
                 {
-                    "id": "2",
-                    "name": "flavor 2",
-                    "ram": "512",
-                    "disk": "20",
-                    "vcpus": "",
+                    "id": fakes.FLAVORS['2'].flavorid,
+                    "name": fakes.FLAVORS['2'].name,
+                    "ram": fakes.FLAVORS['2'].memory_mb,
+                    "disk": fakes.FLAVORS['2'].root_gb,
+                    "vcpus": fakes.FLAVORS['2'].vcpus,
+                    "os-flavor-access:is_public": True,
+                    "rxtx_factor": '',
                     "links": [
                         {
                             "rel": "self",
-                            "href": "http://localhost/" + self._rspv +
-                                 "/flavors/2",
+                            "href": "http://localhost/v2.1/flavors/2",
                         },
                         {
                             "rel": "bookmark",
-                            "href": "http://localhost" + self._fake +
-                                 "/flavors/2",
+                            "href": "http://localhost/flavors/2",
                         },
                     ],
                 },
             ],
         }
-        self._set_expected_body(expected['flavors'][0], ephemeral='20',
-                                swap='10', disabled=False)
-        self._set_expected_body(expected['flavors'][1], ephemeral='10',
-                                swap='5', disabled=False)
+        self._set_expected_body(expected['flavors'][0], fakes.FLAVORS['1'])
+        self._set_expected_body(expected['flavors'][1], fakes.FLAVORS['2'])
         self.assertEqual(expected, flavor)
 
-    def test_get_empty_flavor_list(self):
-        self.stubs.Set(nova.compute.flavors, "get_all_flavors_sorted_list",
-                       empty_get_all_flavors_sorted_list)
-
-        req = self.fake_request.blank(self._prefix + '/flavors')
+    @mock.patch('nova.objects.FlavorList.get_all',
+                return_value=objects.FlavorList())
+    def test_get_empty_flavor_list(self, mock_get):
+        req = self._build_request('/flavors')
         flavors = self.controller.index(req)
         expected = {'flavors': []}
         self.assertEqual(flavors, expected)
 
     def test_get_flavor_list_filter_min_ram(self):
         # Flavor lists may be filtered by minRam.
-        req = self.fake_request.blank(self._prefix + '/flavors?minRam=512')
+        req = self._build_request('/flavors?minRam=512')
         flavor = self.controller.index(req)
         expected = {
             "flavors": [
                 {
-                    "id": "2",
-                    "name": "flavor 2",
+                    "id": fakes.FLAVORS['2'].flavorid,
+                    "name": fakes.FLAVORS['2'].name,
                     "links": [
                         {
                             "rel": "self",
-                            "href": "http://localhost/" + self._rspv +
-                                 "/flavors/2",
+                            "href": "http://localhost/v2.1/flavors/2",
                         },
                         {
                             "rel": "bookmark",
-                            "href": "http://localhost" + self._fake +
-                                 "/flavors/2",
+                            "href": "http://localhost/flavors/2",
                         },
                     ],
                 },
             ],
         }
+        if self.expect_description:
+            expected['flavors'][0]['description'] = (
+                fakes.FLAVORS['2'].description)
         self.assertEqual(flavor, expected)
 
     def test_get_flavor_list_filter_invalid_min_ram(self):
         # Ensure you cannot list flavors with invalid minRam param.
-        req = self.fake_request.blank(self._prefix + '/flavors?minRam=NaN')
+        req = self._build_request('/flavors?minRam=NaN')
         self.assertRaises(webob.exc.HTTPBadRequest,
                           self.controller.index, req)
 
     def test_get_flavor_list_filter_min_disk(self):
         # Flavor lists may be filtered by minDisk.
-        req = self.fake_request.blank(self._prefix + '/flavors?minDisk=20')
+        req = self._build_request('/flavors?minDisk=20')
         flavor = self.controller.index(req)
         expected = {
             "flavors": [
                 {
-                    "id": "2",
-                    "name": "flavor 2",
+                    "id": fakes.FLAVORS['2'].flavorid,
+                    "name": fakes.FLAVORS['2'].name,
                     "links": [
                         {
                             "rel": "self",
-                            "href": "http://localhost/" + self._rspv +
-                                 "/flavors/2",
+                            "href": "http://localhost/v2.1/flavors/2",
                         },
                         {
                             "rel": "bookmark",
-                            "href": "http://localhost" + self._fake +
-                                 "/flavors/2",
+                            "href": "http://localhost/flavors/2",
                         },
                     ],
                 },
             ],
         }
+        if self.expect_description:
+            expected['flavors'][0]['description'] = (
+                fakes.FLAVORS['2'].description)
         self.assertEqual(flavor, expected)
 
     def test_get_flavor_list_filter_invalid_min_disk(self):
         # Ensure you cannot list flavors with invalid minDisk param.
-        req = self.fake_request.blank(self._prefix + '/flavors?minDisk=NaN')
+        req = self._build_request('/flavors?minDisk=NaN')
         self.assertRaises(webob.exc.HTTPBadRequest,
                           self.controller.index, req)
 
@@ -534,88 +467,534 @@ class FlavorsTestV21(test.TestCase):
         """Tests that filtering work on flavor details and that minRam and
         minDisk filters can be combined
         """
-        req = self.fake_request.blank(self._prefix + '/flavors/detail'
-                                      '?minRam=256&minDisk=20')
+        req = self._build_request('/flavors/detail?minRam=256&minDisk=20')
         flavor = self.controller.detail(req)
         expected = {
             "flavors": [
                 {
-                    "id": "2",
-                    "name": "flavor 2",
-                    "ram": "512",
-                    "disk": "20",
-                    "vcpus": "",
+                    "id": fakes.FLAVORS['2'].flavorid,
+                    "name": fakes.FLAVORS['2'].name,
+                    "ram": fakes.FLAVORS['2'].memory_mb,
+                    "disk": fakes.FLAVORS['2'].root_gb,
+                    "vcpus": fakes.FLAVORS['2'].vcpus,
+                    "os-flavor-access:is_public": True,
+                    "rxtx_factor": '',
                     "links": [
                         {
                             "rel": "self",
-                            "href": "http://localhost/" + self._rspv +
-                                 "/flavors/2",
+                            "href": "http://localhost/v2.1/flavors/2",
                         },
                         {
                             "rel": "bookmark",
-                            "href": "http://localhost" + self._fake +
-                                 "/flavors/2",
+                            "href": "http://localhost/flavors/2",
                         },
                     ],
                 },
             ],
         }
-        self._set_expected_body(expected['flavors'][0], ephemeral='10',
-                                swap='5', disabled=False)
+        self._set_expected_body(expected['flavors'][0], fakes.FLAVORS['2'])
         self.assertEqual(expected, flavor)
 
+    def _test_list_flavors_with_invalid_filter(
+        self, url, expected_exception=exception.ValidationError):
+        controller_list = self.controller.index
+        if 'detail' in url:
+            controller_list = self.controller.detail
+        req = self._build_request(url)
+        self.assertRaises(expected_exception,
+                          controller_list, req)
 
-class FlavorsTestV20(FlavorsTestV21):
-    _prefix = "/v2/fake"
-    Controller = flavors_v2.Controller
-    fake_request = fakes.HTTPRequest
-    _rspv = "v2/fake"
-    _fake = "/fake"
+    def test_list_flavors_with_invalid_non_int_limit(self):
+        self._test_list_flavors_with_invalid_filter('/flavors?limit=-9')
 
-    def _set_expected_body(self, expected, ephemeral, swap, disabled):
-        pass
+    def test_list_detail_flavors_with_invalid_non_int_limit(self):
+        self._test_list_flavors_with_invalid_filter('/flavors/detail?limit=-9')
+
+    def test_list_flavors_with_invalid_string_limit(self):
+        self._test_list_flavors_with_invalid_filter('/flavors?limit=abc')
+
+    def test_list_detail_flavors_with_invalid_string_limit(self):
+        self._test_list_flavors_with_invalid_filter(
+            '/flavors/detail?limit=abc')
+
+    def test_list_duplicate_query_with_invalid_string_limit(self):
+        self._test_list_flavors_with_invalid_filter(
+            '/flavors?limit=1&limit=abc')
+
+    def test_list_detail_duplicate_query_with_invalid_string_limit(self):
+        self._test_list_flavors_with_invalid_filter(
+            '/flavors/detail?limit=1&limit=abc')
+
+    def _test_list_flavors_duplicate_query_parameters_validation(
+        self, url, expected=None):
+        controller_list = self.controller.index
+        if 'detail' in url:
+            controller_list = self.controller.detail
+        expected_resp = [{
+            "id": fakes.FLAVORS['2'].flavorid,
+            "name": fakes.FLAVORS['2'].name,
+            "links": [
+                {
+                    "rel": "self",
+                    "href": "http://localhost/v2.1/flavors/2",
+                },
+                {
+                    "rel": "bookmark",
+                    "href": "http://localhost/flavors/2",
+                },
+            ],
+        }]
+        if expected:
+            expected_resp[0].update(expected)
+        if self.expect_description:
+            expected_resp[0]['description'] = (
+                fakes.FLAVORS['2'].description)
+        if 'detail' in url and self.expect_extra_specs:
+            expected_resp[0]['extra_specs'] = (
+                fakes.FLAVORS['2'].extra_specs)
+        if self.omit_legacy_fields:
+            expected_resp[0].pop('rxtx_factor', None)
+            expected_resp[0].pop('OS-FLV-DISABLED:disabled', None)
+        params = {
+            'limit': 1,
+            'marker': 1,
+            'is_public': 't',
+            'minRam': 2,
+            'minDisk': 2,
+            'sort_key': 'id',
+            'sort_dir': 'asc'
+        }
+
+        for param, value in params.items():
+            req = self._build_request(
+                url + '?marker=1&%s=%s&%s=%s' %
+                (param, value, param, value))
+            result = controller_list(req)
+            self.assertEqual(expected_resp, result['flavors'])
+
+    def test_list_duplicate_query_parameters_validation(self):
+        self._test_list_flavors_duplicate_query_parameters_validation(
+            '/flavors')
+
+    def test_list_detail_duplicate_query_parameters_validation(self):
+        expected = {
+            "ram": fakes.FLAVORS['2'].memory_mb,
+            "disk": fakes.FLAVORS['2'].root_gb,
+            "vcpus": fakes.FLAVORS['2'].vcpus,
+            "os-flavor-access:is_public": True,
+            "rxtx_factor": '',
+            "OS-FLV-EXT-DATA:ephemeral": fakes.FLAVORS['2'].ephemeral_gb,
+            "OS-FLV-DISABLED:disabled": fakes.FLAVORS['2'].disabled,
+            "swap": fakes.FLAVORS['2'].swap
+        }
+        self._test_list_flavors_duplicate_query_parameters_validation(
+            '/flavors/detail', expected)
+
+    def _test_list_flavors_with_allowed_filter(
+        self, url, expected=None, req=None):
+        controller_list = self.controller.index
+        if 'detail' in url:
+            controller_list = self.controller.detail
+        expected_resp = [{
+            "id": fakes.FLAVORS['2'].flavorid,
+            "name": fakes.FLAVORS['2'].name,
+            "links": [
+                {
+                    "rel": "self",
+                    "href": "http://localhost/v2.1/flavors/2",
+                },
+                {
+                    "rel": "bookmark",
+                    "href": "http://localhost/flavors/2",
+                },
+            ],
+        }]
+        if expected:
+            expected_resp[0].update(expected)
+        if self.expect_description:
+            expected_resp[0]['description'] = (
+                fakes.FLAVORS['2'].description)
+        if 'detail' in url and self.expect_extra_specs:
+            expected_resp[0]['extra_specs'] = (
+                fakes.FLAVORS['2'].extra_specs)
+        if self.omit_legacy_fields:
+            expected_resp[0].pop('rxtx_factor', None)
+            expected_resp[0].pop('OS-FLV-DISABLED:disabled', None)
+        req = req or self._build_request(url + '&limit=1&marker=1')
+        result = controller_list(req)
+        self.assertEqual(expected_resp, result['flavors'])
+
+    def test_list_flavors_with_additional_filter(self):
+        self._test_list_flavors_with_allowed_filter(
+            '/flavors?limit=1&marker=1&additional=something')
+
+    def test_list_detail_flavors_with_additional_filter(self):
+        expected = {
+            "ram": fakes.FLAVORS['2'].memory_mb,
+            "disk": fakes.FLAVORS['2'].root_gb,
+            "vcpus": fakes.FLAVORS['2'].vcpus,
+            "os-flavor-access:is_public": True,
+            "rxtx_factor": '',
+            "OS-FLV-EXT-DATA:ephemeral": fakes.FLAVORS['2'].ephemeral_gb,
+            "OS-FLV-DISABLED:disabled": fakes.FLAVORS['2'].disabled,
+            "swap": fakes.FLAVORS['2'].swap
+        }
+        self._test_list_flavors_with_allowed_filter(
+            '/flavors/detail?limit=1&marker=1&additional=something',
+            expected)
+
+    def test_list_flavors_with_min_ram_filter_as_negative_int(self):
+        self._test_list_flavors_with_allowed_filter(
+            '/flavors?minRam=-2')
+
+    def test_list_detail_flavors_with_min_ram_filter_as_negative_int(self):
+        expected = {
+            "ram": fakes.FLAVORS['2'].memory_mb,
+            "disk": fakes.FLAVORS['2'].root_gb,
+            "vcpus": fakes.FLAVORS['2'].vcpus,
+            "os-flavor-access:is_public": True,
+            "rxtx_factor": '',
+            "OS-FLV-EXT-DATA:ephemeral": fakes.FLAVORS['2'].ephemeral_gb,
+            "OS-FLV-DISABLED:disabled": fakes.FLAVORS['2'].disabled,
+            "swap": fakes.FLAVORS['2'].swap
+        }
+        self._test_list_flavors_with_allowed_filter(
+            '/flavors/detail?minRam=-2', expected)
+
+    def test_list_flavors_with_min_ram_filter_as_float(self):
+        self._test_list_flavors_with_invalid_filter(
+            '/flavors?minRam=1.2', expected_exception=webob.exc.HTTPBadRequest)
+
+    def test_list_detail_flavors_with_min_ram_filter_as_float(self):
+        self._test_list_flavors_with_invalid_filter(
+            '/flavors/detail?minRam=1.2',
+            expected_exception=webob.exc.HTTPBadRequest)
+
+    def test_list_flavors_with_min_disk_filter_as_negative_int(self):
+        self._test_list_flavors_with_allowed_filter('/flavors?minDisk=-2')
+
+    def test_list_detail_flavors_with_min_disk_filter_as_negative_int(self):
+        expected = {
+            "ram": fakes.FLAVORS['2'].memory_mb,
+            "disk": fakes.FLAVORS['2'].root_gb,
+            "vcpus": fakes.FLAVORS['2'].vcpus,
+            "os-flavor-access:is_public": True,
+            "rxtx_factor": '',
+            "OS-FLV-EXT-DATA:ephemeral": fakes.FLAVORS['2'].ephemeral_gb,
+            "OS-FLV-DISABLED:disabled": fakes.FLAVORS['2'].disabled,
+            "swap": fakes.FLAVORS['2'].swap
+        }
+        self._test_list_flavors_with_allowed_filter(
+            '/flavors/detail?minDisk=-2', expected)
+
+    def test_list_flavors_with_min_disk_filter_as_float(self):
+        self._test_list_flavors_with_invalid_filter(
+            '/flavors?minDisk=1.2',
+            expected_exception=webob.exc.HTTPBadRequest)
+
+    def test_list_detail_flavors_with_min_disk_filter_as_float(self):
+        self._test_list_flavors_with_invalid_filter(
+            '/flavors/detail?minDisk=1.2',
+            expected_exception=webob.exc.HTTPBadRequest)
+
+    def test_list_flavors_with_is_public_filter_as_string_none(self):
+        self._test_list_flavors_with_allowed_filter(
+            '/flavors?is_public=none')
+
+    def test_list_detail_flavors_with_is_public_filter_as_string_none(self):
+        expected = {
+            "ram": fakes.FLAVORS['2'].memory_mb,
+            "disk": fakes.FLAVORS['2'].root_gb,
+            "vcpus": fakes.FLAVORS['2'].vcpus,
+            "os-flavor-access:is_public": True,
+            "rxtx_factor": '',
+            "OS-FLV-EXT-DATA:ephemeral": fakes.FLAVORS['2'].ephemeral_gb,
+            "OS-FLV-DISABLED:disabled": fakes.FLAVORS['2'].disabled,
+            "swap": fakes.FLAVORS['2'].swap
+        }
+        self._test_list_flavors_with_allowed_filter(
+            '/flavors/detail?is_public=none', expected)
+
+    def test_list_flavors_with_is_public_filter_as_valid_bool(self):
+        self._test_list_flavors_with_allowed_filter(
+            '/flavors?is_public=false')
+
+    def test_list_detail_flavors_with_is_public_filter_as_valid_bool(self):
+        expected = {
+            "ram": fakes.FLAVORS['2'].memory_mb,
+            "disk": fakes.FLAVORS['2'].root_gb,
+            "vcpus": fakes.FLAVORS['2'].vcpus,
+            "OS-FLV-EXT-DATA:ephemeral": fakes.FLAVORS['2'].ephemeral_gb,
+            "os-flavor-access:is_public": True,
+            "rxtx_factor": '',
+            "OS-FLV-DISABLED:disabled": fakes.FLAVORS['2'].disabled,
+            "swap": fakes.FLAVORS['2'].swap
+        }
+        self._test_list_flavors_with_allowed_filter(
+            '/flavors/detail?is_public=false', expected)
+
+    def test_list_flavors_with_is_public_filter_as_invalid_string(self):
+        self._test_list_flavors_with_allowed_filter(
+            '/flavors?is_public=invalid')
+
+    def test_list_detail_flavors_with_is_public_filter_as_invalid_string(self):
+        expected = {
+            "ram": fakes.FLAVORS['2'].memory_mb,
+            "disk": fakes.FLAVORS['2'].root_gb,
+            "vcpus": fakes.FLAVORS['2'].vcpus,
+            "os-flavor-access:is_public": True,
+            "rxtx_factor": '',
+            "OS-FLV-EXT-DATA:ephemeral": fakes.FLAVORS['2'].ephemeral_gb,
+            "OS-FLV-DISABLED:disabled": fakes.FLAVORS['2'].disabled,
+            "swap": fakes.FLAVORS['2'].swap
+        }
+        self._test_list_flavors_with_allowed_filter(
+            '/flavors/detail?is_public=invalid', expected)
+
+
+class FlavorsTestV255(FlavorsTestV21):
+    """Run the same tests as we would for v2.1 but with a description."""
+    microversion = '2.55'
+    expect_description = True
+
+
+class FlavorsTestV261(FlavorsTestV255):
+    """Run the same tests as we would for v2.55 but with a extra_specs."""
+    microversion = '2.61'
+    expect_extra_specs = True
+
+
+class FlavorsTestV275(FlavorsTestV261):
+    microversion = '2.75'
+
+    FLAVOR_WITH_NO_SWAP = objects.Flavor(
+        id=1,
+        name='flavor 1',
+        memory_mb=256,
+        vcpus=1,
+        root_gb=10,
+        ephemeral_gb=20,
+        flavorid='1',
+        rxtx_factor=1.0,
+        vcpu_weight=None,
+        disabled=False,
+        is_public=True,
+        swap=0,
+        description=None,
+        extra_specs={"key1": "value1", "key2": "value2"}
+    )
+
+    def test_list_flavors_with_additional_filter_old_version(self):
+        req = fakes.HTTPRequestV21.blank(
+            '/flavors?limit=1&marker=1&additional=something',
+            version='2.74', base_url='http://localhost/v2.1')
+        self._test_list_flavors_with_allowed_filter(
+            '/flavors?limit=1&marker=1&additional=something',
+            req=req)
+
+    def test_list_detail_flavors_with_additional_filter_old_version(self):
+        expected = {
+            "ram": fakes.FLAVORS['2'].memory_mb,
+            "disk": fakes.FLAVORS['2'].root_gb,
+            "vcpus": fakes.FLAVORS['2'].vcpus,
+            "os-flavor-access:is_public": True,
+            "rxtx_factor": '',
+            "OS-FLV-EXT-DATA:ephemeral": fakes.FLAVORS['2'].ephemeral_gb,
+            "OS-FLV-DISABLED:disabled": fakes.FLAVORS['2'].disabled,
+            "swap": fakes.FLAVORS['2'].swap
+        }
+        req = fakes.HTTPRequestV21.blank(
+            '/flavors?limit=1&marker=1&additional=something',
+            version='2.74', base_url='http://localhost/v2.1')
+        self._test_list_flavors_with_allowed_filter(
+            '/flavors/detail?limit=1&marker=1&additional=something',
+            expected, req=req)
+
+    def _test_list_flavors_with_additional_filter(self, url):
+        controller_list = self.controller.index
+        if 'detail' in url:
+            controller_list = self.controller.detail
+        req = self._build_request(url)
+        self.assertRaises(exception.ValidationError,
+                          controller_list, req)
+
+    def test_list_flavors_with_additional_filter(self):
+        self._test_list_flavors_with_additional_filter(
+            '/flavors?limit=1&marker=1&additional=something')
+
+    def test_list_detail_flavors_with_additional_filter(self):
+        self._test_list_flavors_with_additional_filter(
+            '/flavors/detail?limit=1&marker=1&additional=something')
+
+    @mock.patch('nova.objects.FlavorList.get_all')
+    def test_list_flavor_detail_default_swap_value_old_version(self, mock_get):
+        mock_get.return_value = objects.FlavorList(
+            objects=[self.FLAVOR_WITH_NO_SWAP])
+        req = fakes.HTTPRequestV21.blank(
+            '/flavors/detail?limit=1', version='2.74')
+        response = self.controller.detail(req)
+        response_list = response["flavors"]
+        self.assertEqual(response_list[0]['swap'], "")
+
+    @mock.patch('nova.objects.Flavor.get_by_flavor_id')
+    def test_show_flavor_default_swap_value_old_version(self, mock_get):
+        mock_get.return_value = self.FLAVOR_WITH_NO_SWAP
+        req = fakes.HTTPRequestV21.blank('/flavors/1', version='2.74')
+        response = self.controller.show(req, 1)
+        response_list = response["flavor"]
+        self.assertEqual(response_list['swap'], "")
+
+    @mock.patch('nova.objects.FlavorList.get_all')
+    def test_list_flavor_detail_default_swap_value(self, mock_get):
+        mock_get.return_value = objects.FlavorList(
+            objects=[self.FLAVOR_WITH_NO_SWAP])
+        req = fakes.HTTPRequestV21.blank(
+            '/flavors/detail?limit=1', version=self.microversion)
+        response = self.controller.detail(req)
+        response_list = response["flavors"]
+        self.assertEqual(response_list[0]['swap'], 0)
+
+    @mock.patch('nova.objects.Flavor.get_by_flavor_id')
+    def test_show_flavor_default_swap_value(self, mock_get):
+        mock_get.return_value = self.FLAVOR_WITH_NO_SWAP
+        req = fakes.HTTPRequestV21.blank(
+            '/flavors/1', version=self.microversion)
+        response = self.controller.show(req, 1)
+        response_list = response["flavor"]
+        self.assertEqual(response_list['swap'], 0)
+
+
+class FlavorsTestV2102(FlavorsTestV275):
+    microversion = '2.102'
+    omit_legacy_fields = True
+
+    def test_list_flavors_with_name_filter_old_version(self):
+        req = fakes.HTTPRequestV21.blank(
+            '/flavors?name=false', version='2.101')
+        self.assertRaises(
+            exception.ValidationError, self.controller.index, req)
+
+    def test_list_detail_flavors_with_name_filter_old_version(self):
+        req = fakes.HTTPRequestV21.blank(
+            '/flavors/detail?name=false', version='2.101')
+        self.assertRaises(
+            exception.ValidationError, self.controller.detail, req)
+
+    def test_list_flavors_with_name_filter(self):
+        req = fakes.HTTPRequestV21.blank(
+            '/flavors?name=2', version=self.microversion)
+        actual = self.controller.index(req)
+        expected = {
+            'flavors': [
+                {
+                    'description': 'flavor 2 description',
+                    'id': '2',
+                    'links': [
+                        {
+                            'href': 'http://localhost/v2.1/flavors/2',
+                            'rel': 'self',
+                        },
+                        {
+                            'href': 'http://localhost/flavors/2',
+                            'rel': 'bookmark',
+                        },
+                    ],
+                    'name': 'flavor 2',
+                },
+            ],
+        }
+        self.assertEqual(expected, actual)
+
+    def test_list_detail_flavors_with_name_filter(self):
+        req = fakes.HTTPRequestV21.blank(
+            '/flavors/detail?name=2', version=self.microversion)
+        actual = self.controller.detail(req)
+        expected = {
+            'flavors': [
+                {
+                    'OS-FLV-EXT-DATA:ephemeral':
+                        fakes.FLAVORS['2'].ephemeral_gb,
+                    'description': fakes.FLAVORS['2'].description,
+                    'disk': fakes.FLAVORS['2'].root_gb,
+                    'extra_specs': {},
+                    'id': '2',
+                    'links': [
+                        {
+                            'href': 'http://localhost/v2.1/flavors/2',
+                            'rel': 'self',
+                        },
+                        {
+                            'href': 'http://localhost/flavors/2',
+                            'rel': 'bookmark',
+                        },
+                    ],
+                    'name': fakes.FLAVORS['2'].name,
+                    'os-flavor-access:is_public': True,
+                    'ram': fakes.FLAVORS['2'].memory_mb,
+                    'swap': fakes.FLAVORS['2'].swap,
+                    'vcpus': fakes.FLAVORS['2'].vcpus,
+                },
+            ],
+        }
+        self.assertEqual(expected, actual)
+
+    def test_list_detail_flavors_with_additional_filter_old_version(self):
+        self.omit_legacy_fields = False
+        super().test_list_detail_flavors_with_additional_filter_old_version()
+
+    def test_list_flavor_invalid_query_params(self):
+        req = fakes.HTTPRequest.blank(
+            '/flavors?unknown=1',
+            use_admin_context=True,
+            version='2.102')
+        self.assertRaises(
+            exception.ValidationError, self.controller.index, req
+        )
+
+    def test_detail_flavor_invalid_query_params(self):
+        req = fakes.HTTPRequest.blank(
+            '/flavors/detail?unknown=1',
+            use_admin_context=True,
+            version='2.102')
+        self.assertRaises(
+            exception.ValidationError, self.controller.detail, req
+        )
+
+    def test_show_flavor_invalid_query_params(self):
+        req = fakes.HTTPRequest.blank(
+            '/flavors/123?unknown=1',
+            use_admin_context=True,
+            version='2.102')
+        self.assertRaises(
+            exception.ValidationError, self.controller.show, req, '123'
+        )
 
 
 class DisabledFlavorsWithRealDBTestV21(test.TestCase):
     """Tests that disabled flavors should not be shown nor listed."""
-    Controller = flavors_v21.FlavorsController
-    _prefix = "/v3"
-    fake_request = fakes.HTTPRequestV3
 
     def setUp(self):
-        super(DisabledFlavorsWithRealDBTestV21, self).setUp()
+        super().setUp()
 
         # Add a new disabled type to the list of flavors
-        self.req = self.fake_request.blank(self._prefix + '/flavors')
+        self.req = fakes.HTTPRequestV21.blank('/flavors')
         self.context = self.req.environ['nova.context']
         self.admin_context = context.get_admin_context()
 
-        self.disabled_type = self._create_disabled_instance_type()
-        self.inst_types = db.flavor_get_all(
-                self.admin_context)
-        self.controller = self.Controller()
+        self.disabled_type = self._create_disabled_flavor()
+        self.addCleanup(self.disabled_type.destroy)
+        self.flavors = objects.FlavorList.get_all(self.admin_context)
+        self.controller = flavors.FlavorsController()
 
-    def tearDown(self):
-        db.flavor_destroy(
-                self.admin_context, self.disabled_type['name'])
-
-        super(DisabledFlavorsWithRealDBTestV21, self).tearDown()
-
-    def _create_disabled_instance_type(self):
-        inst_types = db.flavor_get_all(self.admin_context)
-
-        inst_type = inst_types[0]
-
-        del inst_type['id']
-        inst_type['name'] += '.disabled'
-        inst_type['flavorid'] = six.text_type(max(
-                [int(flavor['flavorid']) for flavor in inst_types]) + 1)
-        inst_type['disabled'] = True
-
-        disabled_type = db.flavor_create(
-                self.admin_context, inst_type)
-
-        return disabled_type
+    def _create_disabled_flavor(self):
+        flavor = objects.Flavor(context=self.admin_context,
+                                name='foo.disabled', flavorid='10.disabled',
+                                memory_mb=512, vcpus=2, root_gb=1,
+                                ephemeral_gb=0, swap=0, rxtx_factor=1.0,
+                                vcpu_weight=1, disabled=True, is_public=True,
+                                extra_specs={}, projects=[])
+        flavor.create()
+        return flavor
 
     def test_index_should_not_list_disabled_flavors_to_user(self):
         self.context.is_admin = False
@@ -623,7 +1002,7 @@ class DisabledFlavorsWithRealDBTestV21(test.TestCase):
         flavor_list = self.controller.index(self.req)['flavors']
         api_flavorids = set(f['id'] for f in flavor_list)
 
-        db_flavorids = set(i['flavorid'] for i in self.inst_types)
+        db_flavorids = set(i['flavorid'] for i in self.flavors)
         disabled_flavorid = str(self.disabled_type['flavorid'])
 
         self.assertIn(disabled_flavorid, db_flavorids)
@@ -636,7 +1015,7 @@ class DisabledFlavorsWithRealDBTestV21(test.TestCase):
         flavor_list = self.controller.index(self.req)['flavors']
         api_flavorids = set(f['id'] for f in flavor_list)
 
-        db_flavorids = set(i['flavorid'] for i in self.inst_types)
+        db_flavorids = set(i['flavorid'] for i in self.flavors)
         disabled_flavorid = str(self.disabled_type['flavorid'])
 
         self.assertIn(disabled_flavorid, db_flavorids)
@@ -665,19 +1044,11 @@ class DisabledFlavorsWithRealDBTestV21(test.TestCase):
         self.assertEqual(flavor['name'], self.disabled_type['name'])
 
 
-class DisabledFlavorsWithRealDBTestV20(DisabledFlavorsWithRealDBTestV21):
-    """Tests that disabled flavors should not be shown nor listed."""
-    Controller = flavors_v2.Controller
-    _prefix = "/v2/fake"
-    fake_request = fakes.HTTPRequest
-
-
 class ParseIsPublicTestV21(test.TestCase):
-    Controller = flavors_v21.FlavorsController
 
     def setUp(self):
-        super(ParseIsPublicTestV21, self).setUp()
-        self.controller = self.Controller()
+        super().setUp()
+        self.controller = flavors.FlavorsController()
 
     def assertPublic(self, expected, is_public):
         self.assertIs(expected, self.controller._parse_is_public(is_public),
@@ -706,8 +1077,4 @@ class ParseIsPublicTestV21(test.TestCase):
 
     def test_other(self):
         self.assertRaises(
-                webob.exc.HTTPBadRequest, self.assertPublic, None, 'other')
-
-
-class ParseIsPublicTestV20(ParseIsPublicTestV21):
-    Controller = flavors_v2.Controller
+            webob.exc.HTTPBadRequest, self.assertPublic, None, 'other')

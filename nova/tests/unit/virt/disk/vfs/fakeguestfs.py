@@ -22,6 +22,7 @@ EVENT_TRACE = 0x4
 class GuestFS(object):
     SUPPORT_CLOSE_ON_EXIT = True
     SUPPORT_RETURN_DICT = True
+    CAN_SET_OWNERSHIP = True
 
     def __init__(self, **kwargs):
         if not self.SUPPORT_CLOSE_ON_EXIT and 'close_on_exit' in kwargs:
@@ -52,6 +53,7 @@ class GuestFS(object):
         self.drives = []
 
     def set_backend_settings(self, settings):
+        assert isinstance(settings, list), 'set_backend_settings takes a list'
         self.backend_settings = settings
 
     def close(self):
@@ -59,7 +61,7 @@ class GuestFS(object):
 
     def add_drive_opts(self, file, *args, **kwargs):
         if file == "/some/fail/file":
-            raise RuntimeError("%s: No such file or directory", file)
+            raise RuntimeError("%s: No such file or directory" % file)
 
         self.drives.append((file, kwargs))
 
@@ -107,7 +109,7 @@ class GuestFS(object):
                 "mode": 0o700
                 }
 
-        return self.files[path]["content"]
+        return bytes(self.files[path]["content"].encode())
 
     def write(self, path, content):
         if path not in self.files:
@@ -164,6 +166,11 @@ class GuestFS(object):
         if not self.auginit:
             raise RuntimeError("Augeus not initialized")
 
+        if ((cfgpath.startswith("/files/etc/passwd") or
+                cfgpath.startswith("/files/etc/group")) and not
+                self.CAN_SET_OWNERSHIP):
+            raise RuntimeError("Node not found %s" % cfgpath)
+
         if cfgpath == "/files/etc/passwd/root/uid":
             return 0
         elif cfgpath == "/files/etc/passwd/fred/uid":
@@ -176,7 +183,7 @@ class GuestFS(object):
             return 500
         elif cfgpath == "/files/etc/group/admins/gid":
             return 600
-        raise RuntimeError("Unknown path %s", cfgpath)
+        raise RuntimeError("Unknown path %s" % cfgpath)
 
     def set_trace(self, enabled):
         self.trace_enabled = enabled

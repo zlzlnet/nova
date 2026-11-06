@@ -15,20 +15,22 @@
 
 """Client side of the conductor RPC API."""
 
-from oslo_config import cfg
 import oslo_messaging as messaging
 from oslo_serialization import jsonutils
+from oslo_versionedobjects import base as ovo_base
 
+import nova.conf
+from nova import exception
+from nova.i18n import _
 from nova.objects import base as objects_base
+from nova import profiler
 from nova import rpc
 
-CONF = cfg.CONF
-
-rpcapi_cap_opt = cfg.StrOpt('conductor',
-        help='Set a version cap for messages sent to conductor services')
-CONF.register_opt(rpcapi_cap_opt, 'upgrade_levels')
+CONF = nova.conf.CONF
+RPC_TOPIC = 'conductor'
 
 
+@profiler.trace_cls("rpc")
 class ConductorAPI(object):
     """Client side of the conductor RPC API
 
@@ -177,7 +179,25 @@ class ConductorAPI(object):
     * Remove compute_node_update()
     * Remove compute_node_delete()
     * Remove security_groups_trigger_handler()
+    * Remove task_log_get()
+    * Remove task_log_begin_task()
+    * Remove task_log_end_task()
+    * Remove security_groups_trigger_members_refresh()
+    * Remove vol_usage_update()
+    * Remove instance_update()
 
+    * 2.2 - Add object_backport_versions()
+    * 2.3 - Add object_class_action_versions()
+    * Remove compute_node_create()
+    * Remove object_backport()
+
+    * 3.0  - Drop backwards compatibility
+
+    ... Liberty, Mitaka, Newton, and Ocata support message version 3.0.  So,
+    any changes to existing methods in 3.x after that point should be done such
+    that they can handle the version_cap being set to 3.0.
+
+    * Remove provider_fw_rule_get_all()
     """
 
     VERSION_ALIASES = {
@@ -186,11 +206,15 @@ class ConductorAPI(object):
         'icehouse': '2.0',
         'juno': '2.0',
         'kilo': '2.1',
+        'liberty': '3.0',
+        'mitaka': '3.0',
+        'newton': '3.0',
+        'ocata': '3.0',
     }
 
     def __init__(self):
         super(ConductorAPI, self).__init__()
-        target = messaging.Target(topic=CONF.conductor.topic, version='2.0')
+        target = messaging.Target(topic=RPC_TOPIC, version='3.0')
         version_cap = self.VERSION_ALIASES.get(CONF.upgrade_levels.conductor,
                                                CONF.upgrade_levels.conductor)
         serializer = objects_base.NovaObjectSerializer()
@@ -198,79 +222,38 @@ class ConductorAPI(object):
                                      version_cap=version_cap,
                                      serializer=serializer)
 
-    def instance_update(self, context, instance_uuid, updates,
-                        service=None):
-        updates_p = jsonutils.to_primitive(updates)
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'instance_update',
-                          instance_uuid=instance_uuid,
-                          updates=updates_p,
-                          service=service)
-
-    def provider_fw_rule_get_all(self, context):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'provider_fw_rule_get_all')
-
-    def vol_usage_update(self, context, vol_id, rd_req, rd_bytes, wr_req,
-                         wr_bytes, instance, last_refreshed=None,
-                         update_totals=False):
-        instance_p = jsonutils.to_primitive(instance)
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'vol_usage_update',
-                          vol_id=vol_id, rd_req=rd_req,
-                          rd_bytes=rd_bytes, wr_req=wr_req,
-                          wr_bytes=wr_bytes,
-                          instance=instance_p, last_refreshed=last_refreshed,
-                          update_totals=update_totals)
-
-    def compute_node_create(self, context, values):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'compute_node_create', values=values)
-
-    def task_log_get(self, context, task_name, begin, end, host, state=None):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'task_log_get',
-                          task_name=task_name, begin=begin, end=end,
-                          host=host, state=state)
-
-    def task_log_begin_task(self, context, task_name, begin, end, host,
-                            task_items=None, message=None):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'task_log_begin_task',
-                          task_name=task_name,
-                          begin=begin, end=end, host=host,
-                          task_items=task_items, message=message)
-
-    def task_log_end_task(self, context, task_name, begin, end, host, errors,
-                          message=None):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'task_log_end_task',
-                          task_name=task_name, begin=begin, end=end,
-                          host=host, errors=errors, message=message)
-
-    def security_groups_trigger_members_refresh(self, context, group_ids):
-        cctxt = self.client.prepare()
-        return cctxt.call(context, 'security_groups_trigger_members_refresh',
-                          group_ids=group_ids)
-
+    # TODO(hanlind): This method can be removed once oslo.versionedobjects
+    # has been converted to use version_manifests in remotable + classmethod
+    # operations, which will use the new class action handler.
     def object_class_action(self, context, objname, objmethod, objver,
                             args, kwargs):
+        versions = ovo_base.obj_tree_get_versions(objname)
+        return self.object_class_action_versions(context,
+                                                 objname,
+                                                 objmethod,
+                                                 versions,
+                                                 args, kwargs)
+
+    def object_class_action_versions(self, context, objname, objmethod,
+                                     object_versions, args, kwargs):
         cctxt = self.client.prepare()
-        return cctxt.call(context, 'object_class_action',
+        return cctxt.call(context, 'object_class_action_versions',
                           objname=objname, objmethod=objmethod,
-                          objver=objver, args=args, kwargs=kwargs)
+                          object_versions=object_versions,
+                          args=args, kwargs=kwargs)
 
     def object_action(self, context, objinst, objmethod, args, kwargs):
         cctxt = self.client.prepare()
         return cctxt.call(context, 'object_action', objinst=objinst,
                           objmethod=objmethod, args=args, kwargs=kwargs)
 
-    def object_backport(self, context, objinst, target_version):
+    def object_backport_versions(self, context, objinst, object_versions):
         cctxt = self.client.prepare()
-        return cctxt.call(context, 'object_backport', objinst=objinst,
-                          target_version=target_version)
+        return cctxt.call(context, 'object_backport_versions', objinst=objinst,
+                          object_versions=object_versions)
 
 
+@profiler.trace_cls("rpc")
 class ComputeTaskAPI(object):
     """Client side of the conductor 'compute' namespaced RPC API
 
@@ -281,34 +264,76 @@ class ComputeTaskAPI(object):
     1.2 - Added build_instances
     1.3 - Added unshelve_instance
     1.4 - Added reservations to migrate_server.
-    1.5 - Added the leagacy_bdm parameter to build_instances
+    1.5 - Added the legacy_bdm parameter to build_instances
     1.6 - Made migrate_server use instance objects
     1.7 - Do not send block_device_mapping and legacy_bdm to build_instances
     1.8 - Add rebuild_instance
     1.9 - Converted requested_networks to NetworkRequestList object
     1.10 - Made migrate_server() and build_instances() send flavor objects
     1.11 - Added clean_shutdown to migrate_server()
-
+    1.12 - Added request_spec to rebuild_instance()
+    1.13 - Added request_spec to migrate_server()
+    1.14 - Added request_spec to unshelve_instance()
+    1.15 - Added live_migrate_instance
+    1.16 - Added schedule_and_build_instances
+    1.17 - Added tags to schedule_and_build_instances()
+    1.18 - Added request_spec to build_instances().
+    1.19 - build_instances() now gets a 'host_lists' parameter that represents
+           potential alternate hosts for retries within a cell for each
+           instance.
+    1.20 - migrate_server() now gets a 'host_list' parameter that represents
+           potential alternate hosts for retries within a cell.
+    1.21 - Added cache_images()
+    1.22 - Added confirm_snapshot_based_resize()
+    1.23 - Added revert_snapshot_based_resize()
+    1.24 - Add reimage_boot_volume parameter to rebuild_instance()
+    1.25 - Add target_state parameter to rebuild_instance()
+    1.26 - Added attach_volume()
     """
 
     def __init__(self):
         super(ComputeTaskAPI, self).__init__()
-        target = messaging.Target(topic=CONF.conductor.topic,
+        target = messaging.Target(topic=RPC_TOPIC,
                                   namespace='compute_task',
                                   version='1.0')
         serializer = objects_base.NovaObjectSerializer()
         self.client = rpc.get_client(target, serializer=serializer)
 
+    def live_migrate_instance(self, context, instance, scheduler_hint,
+                              block_migration, disk_over_commit, request_spec):
+        kw = {'instance': instance, 'scheduler_hint': scheduler_hint,
+              'block_migration': block_migration,
+              'disk_over_commit': disk_over_commit,
+              'request_spec': request_spec,
+              }
+        version = '1.15'
+        cctxt = self.client.prepare(version=version)
+        cctxt.cast(context, 'live_migrate_instance', **kw)
+
+    # TODO(melwitt): Remove the reservations parameter in version 2.0 of the
+    # RPC API.
+    # TODO(mriedem): Make request_spec required *and* a RequestSpec object
+    # rather than a legacy dict in version 2.0 of the RPC API.
     def migrate_server(self, context, instance, scheduler_hint, live, rebuild,
                   flavor, block_migration, disk_over_commit,
-                  reservations=None, clean_shutdown=True):
+                  reservations=None, clean_shutdown=True, request_spec=None,
+                  host_list=None, do_cast=False):
         kw = {'instance': instance, 'scheduler_hint': scheduler_hint,
               'live': live, 'rebuild': rebuild, 'flavor': flavor,
               'block_migration': block_migration,
               'disk_over_commit': disk_over_commit,
               'reservations': reservations,
-              'clean_shutdown': clean_shutdown}
-        version = '1.11'
+              'clean_shutdown': clean_shutdown,
+              'request_spec': request_spec,
+              'host_list': host_list,
+              }
+        version = '1.20'
+        if not self.client.can_send_version(version):
+            del kw['host_list']
+            version = '1.13'
+        if not self.client.can_send_version(version):
+            del kw['request_spec']
+            version = '1.11'
         if not self.client.can_send_version(version):
             del kw['clean_shutdown']
             version = '1.10'
@@ -319,53 +344,174 @@ class ComputeTaskAPI(object):
             kw['instance'] = jsonutils.to_primitive(
                     objects_base.obj_to_primitive(instance))
             version = '1.4'
-        cctxt = self.client.prepare(version=version)
+        cctxt = self.client.prepare(
+            version=version,
+            call_monitor_timeout=CONF.rpc_response_timeout,
+            timeout=CONF.long_rpc_timeout)
+        if do_cast:
+            return cctxt.cast(context, 'migrate_server', **kw)
         return cctxt.call(context, 'migrate_server', **kw)
 
     def build_instances(self, context, instances, image, filter_properties,
             admin_password, injected_files, requested_networks,
-            security_groups, block_device_mapping, legacy_bdm=True):
+            security_groups, block_device_mapping, legacy_bdm=True,
+            request_spec=None, host_lists=None):
         image_p = jsonutils.to_primitive(image)
-        version = '1.10'
+        kwargs = {"instances": instances, "image": image_p,
+                  "filter_properties": filter_properties,
+                  "admin_password": admin_password,
+                  "injected_files": injected_files,
+                  "requested_networks": requested_networks,
+                  "security_groups": security_groups,
+                  "request_spec": request_spec,
+                  "host_lists": host_lists}
+        version = '1.19'
+        if not self.client.can_send_version(version):
+            version = '1.18'
+            kwargs.pop("host_lists")
+        if not self.client.can_send_version(version):
+            version = '1.10'
+            kwargs.pop("request_spec")
         if not self.client.can_send_version(version):
             version = '1.9'
             if 'instance_type' in filter_properties:
                 flavor = filter_properties['instance_type']
                 flavor_p = objects_base.obj_to_primitive(flavor)
-                filter_properties = dict(filter_properties,
-                                         instance_type=flavor_p)
-        kw = {'instances': instances, 'image': image_p,
-               'filter_properties': filter_properties,
-               'admin_password': admin_password,
-               'injected_files': injected_files,
-               'requested_networks': requested_networks,
-               'security_groups': security_groups}
+                kwargs["filter_properties"] = dict(filter_properties,
+                                                   instance_type=flavor_p)
         if not self.client.can_send_version(version):
             version = '1.8'
-            kw['requested_networks'] = kw['requested_networks'].as_tuples()
+            nets = kwargs['requested_networks'].as_tuples()
+            kwargs['requested_networks'] = nets
         if not self.client.can_send_version('1.7'):
             version = '1.5'
             bdm_p = objects_base.obj_to_primitive(block_device_mapping)
-            kw.update({'block_device_mapping': bdm_p,
-                       'legacy_bdm': legacy_bdm})
+            kwargs.update({'block_device_mapping': bdm_p,
+                           'legacy_bdm': legacy_bdm})
 
         cctxt = self.client.prepare(version=version)
-        cctxt.cast(context, 'build_instances', **kw)
+        cctxt.cast(context, 'build_instances', **kwargs)
 
-    def unshelve_instance(self, context, instance):
-        cctxt = self.client.prepare(version='1.3')
-        cctxt.cast(context, 'unshelve_instance', instance=instance)
+    def schedule_and_build_instances(self, context, build_requests,
+                                     request_specs,
+                                     image, admin_password, injected_files,
+                                     requested_networks,
+                                     block_device_mapping,
+                                     tags=None):
+        version = '1.17'
+        kw = {'build_requests': build_requests,
+              'request_specs': request_specs,
+              'image': jsonutils.to_primitive(image),
+              'admin_password': admin_password,
+              'injected_files': injected_files,
+              'requested_networks': requested_networks,
+              'block_device_mapping': block_device_mapping,
+              'tags': tags}
+
+        if not self.client.can_send_version(version):
+            version = '1.16'
+            del kw['tags']
+
+        cctxt = self.client.prepare(version=version)
+        cctxt.cast(context, 'schedule_and_build_instances', **kw)
+
+    def unshelve_instance(self, context, instance, request_spec=None):
+        version = '1.14'
+        kw = {'instance': instance,
+              'request_spec': request_spec
+              }
+        if not self.client.can_send_version(version):
+            version = '1.3'
+            del kw['request_spec']
+        cctxt = self.client.prepare(version=version)
+        cctxt.cast(context, 'unshelve_instance', **kw)
 
     def rebuild_instance(self, ctxt, instance, new_pass, injected_files,
             image_ref, orig_image_ref, orig_sys_metadata, bdms,
             recreate=False, on_shared_storage=False, host=None,
-            preserve_ephemeral=False, kwargs=None):
-        cctxt = self.client.prepare(version='1.8')
-        cctxt.cast(ctxt, 'rebuild_instance',
-                   instance=instance, new_pass=new_pass,
-                   injected_files=injected_files, image_ref=image_ref,
-                   orig_image_ref=orig_image_ref,
-                   orig_sys_metadata=orig_sys_metadata, bdms=bdms,
-                   recreate=recreate, on_shared_storage=on_shared_storage,
-                   preserve_ephemeral=preserve_ephemeral,
-                   host=host)
+            preserve_ephemeral=False, request_spec=None,
+            reimage_boot_volume=False, target_state=None):
+        version = '1.25'
+        kw = {'instance': instance,
+              'new_pass': new_pass,
+              'injected_files': injected_files,
+              'image_ref': image_ref,
+              'orig_image_ref': orig_image_ref,
+              'orig_sys_metadata': orig_sys_metadata,
+              'bdms': bdms,
+              'recreate': recreate,
+              'on_shared_storage': on_shared_storage,
+              'preserve_ephemeral': preserve_ephemeral,
+              'host': host,
+              'request_spec': request_spec,
+              'reimage_boot_volume': reimage_boot_volume,
+              'target_state': target_state,
+              }
+        if not self.client.can_send_version(version):
+            if kw['target_state']:
+                raise exception.UnsupportedRPCVersion(
+                    api="rebuild_instance", required="1.25")
+            else:
+                del kw['target_state']
+            version = '1.24'
+        if not self.client.can_send_version(version):
+            if kw['reimage_boot_volume']:
+                raise exception.NovaException(
+                    'Conductor RPC version does not support '
+                    'reimage_boot_volume parameter.')
+            else:
+                del kw['reimage_boot_volume']
+            version = '1.12'
+        if not self.client.can_send_version(version):
+            version = '1.8'
+            del kw['request_spec']
+        cctxt = self.client.prepare(version=version)
+        cctxt.cast(ctxt, 'rebuild_instance', **kw)
+
+    def cache_images(self, ctxt, aggregate, image_ids):
+        version = '1.21'
+        if not self.client.can_send_version(version):
+            raise exception.NovaException('Conductor RPC version pin does not '
+                                          'allow cache_images() to be called')
+        cctxt = self.client.prepare(version=version)
+        cctxt.cast(ctxt, 'cache_images', aggregate=aggregate,
+                   image_ids=image_ids)
+
+    def confirm_snapshot_based_resize(
+            self, ctxt, instance, migration, do_cast=True):
+        version = '1.22'
+        if not self.client.can_send_version(version):
+            raise exception.ServiceTooOld(_('nova-conductor too old'))
+        kw = {'instance': instance, 'migration': migration}
+        cctxt = self.client.prepare(version=version)
+        if do_cast:
+            return cctxt.cast(ctxt, 'confirm_snapshot_based_resize', **kw)
+        return cctxt.call(ctxt, 'confirm_snapshot_based_resize', **kw)
+
+    def revert_snapshot_based_resize(self, ctxt, instance, migration):
+        version = '1.23'
+        if not self.client.can_send_version(version):
+            raise exception.ServiceTooOld(_('nova-conductor too old'))
+        kw = {'instance': instance, 'migration': migration}
+        cctxt = self.client.prepare(version=version)
+        cctxt.cast(ctxt, 'revert_snapshot_based_resize', **kw)
+
+    def attach_volume(self, ctxt, instance, volume, device, disk_bus,
+            device_type, tag=None, supports_multiattach=False,
+            delete_on_termination=False, do_cast=False):
+        version = '1.26'
+        if not self.client.can_send_version(version):
+            raise exception.ServiceTooOld(_('nova-conductor too old'))
+        kw = {'instance': instance, 'volume': volume, 'device': device,
+              'disk_bus': disk_bus, 'device_type': device_type, 'tag': tag,
+              'supports_multiattach': supports_multiattach,
+              'delete_on_termination': delete_on_termination}
+        if do_cast:
+            cctxt = self.client.prepare(version=version)
+            return cctxt.cast(ctxt, 'attach_volume', **kw)
+        # NOTE(jkulik): We call nova-compute's reserve_block_device_name(),
+        # which uses long_rpc_timeout and thus we need a long_rpc_timeout, too.
+        cctxt = self.client.prepare(
+            version=version, call_monitor_timeout=CONF.rpc_response_timeout,
+            timeout=CONF.long_rpc_timeout)
+        return cctxt.call(ctxt, 'attach_volume', **kw)

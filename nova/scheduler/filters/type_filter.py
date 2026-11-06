@@ -18,44 +18,24 @@ from nova.scheduler import filters
 from nova.scheduler.filters import utils
 
 
-class TypeAffinityFilter(filters.BaseHostFilter):
-    """TypeAffinityFilter doesn't allow more than one VM type per host.
-
-    Note: this works best with ram_weight_multiplier
-    (spread) set to 1 (default).
-    """
-
-    def host_passes(self, host_state, filter_properties):
-        """Dynamically limits hosts to one instance type
-
-        Return False if host has any instance types other than the requested
-        type. Return True if all instance types match or if host is empty.
-        """
-        instance_type = filter_properties.get('instance_type')
-        instance_type_id = instance_type['id']
-        other_types_on_host = utils.other_types_on_host(host_state,
-                                                        instance_type_id)
-        return not other_types_on_host
-
-
 class AggregateTypeAffinityFilter(filters.BaseHostFilter):
-    """AggregateTypeAffinityFilter limits instance_type by aggregate
+    """AggregateTypeAffinityFilter limits flavors by aggregate
 
-    return True if no instance_type key is set or if the aggregate metadata
+    return True if no flavor key is set or if the aggregate metadata
     key 'instance_type' has the instance_type name as a value
     """
 
     # Aggregate data does not change within a request
     run_filter_once_per_request = True
 
-    def host_passes(self, host_state, filter_properties):
-        instance_type = filter_properties.get('instance_type')
+    RUN_ON_REBUILD = False
 
+    def host_passes(self, host_state, spec_obj):
+        # TODO(stephenfin): Add support for 'flavor' key
         aggregate_vals = utils.aggregate_values_from_key(
             host_state, 'instance_type')
 
         for val in aggregate_vals:
-            if (instance_type['name'] in
-                    [x.strip() for x in val.split(',')]):
+            if spec_obj.flavor.name in [x.strip() for x in val.split(',')]:
                 return True
         return not aggregate_vals

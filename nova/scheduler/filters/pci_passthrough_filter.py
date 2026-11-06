@@ -20,7 +20,10 @@ from nova.scheduler import filters
 LOG = logging.getLogger(__name__)
 
 
-class PciPassthroughFilter(filters.BaseHostFilter):
+class PciPassthroughFilter(
+    filters.BaseHostFilter,
+    filters.CandidateFilterMixin,
+):
     """Pci Passthrough Filter based on PCI request
 
     Filter that schedules instances on a host if the host has devices
@@ -40,14 +43,32 @@ class PciPassthroughFilter(filters.BaseHostFilter):
 
     """
 
-    def host_passes(self, host_state, filter_properties):
+    RUN_ON_REBUILD = False
+
+    def host_passes(self, host_state, spec_obj):
         """Return true if the host has the required PCI devices."""
-        pci_requests = filter_properties.get('pci_requests')
-        if not pci_requests:
+        pci_requests = spec_obj.pci_requests
+        if not pci_requests or not pci_requests.requests:
             return True
-        if not host_state.pci_stats.support_requests(pci_requests.requests):
+
+        if not host_state.pci_stats:
+            LOG.debug("%(host_state)s doesn't have the required PCI devices"
+                      " (%(requests)s)",
+                      {'host_state': host_state,
+                       'requests': pci_requests.requests})
+            return False
+
+        good_candidates = self.filter_candidates(
+            host_state,
+            lambda candidate: host_state.pci_stats.support_requests(
+                pci_requests.requests, provider_mapping=candidate["mappings"]
+            ),
+        )
+
+        if not good_candidates:
             LOG.debug("%(host_state)s doesn't have the required PCI devices"
                       " (%(requests)s)",
                       {'host_state': host_state, 'requests': pci_requests})
             return False
+
         return True

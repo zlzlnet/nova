@@ -13,18 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from oslo_config import cfg
 from oslo_log import log as logging
+import oslo_messaging as messaging
 from oslo_utils import timeutils
-import six
 
-from nova.i18n import _, _LE
+import nova.conf
+from nova import exception
+from nova.i18n import _
 from nova.servicegroup import api
 from nova.servicegroup.drivers import base
 
 
-CONF = cfg.CONF
-CONF.import_opt('service_down_time', 'nova.service')
+CONF = nova.conf.CONF
 
 LOG = logging.getLogger(__name__)
 
@@ -50,18 +50,17 @@ class DbDriver(base.Driver):
                                  ' ServiceGroup driver'))
         report_interval = service.report_interval
         if report_interval:
-            service.tg.add_timer(report_interval, self._report_state,
-                                 api.INITIAL_REPORTING_DELAY, service)
+            service.tg.add_timer_args(
+                report_interval, self._report_state, args=[service],
+                initial_delay=api.INITIAL_REPORTING_DELAY)
 
     def is_up(self, service_ref):
         """Moved from nova.utils
         Check whether a service is up based on last heartbeat.
         """
-        # Keep checking 'updated_at' if 'last_seen_up' isn't set.
-        # Should be able to use only 'last_seen_up' in the M release
         last_heartbeat = (service_ref.get('last_seen_up') or
-            service_ref['updated_at'] or service_ref['created_at'])
-        if isinstance(last_heartbeat, six.string_types):
+            service_ref['created_at'])
+        if isinstance(last_heartbeat, str):
             # NOTE(russellb) If this service_ref came in over rpc via
             # conductor, then the timestamp will be a string and needs to be
             # converted back to a datetime.
@@ -74,13 +73,20 @@ class DbDriver(base.Driver):
         elapsed = timeutils.delta_seconds(last_heartbeat, timeutils.utcnow())
         is_up = abs(elapsed) <= self.service_down_time
         if not is_up:
-            LOG.debug('Seems service is down. Last heartbeat was %(lhb)s. '
-                      'Elapsed time is %(el)s',
-                      {'lhb': str(last_heartbeat), 'el': str(elapsed)})
+            LOG.debug('Seems service %(binary)s on host %(host)s is down. '
+                      'Last heartbeat was %(lhb)s. Elapsed time is %(el)s',
+                      {'binary': service_ref.get('binary'),
+                       'host': service_ref.get('host'),
+                       'lhb': str(last_heartbeat), 'el': str(elapsed)})
         return is_up
+
+    def updated_time(self, service_ref):
+        """Get the updated time from db"""
+        return service_ref['updated_at']
 
     def _report_state(self, service):
         """Update the state of this service in the datastore."""
+
         try:
             service.service_ref.report_count += 1
             service.service_ref.save()
@@ -88,10 +94,31 @@ class DbDriver(base.Driver):
             # TODO(termie): make this pattern be more elegant.
             if getattr(service, 'model_disconnected', False):
                 service.model_disconnected = False
-                LOG.error(_LE('Recovered model server connection!'))
-
-        # TODO(vish): this should probably only catch connection errors
-        except Exception:
+                LOG.info('Recovered from being unable to report status.')
+        except messaging.MessagingTimeout:
+            # NOTE(johngarbutt) during upgrade we will see messaging timeouts
+            # as nova-conductor is restarted, so only log this error once.
             if not getattr(service, 'model_disconnected', False):
                 service.model_disconnected = True
-                LOG.exception(_LE('model server went away'))
+                LOG.warning(
+                    'Lost connection to nova-conductor for reporting service '
+                    'status.'
+                )
+        except exception.ServiceNotFound:
+            # The service may have been deleted via the API but the actual
+            # process is still running. Provide a useful error message rather
+            # than the noisy traceback in the generic Exception block below.
+            LOG.error('The services table record for the %s service on '
+                      'host %s is gone. You either need to stop this service '
+                      'if it should be deleted or restart it to recreate the '
+                      'record in the database.',
+                      service.service_ref.binary, service.service_ref.host)
+            service.model_disconnected = True
+        except Exception:
+            # NOTE(rpodolyaka): we'd like to avoid catching of all possible
+            # exceptions here, but otherwise it would become possible for
+            # the state reporting thread to stop abruptly, and thus leave
+            # the service unusable until it's restarted.
+            LOG.exception('Unexpected error while reporting service status')
+            # trigger the recovery log message, if this error goes away
+            service.model_disconnected = True

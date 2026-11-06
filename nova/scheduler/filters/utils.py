@@ -17,9 +17,6 @@
 import collections
 
 from oslo_log import log as logging
-import six
-
-from nova.i18n import _LI
 
 LOG = logging.getLogger(__name__)
 
@@ -60,10 +57,14 @@ def validate_num_values(vals, default=None, cast_to=int, based_on=min):
         return default
 
     if num_values > 1:
-        LOG.info(_LI("%(num_values)d values found, "
-                     "of which the minimum value will be used."),
-                 {'num_values': num_values})
-
+        if based_on == min:
+            LOG.info("%(num_values)d values found, "
+                     "of which the minimum value will be used.",
+                     {'num_values': num_values})
+        else:
+            LOG.info("%(num_values)d values found, "
+                     "of which the maximum value will be used.",
+                     {'num_values': num_values})
     return based_on([cast_to(val) for val in vals])
 
 
@@ -73,22 +74,9 @@ def instance_uuids_overlap(host_state, uuids):
     Returns True if any of the supplied uuids match any of the instance.uuid
     values in the host_state.
     """
-    if isinstance(uuids, six.string_types):
+    if isinstance(uuids, str):
         uuids = [uuids]
     set_uuids = set(uuids)
     # host_state.instances is a dict whose keys are the instance uuids
     host_uuids = set(host_state.instances.keys())
     return bool(host_uuids.intersection(set_uuids))
-
-
-def other_types_on_host(host_state, instance_type_id):
-    """Tests for overlap between a host_state's instances and an
-    instance_type_id.
-
-    Returns True if there are any instances in the host_state whose
-    instance_type_id is different than the supplied instance_type_id value.
-    """
-    host_instances = host_state.instances.values()
-    host_types = set([inst.instance_type_id for inst in host_instances])
-    inst_set = set([instance_type_id])
-    return bool(host_types - inst_set)

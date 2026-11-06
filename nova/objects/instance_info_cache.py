@@ -12,23 +12,23 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_db import exception as db_exc
 from oslo_log import log as logging
 
-from nova.cells import opts as cells_opts
-from nova.cells import rpcapi as cells_rpcapi
-from nova import db
+from nova.db.main import api as db
 from nova import exception
-from nova.i18n import _LE
 from nova.objects import base
 from nova.objects import fields
 
 LOG = logging.getLogger(__name__)
 
+__all__ = [
+    'InstanceInfoCache',
+]
 
-# TODO(berrange): Remove NovaObjectDictCompat
+
 @base.NovaObjectRegistry.register
-class InstanceInfoCache(base.NovaPersistentObject, base.NovaObject,
-                        base.NovaObjectDictCompat):
+class InstanceInfoCache(base.NovaPersistentObject, base.NovaObject):
     # Version 1.0: Initial version
     # Version 1.1: Converted network_info to store the model.
     # Version 1.2: Added new() and update_cells kwarg to save().
@@ -40,13 +40,13 @@ class InstanceInfoCache(base.NovaPersistentObject, base.NovaObject,
 
     fields = {
         'instance_uuid': fields.UUIDField(),
-        'network_info': fields.Field(fields.NetworkModel(), nullable=True),
-        }
+        'network_info': fields.NetworkModelField(nullable=True),
+    }
 
     @staticmethod
     def _from_db_object(context, info_cache, db_obj):
         for field in info_cache.fields:
-            info_cache[field] = db_obj[field]
+            setattr(info_cache, field, db_obj[field])
         info_cache.obj_reset_changes()
         info_cache._context = context
         return info_cache
@@ -66,7 +66,8 @@ class InstanceInfoCache(base.NovaPersistentObject, base.NovaObject,
         # Leave the fields dirty
         return info_cache
 
-    @base.remotable_classmethod
+    @classmethod
+    @base.remotable
     def get_by_instance_uuid(cls, context, instance_uuid):
         db_obj = db.instance_info_cache_get(context, instance_uuid)
         if not db_obj:
@@ -74,33 +75,32 @@ class InstanceInfoCache(base.NovaPersistentObject, base.NovaObject,
                     instance_uuid=instance_uuid)
         return cls._from_db_object(context, cls(context), db_obj)
 
-    @staticmethod
-    def _info_cache_cells_update(ctxt, info_cache):
-        cell_type = cells_opts.get_cell_type()
-        if cell_type != 'compute':
-            return
-        cells_api = cells_rpcapi.CellsAPI()
-        try:
-            cells_api.instance_info_cache_update_at_top(ctxt, info_cache)
-        except Exception:
-            LOG.exception(_LE("Failed to notify cells of instance info "
-                              "cache update"))
-
+    # TODO(stephenfin): Remove 'update_cells' in version 2.0
     @base.remotable
     def save(self, update_cells=True):
         if 'network_info' in self.obj_what_changed():
-            if update_cells:
-                stale_instance = self.obj_clone()
             nw_info_json = self.fields['network_info'].to_primitive(
                 self, 'network_info', self.network_info)
-            rv = db.instance_info_cache_update(self._context,
-                                               self.instance_uuid,
-                                               {'network_info': nw_info_json})
+
+            inst_uuid = self.instance_uuid
+
+            try:
+                rv = db.instance_info_cache_update(
+                    self._context, inst_uuid, {'network_info': nw_info_json})
+            except db_exc.DBReferenceError as exp:
+                if exp.key != 'instance_uuid':
+                    raise
+                # NOTE(melwitt): It is possible for us to fail here with a
+                # foreign key constraint violation on instance_uuid when we
+                # attempt to save the instance network info cache after
+                # receiving a network-changed external event from neutron
+                # during a cross-cell migration. This means the instance record
+                # is not found in this cell database and we can raise
+                # InstanceNotFound to signal that in a way that callers know
+                # how to handle.
+                raise exception.InstanceNotFound(instance_id=inst_uuid)
+
             self._from_db_object(self._context, self, rv)
-            if update_cells:
-                # Send a copy of ourselves before updates are applied so
-                # that cells can tell what changed.
-                self._info_cache_cells_update(self._context, stale_instance)
         self.obj_reset_changes()
 
     @base.remotable
@@ -114,7 +114,8 @@ class InstanceInfoCache(base.NovaPersistentObject, base.NovaObject,
         current._context = None
 
         for field in self.fields:
-            if self.obj_attr_is_set(field) and self[field] != current[field]:
-                self[field] = current[field]
+            if (self.obj_attr_is_set(field) and
+                    getattr(self, field) != getattr(current, field)):
+                setattr(self, field, getattr(current, field))
 
         self.obj_reset_changes()

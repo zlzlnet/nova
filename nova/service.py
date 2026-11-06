@@ -17,107 +17,131 @@
 
 """Generic Node base class for all workers that run on hosts."""
 
+import functools
+import inspect
 import os
+import os.path
 import random
 import sys
+import threading
 
-from oslo_concurrency import processutils
-from oslo_config import cfg
 from oslo_log import log as logging
 import oslo_messaging as messaging
+from oslo_service import service
 from oslo_utils import importutils
 
 from nova import baserpc
 from nova import conductor
+import nova.conf
 from nova import context
-from nova import debugger
 from nova import exception
-from nova.i18n import _, _LE, _LI, _LW
+from nova.i18n import _
 from nova import objects
 from nova.objects import base as objects_base
-from nova.openstack.common import service
+from nova.objects import service as service_obj
 from nova import rpc
 from nova import servicegroup
 from nova import utils
 from nova import version
-from nova import wsgi
 
+osprofiler = importutils.try_import("osprofiler")
+osprofiler_initializer = importutils.try_import("osprofiler.initializer")
+
+CONF = nova.conf.CONF
 LOG = logging.getLogger(__name__)
 
-service_opts = [
-    cfg.IntOpt('report_interval',
-               default=10,
-               help='Seconds between nodes reporting state to datastore'),
-    cfg.BoolOpt('periodic_enable',
-               default=True,
-               help='Enable periodic tasks'),
-    cfg.IntOpt('periodic_fuzzy_delay',
-               default=60,
-               help='Range of seconds to randomly delay when starting the'
-                    ' periodic task scheduler to reduce stampeding.'
-                    ' (Disable by setting to 0)'),
-    cfg.ListOpt('enabled_apis',
-                default=['ec2', 'osapi_compute', 'metadata'],
-                help='A list of APIs to enable by default'),
-    cfg.ListOpt('enabled_ssl_apis',
-                default=[],
-                help='A list of APIs with enabled SSL'),
-    cfg.StrOpt('ec2_listen',
-               default="0.0.0.0",
-               help='The IP address on which the EC2 API will listen.'),
-    cfg.IntOpt('ec2_listen_port',
-               default=8773,
-               help='The port on which the EC2 API will listen.'),
-    cfg.IntOpt('ec2_workers',
-               help='Number of workers for EC2 API service. The default will '
-                    'be equal to the number of CPUs available.'),
-    cfg.StrOpt('osapi_compute_listen',
-               default="0.0.0.0",
-               help='The IP address on which the OpenStack API will listen.'),
-    cfg.IntOpt('osapi_compute_listen_port',
-               default=8774,
-               help='The port on which the OpenStack API will listen.'),
-    cfg.IntOpt('osapi_compute_workers',
-               help='Number of workers for OpenStack API service. The default '
-                    'will be the number of CPUs available.'),
-    cfg.StrOpt('metadata_manager',
-               default='nova.api.manager.MetadataManager',
-               help='OpenStack metadata service manager'),
-    cfg.StrOpt('metadata_listen',
-               default="0.0.0.0",
-               help='The IP address on which the metadata API will listen.'),
-    cfg.IntOpt('metadata_listen_port',
-               default=8775,
-               help='The port on which the metadata API will listen.'),
-    cfg.IntOpt('metadata_workers',
-               help='Number of workers for metadata service. The default will '
-                    'be the number of CPUs available.'),
-    cfg.StrOpt('compute_manager',
-               default='nova.compute.manager.ComputeManager',
-               help='Full class name for the Manager for compute'),
-    cfg.StrOpt('console_manager',
-               default='nova.console.manager.ConsoleProxyManager',
-               help='Full class name for the Manager for console proxy'),
-    cfg.StrOpt('consoleauth_manager',
-               default='nova.consoleauth.manager.ConsoleAuthManager',
-               help='Manager for console auth'),
-    cfg.StrOpt('cert_manager',
-               default='nova.cert.manager.CertManager',
-               help='Full class name for the Manager for cert'),
-    cfg.StrOpt('network_manager',
-               default='nova.network.manager.VlanManager',
-               help='Full class name for the Manager for network'),
-    cfg.StrOpt('scheduler_manager',
-               default='nova.scheduler.manager.SchedulerManager',
-               help='Full class name for the Manager for scheduler'),
-    cfg.IntOpt('service_down_time',
-               default=60,
-               help='Maximum time since last check-in for up service'),
-    ]
+SERVICE_MANAGERS = {
+    'nova-compute': 'nova.compute.manager.ComputeManager',
+    'nova-conductor': 'nova.conductor.manager.ConductorManager',
+    'nova-scheduler': 'nova.scheduler.manager.SchedulerManager',
+}
 
-CONF = cfg.CONF
-CONF.register_opts(service_opts)
-CONF.import_opt('host', 'nova.netconf')
+
+class _TrackingEndpointWrapper:
+    """RPC endpoint wrapper to track the RPC methods
+
+    This is RPC endpoint wrapper to be supplied to RPC server so that
+    each RPC method call can be tracked. `endpoint` is the real object
+    oslo.messaging should dispatch calls to (a service's manager or one
+    of its additional_endpoints); `tracker` is the object whose
+    _record_task_start()/_record_task_end() the call gets recorded on,
+    defaulting to `endpoint` itself. additional_endpoints (e.g. conductor's
+    ComputeTaskManager) are not Manager subclasses and have no tracking
+    dict of their own, so they're wrapped with `tracker` set to the owning
+    manager instead, reporting into its in-progress-task dict.
+    """
+
+    def __init__(self, endpoint, tracker=None):
+        self._endpoint = endpoint
+        self._tracker = tracker if tracker is not None else endpoint
+
+    def __getattr__(self, name):
+        attr = getattr(self._endpoint, name)
+        if (not inspect.ismethod(attr) or
+                getattr(attr, '_skip_automatic_rpc_tracking', False)):
+            setattr(self, name, attr)
+            return attr
+
+        @functools.wraps(attr)
+        def _tracked(*args, **kwargs):
+            instance_uuid = None
+            request_id = None
+            if isinstance(args[0], context.RequestContext):
+                request_id = getattr(args[0], 'request_id', None)
+            if len(args) > 1 and isinstance(args[1], objects.Instance):
+                instance_uuid = args[1].uuid
+            elif 'instance' in kwargs:
+                instance_uuid = kwargs['instance'].uuid
+
+            key = self._tracker._record_task_start(
+                name, instance_uuid, request_id)
+            try:
+                result = attr(*args, **kwargs)
+            except Exception:
+                self._tracker._record_task_end(key, failed=True)
+                raise
+            self._tracker._record_task_end(key)
+            return result
+
+        # NOTE(gmaan): __getattr__ is only called when `name` isn't found on
+        # the object. Setting the _tracked() wrapped method using setattr so
+        # that the next RPC call for same method are called directly without
+        # rebuilding RPC method with _tracked() wrapper.
+        setattr(self, name, _tracked)
+        return _tracked
+
+
+def _create_service_ref(this_service, context):
+    service = objects.Service(context)
+    service.host = this_service.host
+    service.binary = this_service.binary
+    service.topic = this_service.topic
+    service.report_count = 0
+    service.create()
+    return service
+
+
+def _update_service_ref(service):
+    if service.version != service_obj.SERVICE_VERSION:
+        LOG.info('Updating service version for %(binary)s on '
+                 '%(host)s from %(old)i to %(new)i',
+                 {'binary': service.binary,
+                  'host': service.host,
+                  'old': service.version,
+                  'new': service_obj.SERVICE_VERSION})
+        service.version = service_obj.SERVICE_VERSION
+        service.save()
+
+
+def setup_profiler(binary, host):
+    if osprofiler and CONF.profiler.enabled:
+        osprofiler.initializer.init_from_conf(
+            conf=CONF,
+            context=context.get_admin_context().to_dict(),
+            project="nova",
+            service=binary,
+            host=host)
+        LOG.info("OSProfiler is enabled.")
 
 
 class Service(service.Service):
@@ -125,44 +149,85 @@ class Service(service.Service):
 
     A service takes a manager and enables rpc by listening to queues based
     on topic. It also periodically runs tasks on the manager and reports
-    it state to the database services table.
+    its state to the database services table.
     """
 
     def __init__(self, host, binary, topic, manager, report_interval=None,
                  periodic_enable=None, periodic_fuzzy_delay=None,
-                 periodic_interval_max=None, db_allowed=True,
+                 periodic_interval_max=None, topic_alt=None,
                  *args, **kwargs):
         super(Service, self).__init__()
         self.host = host
         self.binary = binary
         self.topic = topic
+        # NOTE(gmaan): If any service would like to create a 2nd rpc server,
+        # then it needs to be created with different topic (topic_alt) so that
+        # oslo.messaging creates the different RPC objects (for example,
+        # dispatcher, consumers, rabbitmq queue, amqp listener, kombu
+        # connection etc). The endpoint (manager) stay same so that same
+        # manager will be serving the both rpc servers.
+        self.topic_alt = topic_alt
         self.manager_class_name = manager
         self.servicegroup_api = servicegroup.API()
         manager_class = importutils.import_class(self.manager_class_name)
+        if objects_base.NovaObject.indirection_api:
+            conductor_api = conductor.API()
+            conductor_api.wait_until_ready(context.get_admin_context())
         self.manager = manager_class(host=self.host, *args, **kwargs)
         self.rpcserver = None
+        self.rpcserver_alt = None
         self.report_interval = report_interval
         self.periodic_enable = periodic_enable
         self.periodic_fuzzy_delay = periodic_fuzzy_delay
         self.periodic_interval_max = periodic_interval_max
         self.saved_args, self.saved_kwargs = args, kwargs
         self.backdoor_port = None
-        self.conductor_api = conductor.API(use_local=db_allowed)
-        self.conductor_api.wait_until_ready(context.get_admin_context())
+        setup_profiler(binary, self.host)
+
+    def __repr__(self):
+        return "<%(cls_name)s: host=%(host)s, binary=%(binary)s, " \
+               "manager_class_name=%(manager)s>" % {
+                 'cls_name': self.__class__.__name__,
+                 'host': self.host,
+                 'binary': self.binary,
+                 'manager': self.manager_class_name
+                }
 
     def start(self):
+        """Start the service.
+
+        This includes starting an RPC service, initializing
+        periodic tasks, etc.
+        """
+        # NOTE(melwitt): Clear the cell cache holding database transaction
+        # context manager objects. We do this to ensure we create new internal
+        # oslo.db locks to avoid a situation where a child process receives an
+        # already locked oslo.db lock when it is forked. When a child process
+        # inherits a locked oslo.db lock, database accesses through that
+        # transaction context manager will never be able to acquire the lock
+        # and requests will fail with CellTimeout errors.
+        # See https://bugs.python.org/issue6721 for more information.
+        # With python 3.7, it would be possible for oslo.db to make use of the
+        # os.register_at_fork() method to reinitialize its lock. Until we
+        # require python 3.7 as a minimum version, we must handle the situation
+        # outside of oslo.db.
+        context.CELL_CACHE = {}
+
         verstr = version.version_string_with_package()
-        LOG.info(_LI('Starting %(topic)s node (version %(version)s)'),
+        LOG.info('Starting %(topic)s node (version %(version)s)',
                   {'topic': self.topic, 'version': verstr})
         self.basic_config_check()
-        self.manager.init_host()
-        self.model_disconnected = False
         ctxt = context.get_admin_context()
         self.service_ref = objects.Service.get_by_host_and_binary(
             ctxt, self.host, self.binary)
-        if not self.service_ref:
+        self.manager.init_host(self.service_ref)
+        self.model_disconnected = False
+        if self.service_ref:
+            _update_service_ref(self.service_ref)
+
+        else:
             try:
-                self.service_ref = self._create_service_ref(ctxt)
+                self.service_ref = _create_service_ref(self, ctxt)
             except (exception.ServiceTopicExists,
                     exception.ServiceBinaryExists):
                 # NOTE(danms): If we race to create a record with a sibling
@@ -170,25 +235,53 @@ class Service(service.Service):
                 self.service_ref = objects.Service.get_by_host_and_binary(
                     ctxt, self.host, self.binary)
 
-        self.manager.pre_start_hook()
+        self.manager.pre_start_hook(self.service_ref)
 
         if self.backdoor_port is not None:
             self.manager.backdoor_port = self.backdoor_port
 
-        LOG.debug("Creating RPC server for service %s", self.topic)
-
         target = messaging.Target(topic=self.topic, server=self.host)
 
+        # Wrap the manager (and its additional_endpoints) so every RPC
+        # call dispatched to them is recorded. additional_endpoints (e.g.
+        # conductor's ComputeTaskManager) are not Manager subclasses, so
+        # they report into the manager's tracking dict instead of their
+        # own via the tracker argument.
+        manager_endpoint = _TrackingEndpointWrapper(self.manager)
+
         endpoints = [
-            self.manager,
+            manager_endpoint,
             baserpc.BaseRPCAPI(self.manager.service_name, self.backdoor_port)
         ]
-        endpoints.extend(self.manager.additional_endpoints)
+        endpoints.extend(
+            _TrackingEndpointWrapper(additional_endpoint, self.manager)
+            for additional_endpoint in self.manager.additional_endpoints)
 
         serializer = objects_base.NovaObjectSerializer()
 
+        LOG.debug("Creating RPC server for service: %s on topic: %s",
+                  self.binary, self.topic)
         self.rpcserver = rpc.get_server(target, endpoints, serializer)
         self.rpcserver.start()
+
+        self.rpcserver_alt = None
+        # NOTE(gmaan): Only compute service creates the two rpcservers which
+        # means each compute service will create two rabiitmq queues bound with
+        # same exchange but on two different topics (1. 'compute'
+        # 2. 'compute-alt').
+        # The main use case for 2nd rpcserver is graceful shutdown of compute
+        # service. During graceful shutdown, the compute service will stop
+        # listening to the new request (stop listening on 'compute' rpcserver)
+        # but continue listening to the 'compute-alt' rpcserver so that it can
+        # finish all their ongoing operations.
+        if self.topic_alt is not None:
+            LOG.debug("Creating 2nd RPC server for service: %s on topic: %s",
+                      self.binary, self.topic_alt)
+            target_alt = messaging.Target(
+                    topic=self.topic_alt, server=self.host)
+            self.rpcserver_alt = rpc.get_server(
+                    target_alt, endpoints, serializer)
+            self.rpcserver_alt.start()
 
         self.manager.post_start_hook()
 
@@ -208,15 +301,6 @@ class Service(service.Service):
                                      periodic_interval_max=
                                         self.periodic_interval_max)
 
-    def _create_service_ref(self, context):
-        service = objects.Service(context)
-        service.host = self.host
-        service.binary = self.binary
-        service.topic = self.topic
-        service.report_count = 0
-        service.create()
-        return service
-
     def __getattr__(self, key):
         manager = self.__dict__.get('manager', None)
         return getattr(manager, key)
@@ -225,7 +309,7 @@ class Service(service.Service):
     def create(cls, host=None, binary=None, topic=None, manager=None,
                report_interval=None, periodic_enable=None,
                periodic_fuzzy_delay=None, periodic_interval_max=None,
-               db_allowed=True):
+               topic_alt=None):
         """Instantiates class and passes back application object.
 
         :param host: defaults to CONF.host
@@ -236,6 +320,7 @@ class Service(service.Service):
         :param periodic_enable: defaults to CONF.periodic_enable
         :param periodic_fuzzy_delay: defaults to CONF.periodic_fuzzy_delay
         :param periodic_interval_max: if set, the max time to wait between runs
+        :param topic_alt: defaults to None
 
         """
         if not host:
@@ -245,9 +330,7 @@ class Service(service.Service):
         if not topic:
             topic = binary.rpartition('nova-')[2]
         if not manager:
-            manager_cls = ('%s_manager' %
-                           binary.rpartition('nova-')[2])
-            manager = CONF.get(manager_cls, None)
+            manager = SERVICE_MANAGERS.get(binary)
         if report_interval is None:
             report_interval = CONF.report_interval
         if periodic_enable is None:
@@ -255,38 +338,140 @@ class Service(service.Service):
         if periodic_fuzzy_delay is None:
             periodic_fuzzy_delay = CONF.periodic_fuzzy_delay
 
-        debugger.init()
-
         service_obj = cls(host, binary, topic, manager,
                           report_interval=report_interval,
                           periodic_enable=periodic_enable,
                           periodic_fuzzy_delay=periodic_fuzzy_delay,
                           periodic_interval_max=periodic_interval_max,
-                          db_allowed=db_allowed)
+                          topic_alt=topic_alt)
+
+        # NOTE(gibi): This have to be after the service object creation as
+        # that is the point where we can safely use the RPC to the conductor.
+        # E.g. the Service.__init__ actually waits for the conductor to start
+        # up before it allows the service to be created. The
+        # raise_if_old_compute() depends on the RPC to be up and does not
+        # implement its own retry mechanism to connect to the conductor.
+        try:
+            utils.raise_if_old_compute()
+        except exception.TooOldComputeService as e:
+            if CONF.workarounds.disable_compute_service_check_for_ffu:
+                LOG.warning(str(e))
+            else:
+                raise
 
         return service_obj
 
     def kill(self):
-        """Destroy the service object in the datastore."""
+        """Destroy the service object in the datastore.
+
+        NOTE: Although this method is not used anywhere else than tests, it is
+        convenient to have it here, so the tests might easily and in clean way
+        stop and remove the service_ref.
+
+        """
         self.stop()
         try:
-            self.service_ref.destroy()
+            if self.service_ref:
+                self.service_ref.destroy()
         except exception.NotFound:
-            LOG.warning(_LW('Service killed that has no database entry'))
+            LOG.warning('Service killed that has no database entry')
+
+    def _stop_rpc_server(self, rpc_server, topic):
+        try:
+            LOG.debug('%s service stopping RPC server on topic: %s',
+                      self.binary, topic)
+            rpc_server.stop()
+            return True
+        except Exception:
+            LOG.exception('Error occurred during RPC server stop.')
+            return False
+
+    def _wait_rpc_server(self, rpc_server, topic):
+        try:
+            rpc_server.wait()
+            LOG.debug('%s service stopped RPC server on topic: %s',
+                      self.binary, topic)
+        except Exception:
+            LOG.exception('Error occurred during RPC server wait.')
+
+    def _shutdown_rpc_server(self, rpc_server, topic):
+        if self._stop_rpc_server(rpc_server, topic):
+            self._wait_rpc_server(rpc_server, topic)
+
+    def _get_manager_shutdown_timeout(self):
+        if CONF.manager_shutdown_timeout > CONF.graceful_shutdown_timeout:
+            LOG.warning('manager_shutdown_timeout (%s) is higher than '
+                        'graceful_shutdown_timeout (%s); the service may be '
+                        'killed before the manager finishes waiting.',
+                        CONF.manager_shutdown_timeout,
+                        CONF.graceful_shutdown_timeout)
+            return max(0, CONF.graceful_shutdown_timeout - 10)
+        return CONF.manager_shutdown_timeout
+
+    def _run_manager_graceful_shutdown(self):
+        timeout = self._get_manager_shutdown_timeout()
+        finished = threading.Event()
+
+        def _run():
+            try:
+                LOG.info('%s manager graceful shutdown started.',
+                          self.binary)
+                self.manager.graceful_shutdown(timeout)
+                LOG.info('%s manager graceful shutdown finished.',
+                          self.binary)
+            except Exception:
+                LOG.exception('Error occurred during %s manager graceful '
+                              'shutdown', self.binary)
+            finally:
+                finished.set()
+
+        # NOTE(gmaan): manager's graceful_shutdown does two things 1. wait for
+        # in-progress tasks 2. cleanup_host. First one is controlled with
+        # timeout but latter one is sync call to drivers cleanup_host which
+        # can hang the shutdown so we need to run manager's graceful_shutdown
+        # in a thread with timeout so that we do not hang the overall shutdown.
+        shutdown_thread = threading.Thread(target=_run)
+        shutdown_thread.daemon = True
+        shutdown_thread.start()
+        # NOTE(gmaan): Event.wait(timeout) always returns a bool even on
+        # timeout.
+        if not finished.wait(timeout):
+            LOG.warning(
+                '%s manager graceful shutdown did not complete within '
+                'the %s second, proceeding with service shutdown.',
+                self.binary, timeout)
 
     def stop(self):
-        try:
-            self.rpcserver.stop()
-            self.rpcserver.wait()
-        except Exception:
-            pass
+        """stop the service and clean up."""
+        LOG.info('%s service graceful shutdown started.', self.binary)
 
-        try:
-            self.manager.cleanup_host()
-        except Exception:
-            LOG.exception(_LE('Service error occurred during cleanup_host'))
-            pass
+        self.manager.set_shutdown_in_progress()
 
+        # This RPC server handles new requests during normal operation. During
+        # graceful shutdown, we limit the RPC requests the service can handle.
+        # So we stop the main RPC server here and let the alternative RPC
+        # server handle the remaining requests for the ongoing operations.
+        rpcserver_stopped = False
+        if self.rpcserver is not None:
+            rpcserver_stopped = self._stop_rpc_server(
+                self.rpcserver, self.topic)
+
+        # Run manager graceful_shutdown() before waiting for the RPC server
+        # to shutdown so that tasks already in progress on self.rpcserver can
+        # also be tracked and logged before RPC server wait() finish them.
+        self._run_manager_graceful_shutdown()
+
+        if rpcserver_stopped:
+            self._wait_rpc_server(self.rpcserver, self.topic)
+
+        if self.rpcserver_alt is not None:
+            # During graceful shutdown, manager will use this RPC server to
+            # finish the in-progress tasks so this RPC server will be stopped
+            # at the end.
+            self._shutdown_rpc_server(
+                    self.rpcserver_alt, self.topic_alt)
+
+        LOG.info('%s service graceful shutdown finished.', self.binary)
         super(Service, self).stop()
 
     def periodic_tasks(self, raise_on_error=False):
@@ -301,118 +486,14 @@ class Service(service.Service):
             with utils.tempdir():
                 pass
         except Exception as e:
-            LOG.error(_LE('Temporary directory is invalid: %s'), e)
+            LOG.error('Temporary directory is invalid: %s', e)
             sys.exit(1)
 
-
-class WSGIService(object):
-    """Provides ability to launch API from a 'paste' configuration."""
-
-    def __init__(self, name, loader=None, use_ssl=False, max_url_len=None):
-        """Initialize, but do not start the WSGI server.
-
-        :param name: The name of the WSGI server given to the loader.
-        :param loader: Loads the WSGI application using the given name.
-        :returns: None
-
-        """
-        self.name = name
-        self.manager = self._get_manager()
-        self.loader = loader or wsgi.Loader()
-        self.app = self.loader.load_app(name)
-        # inherit all compute_api worker counts from osapi_compute
-        if name.startswith('openstack_compute_api'):
-            wname = 'osapi_compute'
-        else:
-            wname = name
-        self.host = getattr(CONF, '%s_listen' % name, "0.0.0.0")
-        self.port = getattr(CONF, '%s_listen_port' % name, 0)
-        self.workers = (getattr(CONF, '%s_workers' % wname, None) or
-                        processutils.get_worker_count())
-        if self.workers and self.workers < 1:
-            worker_name = '%s_workers' % name
-            msg = (_("%(worker_name)s value of %(workers)s is invalid, "
-                     "must be greater than 0") %
-                   {'worker_name': worker_name,
-                    'workers': str(self.workers)})
-            raise exception.InvalidInput(msg)
-        self.use_ssl = use_ssl
-        self.server = wsgi.Server(name,
-                                  self.app,
-                                  host=self.host,
-                                  port=self.port,
-                                  use_ssl=self.use_ssl,
-                                  max_url_len=max_url_len)
-        # Pull back actual port used
-        self.port = self.server.port
-        self.backdoor_port = None
-
     def reset(self):
-        """Reset server greenpool size to default.
-
-        :returns: None
-
-        """
-        self.server.reset()
-
-    def _get_manager(self):
-        """Initialize a Manager object appropriate for this service.
-
-        Use the service name to look up a Manager subclass from the
-        configuration and initialize an instance. If no class name
-        is configured, just return None.
-
-        :returns: a Manager instance, or None.
-
-        """
-        fl = '%s_manager' % self.name
-        if fl not in CONF:
-            return None
-
-        manager_class_name = CONF.get(fl, None)
-        if not manager_class_name:
-            return None
-
-        manager_class = importutils.import_class(manager_class_name)
-        return manager_class()
-
-    def start(self):
-        """Start serving this service using loaded configuration.
-
-        Also, retrieve updated port number in case '0' was passed in, which
-        indicates a random port should be used.
-
-        :returns: None
-
-        """
-        if self.manager:
-            self.manager.init_host()
-            self.manager.pre_start_hook()
-            if self.backdoor_port is not None:
-                self.manager.backdoor_port = self.backdoor_port
-        self.server.start()
-        if self.manager:
-            self.manager.post_start_hook()
-
-    def stop(self):
-        """Stop serving this API.
-
-        :returns: None
-
-        """
-        self.server.stop()
-
-    def wait(self):
-        """Wait for the service to stop serving this API.
-
-        :returns: None
-
-        """
-        self.server.wait()
-
-
-def process_launcher():
-    return service.ProcessLauncher()
+        """reset the service."""
+        self.manager.reset()
+        # Reset the cell cache that holds database transaction context managers
+        context.CELL_CACHE = {}
 
 
 # NOTE(vish): the global launcher is to maintain the existing
@@ -421,12 +502,13 @@ def process_launcher():
 _launcher = None
 
 
-def serve(server, workers=None):
+def serve(server, workers=None, no_fork=False):
     global _launcher
     if _launcher:
         raise RuntimeError(_('serve() can only be called once'))
 
-    _launcher = service.launch(server, workers=workers)
+    _launcher = service.launch(CONF, server, workers=workers,
+                               restart_method='mutate', no_fork=no_fork)
 
 
 def wait():

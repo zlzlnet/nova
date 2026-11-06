@@ -15,13 +15,16 @@
 
 import webob.exc
 
+from nova.api.openstack.api_version_request \
+    import MAX_PROXY_API_SUPPORT_VERSION
 from nova.api.openstack import common
+from nova.api.openstack.compute.schemas import images as schema
 from nova.api.openstack.compute.views import images as views_images
 from nova.api.openstack import wsgi
+from nova.api import validation
 from nova import exception
 from nova.i18n import _
-import nova.image
-import nova.utils
+from nova.image import glance
 
 
 SUPPORTED_FILTERS = {
@@ -35,20 +38,21 @@ SUPPORTED_FILTERS = {
 }
 
 
-class Controller(wsgi.Controller):
+@validation.validated
+class ImagesController(wsgi.Controller):
     """Base controller for retrieving/displaying images."""
 
     _view_builder_class = views_images.ViewBuilder
 
-    def __init__(self, **kwargs):
-        super(Controller, self).__init__(**kwargs)
-        self._image_api = nova.image.API()
+    def __init__(self):
+        super().__init__()
+        self._image_api = glance.API()
 
     def _get_filters(self, req):
         """Return a dictionary of query param filters from the request.
 
         :param req: the Request object coming from the wsgi layer
-        :retval a dict of key/value filters
+        :returns: a dict of key/value filters
         """
         filters = {}
         for param in req.params:
@@ -71,6 +75,10 @@ class Controller(wsgi.Controller):
 
         return filters
 
+    @wsgi.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @wsgi.expected_errors(404)
+    @validation.query_schema(schema.show_query)
+    @validation.response_body_schema(schema.show_response)
     def show(self, req, id):
         """Return detailed information about a specific image.
 
@@ -81,13 +89,16 @@ class Controller(wsgi.Controller):
 
         try:
             image = self._image_api.get(context, id)
-        except (exception.NotFound, exception.InvalidImageRef):
+        except (exception.ImageNotFound, exception.InvalidImageRef):
             explanation = _("Image not found.")
             raise webob.exc.HTTPNotFound(explanation=explanation)
 
-        req.cache_db_items('images', [image], 'id')
         return self._view_builder.show(req, image)
 
+    @wsgi.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @wsgi.expected_errors((403, 404))
+    @wsgi.response(204)
+    @validation.response_body_schema(schema.delete_response)
     def delete(self, req, id):
         """Delete an image, if allowed.
 
@@ -105,13 +116,15 @@ class Controller(wsgi.Controller):
             # raises HTTPForbidden.
             explanation = _("You are not allowed to delete the image.")
             raise webob.exc.HTTPForbidden(explanation=explanation)
-        return webob.exc.HTTPNoContent()
 
+    @wsgi.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @wsgi.expected_errors(400)
+    @validation.query_schema(schema.index_query)
+    @validation.response_body_schema(schema.index_response)
     def index(self, req):
         """Return an index listing of images available to the request.
 
         :param req: `wsgi.Request` object
-
         """
         context = req.environ['nova.context']
         filters = self._get_filters(req)
@@ -124,11 +137,14 @@ class Controller(wsgi.Controller):
             raise webob.exc.HTTPBadRequest(explanation=e.format_message())
         return self._view_builder.index(req, images)
 
+    @wsgi.api_version("2.1", MAX_PROXY_API_SUPPORT_VERSION)
+    @wsgi.expected_errors(400)
+    @validation.query_schema(schema.detail_query)
+    @validation.response_body_schema(schema.detail_response)
     def detail(self, req):
         """Return a detailed index listing of images available to the request.
 
         :param req: `wsgi.Request` object.
-
         """
         context = req.environ['nova.context']
         filters = self._get_filters(req)
@@ -139,12 +155,4 @@ class Controller(wsgi.Controller):
         except exception.Invalid as e:
             raise webob.exc.HTTPBadRequest(explanation=e.format_message())
 
-        req.cache_db_items('images', images, 'id')
         return self._view_builder.detail(req, images)
-
-    def create(self, *args, **kwargs):
-        raise webob.exc.HTTPMethodNotAllowed()
-
-
-def create_resource():
-    return wsgi.Resource(Controller())

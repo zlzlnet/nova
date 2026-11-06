@@ -19,28 +19,24 @@
 Test WSGI basics and provide some helper functions for other WSGI tests.
 """
 
-from nova import test
+import collections
+import tempfile
+from unittest import mock
 
 import routes
 import webob
 
-from nova import wsgi
+from nova.api import wsgi
+import nova.exception
+from nova import test
 
 
-class Test(test.NoDBTestCase):
+os_uname = collections.namedtuple(
+    'uname_result', ['sysname', 'nodename', 'release', 'version', 'machine'],
+)
 
-    def test_debug(self):
 
-        class Application(wsgi.Application):
-            """Dummy application to test debug."""
-
-            def __call__(self, environ, start_response):
-                start_response("200", [("X-Test", "checking")])
-                return ['Test result']
-
-        application = wsgi.Debug(Application())
-        result = webob.Request.blank('/').get_response(application)
-        self.assertEqual(result.body, "Test result")
+class TestRouter(test.NoDBTestCase):
 
     def test_router(self):
 
@@ -63,3 +59,64 @@ class Test(test.NoDBTestCase):
         self.assertEqual(result.body, "Router result")
         result = webob.Request.blank('/bad').get_response(Router())
         self.assertNotEqual(result.body, "Router result")
+
+
+class TestLoaderNothingExists(test.NoDBTestCase):
+    """Loader tests where os.path.exists always returns False."""
+
+    def setUp(self):
+        super(TestLoaderNothingExists, self).setUp()
+        self.stub_out('os.path.exists', lambda _: False)
+
+    def test_relpath_config_not_found(self):
+        self.flags(api_paste_config='api-paste.ini', group='wsgi')
+        self.assertRaises(
+            nova.exception.ConfigNotFound,
+            wsgi.Loader,
+        )
+
+    def test_asbpath_config_not_found(self):
+        self.flags(api_paste_config='/etc/nova/api-paste.ini', group='wsgi')
+        self.assertRaises(
+            nova.exception.ConfigNotFound,
+            wsgi.Loader,
+        )
+
+
+class TestLoaderNormalFilesystem(test.NoDBTestCase):
+    """Loader tests with normal filesystem (unmodified os.path module)."""
+
+    _paste_config = """
+[app:test_app]
+use = egg:Paste#static
+document_root = /tmp
+    """
+
+    def setUp(self):
+        super(TestLoaderNormalFilesystem, self).setUp()
+        self.config = tempfile.NamedTemporaryFile(mode="w+t")
+        self.config.write(self._paste_config.lstrip())
+        self.config.seek(0)
+        self.config.flush()
+        self.loader = wsgi.Loader(self.config.name)
+
+    def test_config_found(self):
+        self.assertEqual(self.config.name, self.loader.config_path)
+
+    def test_app_not_found(self):
+        self.assertRaises(
+            nova.exception.PasteAppNotFound,
+            self.loader.load_app,
+            "nonexistent app",
+        )
+
+    def test_app_found(self):
+        with mock.patch('os.uname') as mock_uname:
+            mock_uname.return_value = os_uname(
+                'Linux', '', '5.10.13-200-generic', '', 'x86_64')
+            url_parser = self.loader.load_app("test_app")
+        self.assertEqual("/tmp", url_parser.directory)
+
+    def tearDown(self):
+        self.config.close()
+        super(TestLoaderNormalFilesystem, self).tearDown()

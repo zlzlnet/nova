@@ -17,26 +17,22 @@
 Websocket proxy that is compatible with OpenStack Nova
 noVNC consoles. Leverages websockify.py by Joel Martin
 """
+# autopep8: off
+from nova import monkey_patch; monkey_patch.patch(backend='threading')  # noqa
+# autopep8: on
 
 import sys
 
-from oslo_config import cfg
 
 from nova.cmd import baseproxy
+import nova.conf
+from nova.conf import vnc
 from nova import config
+from nova.console.securityproxy import rfb
 
 
-opts = [
-    cfg.StrOpt('novncproxy_host',
-               default='0.0.0.0',
-               help='Host on which to listen for incoming requests'),
-    cfg.IntOpt('novncproxy_port',
-               default=6080,
-               help='Port on which to listen for incoming requests'),
-    ]
-
-CONF = cfg.CONF
-CONF.register_cli_opts(opts)
+CONF = nova.conf.CONF
+vnc.register_cli_opts(CONF)
 
 
 def main():
@@ -45,5 +41,6 @@ def main():
     config.parse_args(sys.argv)
 
     baseproxy.proxy(
-        host=CONF.novncproxy_host,
-        port=CONF.novncproxy_port)
+        host=CONF.vnc.novncproxy_host,
+        port=CONF.vnc.novncproxy_port,
+        security_proxy=rfb.RFBSecurityProxy())

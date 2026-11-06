@@ -15,6 +15,12 @@
 from nova.objects import base as obj_base
 from nova.objects import fields
 
+__all__ = [
+    'EVENT_NAMES',
+    'EVENT_STATUSES',
+    'InstanceExternalEvent',
+]
+
 EVENT_NAMES = [
     # Network has changed for this instance, rebuild info_cache
     'network-changed',
@@ -22,19 +28,39 @@ EVENT_NAMES = [
     # VIF plugging notifications, tag is port_id
     'network-vif-plugged',
     'network-vif-unplugged',
+    'network-vif-deleted',
 
+    # Volume was extended for this instance, tag is volume_id
+    'volume-extended',
+
+    # Power state has changed for this instance
+    'power-update',
+
+    # Accelerator Request got bound, tag is ARQ uuid.
+    # Sent when an ARQ for an instance has been bound or failed to bind.
+    'accelerator-request-bound',
+
+    # re-image operation has completed from cinder side
+    'volume-reimaged',
 ]
 
 EVENT_STATUSES = ['failed', 'completed', 'in-progress']
 
+# Possible tag values for the power-update event.
+POWER_ON = 'POWER_ON'
+POWER_OFF = 'POWER_OFF'
 
-# TODO(berrange): Remove NovaObjectDictCompat
+
 @obj_base.NovaObjectRegistry.register
-class InstanceExternalEvent(obj_base.NovaObject,
-                            obj_base.NovaObjectDictCompat):
+class InstanceExternalEvent(obj_base.NovaObject):
     # Version 1.0: Initial version
     #              Supports network-changed and vif-plugged
-    VERSION = '1.0'
+    # Version 1.1: adds network-vif-deleted event
+    # Version 1.2: adds volume-extended event
+    # Version 1.3: adds power-update event
+    # Version 1.4: adds accelerator-request-bound event
+    # Version 1.5: adds volume-reimaged event
+    VERSION = '1.5'
 
     fields = {
         'instance_uuid': fields.UUIDField(),

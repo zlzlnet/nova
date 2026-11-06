@@ -20,10 +20,12 @@ from nova import exception
 
 FORMAT_RAW = "raw"
 FORMAT_QCOW2 = "qcow2"
+FORMAT_PLOOP = "ploop"
 
 ALL_FORMATS = [
     FORMAT_RAW,
     FORMAT_QCOW2,
+    FORMAT_PLOOP,
 ]
 
 
@@ -40,7 +42,7 @@ class Image(object):
     """
 
     def __init__(self, format):
-        """Create a new abstract iamge
+        """Create a new abstract image
 
         :param format: one of the format constants
         """

@@ -14,58 +14,95 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-"""Database setup and migration commands."""
+import os
 
-from nova.db.sqlalchemy import migration
+from alembic import command as alembic_api
+from alembic import config as alembic_config
+from alembic.runtime import migration as alembic_migration
+from oslo_log import log as logging
 
-IMPL = migration
+from nova.db.api import api as api_db_api
+from nova.db.main import api as main_db_api
+from nova import exception
+
+LOG = logging.getLogger(__name__)
 
 
-def db_sync(version=None, database='main'):
+def _get_engine(database='main', context=None):
+    if database == 'main':
+        return main_db_api.get_engine(context=context)
+
+    if database == 'api':
+        return api_db_api.get_engine()
+
+
+def _find_alembic_conf(database='main'):
+    """Get the path for the alembic repository."""
+
+    path = os.path.join(
+        os.path.abspath(os.path.dirname(__file__)),
+        database, 'alembic.ini')
+
+    config = alembic_config.Config(path)
+    # we don't want to use the logger configuration from the file, which is
+    # only really intended for the CLI
+    # https://stackoverflow.com/a/42691781/613428
+    config.attributes['configure_logger'] = False
+    return config
+
+
+def _upgrade_alembic(engine, config, version):
+    # reuse the connection rather than creating a new one
+    with engine.begin() as connection:
+        config.attributes['connection'] = connection
+        alembic_api.upgrade(config, version or 'head')
+
+
+def db_sync(version=None, database='main', context=None):
     """Migrate the database to `version` or the most recent version."""
-    return IMPL.db_sync(version=version, database=database)
+
+    if database not in ('main', 'api'):
+        raise exception.Invalid('%s is not a valid database' % database)
+
+    # if the user requested a specific version, check if it's an integer:
+    # if so, we're almost certainly in sqlalchemy-migrate land and won't
+    # support that
+    if version is not None and version.isdigit():
+        raise exception.Invalid(
+            'You requested an sqlalchemy-migrate database version; this is '
+            'no longer supported'
+        )
+
+    engine = _get_engine(database, context=context)
+
+    config = _find_alembic_conf(database)
+    # discard the URL stored in alembic.ini in favour of the URL configured
+    # for the engine, casting from 'sqlalchemy.engine.url.URL' to str in the
+    # process
+    # NOTE(sean-k-mooney): the engine has already url encoded the connection
+    # string using a mix of url encode styles for different parts of the url.
+    # since we are updating the alembic config parser instance we need to
+    # escape '%' to '%%' to account for ConfigParser's string interpolation.
+    url = engine.url.render_as_string(hide_password=False).replace('%', '%%')
+    config.set_main_option('sqlalchemy.url', url)
+
+    # apply anything later
+    LOG.info('Applying migration(s)')
+
+    _upgrade_alembic(engine, config, version)
+
+    LOG.info('Migration(s) applied')
 
 
-def db_expand(dryrun=False, database='main'):
-    """Expand database schema."""
-    return IMPL.db_expand(dryrun=dryrun, database=database)
-
-
-def db_migrate(dryrun=False, database='main'):
-    """Migrate database schema."""
-    return IMPL.db_migrate(dryrun=dryrun, database=database)
-
-
-def db_contract(dryrun=False, database='main'):
-    """Contract database schema."""
-    return IMPL.db_contract(dryrun=dryrun, database=database)
-
-
-def db_version(database='main'):
+def db_version(database='main', context=None):
     """Display the current database version."""
-    return IMPL.db_version(database=database)
+    if database not in ('main', 'api'):
+        raise exception.Invalid('%s is not a valid database' % database)
 
+    engine = _get_engine(database, context=context)
 
-def db_initial_version(database='main'):
-    """The starting version for the database."""
-    return IMPL.db_initial_version(database=database)
+    with engine.connect() as conn:
+        m_context = alembic_migration.MigrationContext.configure(conn)
+        version = m_context.get_current_revision()
 
-
-def db_null_instance_uuid_scan(delete=False):
-    """Utility for scanning the database to look for NULL instance uuid rows.
-
-    Scans the backing nova database to look for table entries where
-    instances.uuid or instance_uuid columns are NULL (except for the
-    fixed_ips table since that can contain NULL instance_uuid entries by
-    design). Dumps the tables that have NULL instance_uuid entries or
-    optionally deletes them based on usage.
-
-    This tool is meant to be used in conjunction with the 267 database
-    migration script to detect and optionally cleanup NULL instance_uuid
-    records.
-
-    :param delete: If true, delete NULL instance_uuid records found, else
-                   just query to see if they exist for reporting.
-    :returns: dict of table name to number of hits for NULL instance_uuid rows.
-    """
-    return IMPL.db_null_instance_uuid_scan(delete=delete)
+    return version

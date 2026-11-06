@@ -19,13 +19,12 @@ and as a WSGI layer
 """
 
 import copy
+from unittest import mock
+from urllib import parse as urlparse
 
-import mock
-import six.moves.urllib.parse as urlparse
 import webob
 
-from nova.api.openstack.compute import images
-from nova.api.openstack.compute.plugins.v3 import images as images_v21
+from nova.api.openstack.compute import images as images_v21
 from nova.api.openstack.compute.views import images as images_view
 from nova import exception
 from nova.image import glance
@@ -43,145 +42,155 @@ IMAGE_FIXTURES = image_fixtures.get_image_fixtures()
 class ImagesControllerTestV21(test.NoDBTestCase):
     """Test of the OpenStack API /images application controller w/Glance.
     """
-    image_controller_class = images_v21.ImagesController
-    url_base = '/v3'
-    bookmark_base = ''
-    http_request = fakes.HTTPRequestV3
+    url_base = '/v2.1'
+    http_request = fakes.HTTPRequestV21
 
     def setUp(self):
         """Run before each test."""
         super(ImagesControllerTestV21, self).setUp()
-        fakes.stub_out_networking(self.stubs)
-        fakes.stub_out_rate_limiting(self.stubs)
-        fakes.stub_out_key_pair_funcs(self.stubs)
-        fakes.stub_out_compute_api_snapshot(self.stubs)
-        fakes.stub_out_compute_api_backup(self.stubs)
+        self.flags(api_servers=['http://localhost:9292'], group='glance')
+        fakes.stub_out_networking(self)
+        fakes.stub_out_key_pair_funcs(self)
+        fakes.stub_out_compute_api_snapshot(self)
+        fakes.stub_out_compute_api_backup(self)
 
-        self.controller = self.image_controller_class()
+        self.controller = images_v21.ImagesController()
         self.url_prefix = "http://localhost%s/images" % self.url_base
-        self.bookmark_prefix = "http://localhost%s/images" % self.bookmark_base
+        self.bookmark_prefix = "http://localhost/images"
         self.uuid = 'fa95aaf5-ab3b-4cd8-88c0-2be7dd051aaf'
         self.server_uuid = "aa640691-d1a7-4a67-9d3c-d35ee6b3cc74"
         self.server_href = (
             "http://localhost%s/servers/%s" % (self.url_base,
                                                self.server_uuid))
         self.server_bookmark = (
-             "http://localhost%s/servers/%s" % (self.bookmark_base,
-                                                self.server_uuid))
+             "http://localhost/servers/%s" % self.server_uuid)
         self.alternate = "%s/images/%s"
 
-        self.expected_image_123 = {
-            "image": {'id': '123',
-                      'name': 'public image',
-                      'metadata': {'key1': 'value1'},
-                      'updated': NOW_API_FORMAT,
-                      'created': NOW_API_FORMAT,
-                      'status': 'ACTIVE',
-                      'minDisk': 10,
-                      'progress': 100,
-                      'minRam': 128,
-                      "links": [{
-                                    "rel": "self",
-                                    "href": "%s/123" % self.url_prefix
-                                },
-                                {
-                                    "rel": "bookmark",
-                                    "href":
-                                        "%s/123" % self.bookmark_prefix
-                                },
-                                {
-                                    "rel": "alternate",
-                                    "type": "application/vnd.openstack.image",
-                                    "href": self.alternate %
-                                            (glance.generate_glance_url(),
-                                             123),
-                                }],
+        self.image_a_uuid = IMAGE_FIXTURES[0]['id']
+        self.expected_image_a = {
+            "image": {
+                'id': self.image_a_uuid,
+                'name': 'public image',
+                'metadata': {'key1': 'value1'},
+                'updated': NOW_API_FORMAT,
+                'created': NOW_API_FORMAT,
+                'status': 'ACTIVE',
+                'minDisk': 10,
+                'progress': 100,
+                'minRam': 128,
+                'OS-EXT-IMG-SIZE:size': 25165824,
+                "links": [
+                    {
+                        "rel": "self",
+                        "href": f"{self.url_prefix}/{self.image_a_uuid}"
+                    },
+                    {
+                        "rel": "bookmark",
+                        "href": f"{self.bookmark_prefix}/{self.image_a_uuid}"
+                    },
+                    {
+                        "rel": "alternate",
+                        "type": "application/vnd.openstack.image",
+                        "href": self.alternate % (
+                            glance.generate_glance_url('ctx'),
+                            self.image_a_uuid,
+                        ),
+                    }
+                ],
             },
         }
 
-        self.expected_image_124 = {
-            "image": {'id': '124',
-                      'name': 'queued snapshot',
-                      'metadata': {
-                          u'instance_uuid': self.server_uuid,
-                          u'user_id': u'fake',
-                      },
-                      'updated': NOW_API_FORMAT,
-                      'created': NOW_API_FORMAT,
-                      'status': 'SAVING',
-                      'progress': 25,
-                      'minDisk': 0,
-                      'minRam': 0,
-                      'server': {
-                          'id': self.server_uuid,
-                          "links": [{
-                                        "rel": "self",
-                                        "href": self.server_href,
-                                    },
-                                    {
-                                        "rel": "bookmark",
-                                        "href": self.server_bookmark,
-                                    }],
-                      },
-                      "links": [{
-                                    "rel": "self",
-                                    "href": "%s/124" % self.url_prefix
-                                },
-                                {
-                                    "rel": "bookmark",
-                                    "href":
-                                        "%s/124" % self.bookmark_prefix
-                                },
-                                {
-                                    "rel": "alternate",
-                                    "type":
-                                        "application/vnd.openstack.image",
-                                    "href": self.alternate %
-                                            (glance.generate_glance_url(),
-                                             124),
-                                }],
+        self.image_b_uuid = IMAGE_FIXTURES[1]['id']
+        self.expected_image_b = {
+            "image": {
+                'id': self.image_b_uuid,
+                'name': 'queued snapshot',
+                'metadata': {
+                    'instance_uuid': self.server_uuid,
+                    'user_id': 'fake',
+                },
+                'updated': NOW_API_FORMAT,
+                'created': NOW_API_FORMAT,
+                'status': 'SAVING',
+                'progress': 25,
+                'minDisk': 0,
+                'minRam': 0,
+                'OS-EXT-IMG-SIZE:size': 25165824,
+                'server': {
+                    'id': self.server_uuid,
+                    "links": [
+                        {
+                            "rel": "self",
+                            "href": self.server_href,
+                        },
+                        {
+                            "rel": "bookmark",
+                            "href": self.server_bookmark,
+                        }
+                    ],
+                },
+                "links": [
+                    {
+                        "rel": "self",
+                        "href": f"{self.url_prefix}/{self.image_b_uuid}"
+                    },
+                    {
+                        "rel": "bookmark",
+                        "href": f"{self.bookmark_prefix}/{self.image_b_uuid}"
+                    },
+                    {
+                        "rel": "alternate",
+                        "type": "application/vnd.openstack.image",
+                        "href": self.alternate % (
+                            glance.generate_glance_url('ctx'),
+                            self.image_b_uuid,
+                        ),
+                    },
+                ],
             },
         }
 
-    @mock.patch('nova.image.api.API.get', return_value=IMAGE_FIXTURES[0])
+    @mock.patch('nova.image.glance.API.get', return_value=IMAGE_FIXTURES[0])
     def test_get_image(self, get_mocked):
-        request = self.http_request.blank(self.url_base + 'images/123')
-        actual_image = self.controller.show(request, '123')
+        request = self.http_request.blank(
+            self.url_base + f'images/{self.image_a_uuid}')
+        actual_image = self.controller.show(request, self.image_a_uuid)
         self.assertThat(actual_image,
-                        matchers.DictMatches(self.expected_image_123))
-        get_mocked.assert_called_once_with(mock.ANY, '123')
+                        matchers.DictMatches(self.expected_image_a))
+        get_mocked.assert_called_once_with(mock.ANY, self.image_a_uuid)
 
-    @mock.patch('nova.image.api.API.get', return_value=IMAGE_FIXTURES[1])
+    @mock.patch('nova.image.glance.API.get', return_value=IMAGE_FIXTURES[1])
     def test_get_image_with_custom_prefix(self, _get_mocked):
-        self.flags(osapi_compute_link_prefix='https://zoo.com:42',
-                   osapi_glance_link_prefix='http://circus.com:34')
-        fake_req = self.http_request.blank(self.url_base + 'images/124')
-        actual_image = self.controller.show(fake_req, '124')
+        self.flags(compute_link_prefix='https://zoo.com:42',
+                   glance_link_prefix='http://circus.com:34',
+                   group='api')
+        fake_req = self.http_request.blank(
+            self.url_base + f'images/{self.image_b_uuid}')
+        actual_image = self.controller.show(fake_req, self.image_b_uuid)
 
-        expected_image = self.expected_image_124
+        expected_image = self.expected_image_b
         expected_image["image"]["links"][0]["href"] = (
-            "https://zoo.com:42%s/images/124" % self.url_base)
+            f"https://zoo.com:42{self.url_base}/images/{self.image_b_uuid}")
         expected_image["image"]["links"][1]["href"] = (
-            "https://zoo.com:42%s/images/124" % self.bookmark_base)
+            f"https://zoo.com:42/images/{self.image_b_uuid}")
         expected_image["image"]["links"][2]["href"] = (
-            "http://circus.com:34/images/124")
+            f"http://circus.com:34/images/{self.image_b_uuid}")
         expected_image["image"]["server"]["links"][0]["href"] = (
             "https://zoo.com:42%s/servers/%s" % (self.url_base,
                                                  self.server_uuid))
         expected_image["image"]["server"]["links"][1]["href"] = (
-            "https://zoo.com:42%s/servers/%s" % (self.bookmark_base,
-                                                 self.server_uuid))
+            "https://zoo.com:42/servers/%s" % (self.server_uuid))
 
         self.assertThat(actual_image, matchers.DictMatches(expected_image))
 
-    @mock.patch('nova.image.api.API.get',
+    @mock.patch('nova.image.glance.API.get',
                 side_effect=exception.ImageNotFound(image_id=''))
     def test_get_image_404(self, _get_mocked):
         fake_req = self.http_request.blank(self.url_base + 'images/unknown')
         self.assertRaises(webob.exc.HTTPNotFound,
                           self.controller.show, fake_req, 'unknown')
 
-    @mock.patch('nova.image.api.API.get_all', return_value=IMAGE_FIXTURES)
+    @mock.patch('nova.image.glance.API.get_all', return_value=IMAGE_FIXTURES)
     def test_get_image_details(self, get_all_mocked):
         request = self.http_request.blank(self.url_base + 'images/detail')
         response = self.controller.detail(request)
@@ -189,93 +198,107 @@ class ImagesControllerTestV21(test.NoDBTestCase):
         get_all_mocked.assert_called_once_with(mock.ANY, filters={})
         response_list = response["images"]
 
-        image_125 = copy.deepcopy(self.expected_image_124["image"])
-        image_125['id'] = '125'
-        image_125['name'] = 'saving snapshot'
-        image_125['progress'] = 50
-        image_125["links"][0]["href"] = "%s/125" % self.url_prefix
-        image_125["links"][1]["href"] = "%s/125" % self.bookmark_prefix
-        image_125["links"][2]["href"] = (
-            "%s/images/125" % glance.generate_glance_url())
+        image_c = copy.deepcopy(self.expected_image_b["image"])
+        image_c['id'] = IMAGE_FIXTURES[2]['id']
+        image_c['name'] = 'saving snapshot'
+        image_c['progress'] = 50
+        image_c["links"][0]["href"] = "%s/%s" % (
+            self.url_prefix, IMAGE_FIXTURES[2]['id'])
+        image_c["links"][1]["href"] = "%s/%s" % (
+            self.bookmark_prefix, IMAGE_FIXTURES[2]['id'])
+        image_c["links"][2]["href"] = "%s/images/%s" % (
+            glance.generate_glance_url('ctx'), IMAGE_FIXTURES[2]['id'])
 
-        image_126 = copy.deepcopy(self.expected_image_124["image"])
-        image_126['id'] = '126'
-        image_126['name'] = 'active snapshot'
-        image_126['status'] = 'ACTIVE'
-        image_126['progress'] = 100
-        image_126["links"][0]["href"] = "%s/126" % self.url_prefix
-        image_126["links"][1]["href"] = "%s/126" % self.bookmark_prefix
-        image_126["links"][2]["href"] = (
-            "%s/images/126" % glance.generate_glance_url())
+        image_d = copy.deepcopy(self.expected_image_b["image"])
+        image_d['id'] = IMAGE_FIXTURES[3]['id']
+        image_d['name'] = 'active snapshot'
+        image_d['status'] = 'ACTIVE'
+        image_d['progress'] = 100
+        image_d["links"][0]["href"] = "%s/%s" % (
+            self.url_prefix, IMAGE_FIXTURES[3]['id'])
+        image_d["links"][1]["href"] = "%s/%s" % (
+            self.bookmark_prefix, IMAGE_FIXTURES[3]['id'])
+        image_d["links"][2]["href"] = "%s/images/%s" % (
+            glance.generate_glance_url('ctx'), IMAGE_FIXTURES[3]['id'])
 
-        image_127 = copy.deepcopy(self.expected_image_124["image"])
-        image_127['id'] = '127'
-        image_127['name'] = 'killed snapshot'
-        image_127['status'] = 'ERROR'
-        image_127['progress'] = 0
-        image_127["links"][0]["href"] = "%s/127" % self.url_prefix
-        image_127["links"][1]["href"] = "%s/127" % self.bookmark_prefix
-        image_127["links"][2]["href"] = (
-            "%s/images/127" % glance.generate_glance_url())
+        image_e = copy.deepcopy(self.expected_image_b["image"])
+        image_e['id'] = IMAGE_FIXTURES[4]['id']
+        image_e['name'] = 'killed snapshot'
+        image_e['status'] = 'ERROR'
+        image_e['progress'] = 0
+        image_e["links"][0]["href"] = "%s/%s" % (
+            self.url_prefix, IMAGE_FIXTURES[4]['id'])
+        image_e["links"][1]["href"] = "%s/%s" % (
+            self.bookmark_prefix, IMAGE_FIXTURES[4]['id'])
+        image_e["links"][2]["href"] = "%s/images/%s" % (
+            glance.generate_glance_url('ctx'), IMAGE_FIXTURES[4]['id'])
 
-        image_128 = copy.deepcopy(self.expected_image_124["image"])
-        image_128['id'] = '128'
-        image_128['name'] = 'deleted snapshot'
-        image_128['status'] = 'DELETED'
-        image_128['progress'] = 0
-        image_128["links"][0]["href"] = "%s/128" % self.url_prefix
-        image_128["links"][1]["href"] = "%s/128" % self.bookmark_prefix
-        image_128["links"][2]["href"] = (
-            "%s/images/128" % glance.generate_glance_url())
+        image_f = copy.deepcopy(self.expected_image_b["image"])
+        image_f['id'] = IMAGE_FIXTURES[5]['id']
+        image_f['name'] = 'deleted snapshot'
+        image_f['status'] = 'DELETED'
+        image_f['progress'] = 0
+        image_f["links"][0]["href"] = "%s/%s" % (
+            self.url_prefix, IMAGE_FIXTURES[5]['id'])
+        image_f["links"][1]["href"] = "%s/%s" % (
+            self.bookmark_prefix, IMAGE_FIXTURES[5]['id'])
+        image_f["links"][2]["href"] = "%s/images/%s" % (
+            glance.generate_glance_url('ctx'), IMAGE_FIXTURES[5]['id'])
 
-        image_129 = copy.deepcopy(self.expected_image_124["image"])
-        image_129['id'] = '129'
-        image_129['name'] = 'pending_delete snapshot'
-        image_129['status'] = 'DELETED'
-        image_129['progress'] = 0
-        image_129["links"][0]["href"] = "%s/129" % self.url_prefix
-        image_129["links"][1]["href"] = "%s/129" % self.bookmark_prefix
-        image_129["links"][2]["href"] = (
-            "%s/images/129" % glance.generate_glance_url())
+        image_g = copy.deepcopy(self.expected_image_b["image"])
+        image_g['id'] = IMAGE_FIXTURES[6]['id']
+        image_g['name'] = 'pending_delete snapshot'
+        image_g['status'] = 'DELETED'
+        image_g['progress'] = 0
+        image_g["links"][0]["href"] = "%s/%s" % (
+            self.url_prefix, IMAGE_FIXTURES[6]['id'])
+        image_g["links"][1]["href"] = "%s/%s" % (
+            self.bookmark_prefix, IMAGE_FIXTURES[6]['id'])
+        image_g["links"][2]["href"] = "%s/images/%s" % (
+            glance.generate_glance_url('ctx'), IMAGE_FIXTURES[6]['id'])
 
-        image_130 = copy.deepcopy(self.expected_image_123["image"])
-        image_130['id'] = '130'
-        image_130['name'] = None
-        image_130['metadata'] = {}
-        image_130['minDisk'] = 0
-        image_130['minRam'] = 0
-        image_130["links"][0]["href"] = "%s/130" % self.url_prefix
-        image_130["links"][1]["href"] = "%s/130" % self.bookmark_prefix
-        image_130["links"][2]["href"] = (
-            "%s/images/130" % glance.generate_glance_url())
+        image_h = copy.deepcopy(self.expected_image_a["image"])
+        image_h['id'] = IMAGE_FIXTURES[7]['id']
+        image_h['name'] = None
+        image_h['metadata'] = {}
+        image_h['minDisk'] = 0
+        image_h['minRam'] = 0
+        image_h["links"][0]["href"] = "%s/%s" % (
+            self.url_prefix, IMAGE_FIXTURES[7]['id'])
+        image_h["links"][1]["href"] = "%s/%s" % (
+            self.bookmark_prefix, IMAGE_FIXTURES[7]['id'])
+        image_h["links"][2]["href"] = "%s/images/%s" % (
+            glance.generate_glance_url('ctx'), IMAGE_FIXTURES[7]['id'])
 
-        image_131 = copy.deepcopy(self.expected_image_123["image"])
-        image_131['id'] = '131'
-        image_131['name'] = None
-        image_131['metadata'] = {}
-        image_131['minDisk'] = 0
-        image_131['minRam'] = 0
-        image_131["links"][0]["href"] = "%s/131" % self.url_prefix
-        image_131["links"][1]["href"] = "%s/131" % self.bookmark_prefix
-        image_131["links"][2]["href"] = (
-            "%s/images/131" % glance.generate_glance_url())
+        image_i = copy.deepcopy(self.expected_image_a["image"])
+        image_i['id'] = IMAGE_FIXTURES[8]['id']
+        image_i['name'] = None
+        image_i['metadata'] = {}
+        image_i['minDisk'] = 0
+        image_i['minRam'] = 0
+        image_i["links"][0]["href"] = "%s/%s" % (
+            self.url_prefix, IMAGE_FIXTURES[8]['id'])
+        image_i["links"][1]["href"] = "%s/%s" % (
+            self.bookmark_prefix, IMAGE_FIXTURES[8]['id'])
+        image_i["links"][2]["href"] = "%s/images/%s" % (
+            glance.generate_glance_url('ctx'), IMAGE_FIXTURES[8]['id'])
 
-        expected = [self.expected_image_123["image"],
-                    self.expected_image_124["image"],
-                    image_125, image_126, image_127,
-                    image_128, image_129, image_130,
-                    image_131]
+        expected = [self.expected_image_a["image"],
+                    self.expected_image_b["image"],
+                    image_c, image_d, image_e,
+                    image_f, image_g, image_h,
+                    image_i]
 
         self.assertThat(expected, matchers.DictListMatches(response_list))
 
-    @mock.patch('nova.image.api.API.get_all')
+    @mock.patch('nova.image.glance.API.get_all')
     def test_get_image_details_with_limit(self, get_all_mocked):
         request = self.http_request.blank(self.url_base +
                                           'images/detail?limit=2')
         self.controller.detail(request)
         get_all_mocked.assert_called_once_with(mock.ANY, limit=2, filters={})
 
-    @mock.patch('nova.image.api.API.get_all')
+    @mock.patch('nova.image.glance.API.get_all')
     def test_get_image_details_with_limit_and_page_size(self, get_all_mocked):
         request = self.http_request.blank(
             self.url_base + 'images/detail?limit=2&page_size=1')
@@ -283,7 +306,7 @@ class ImagesControllerTestV21(test.NoDBTestCase):
         get_all_mocked.assert_called_once_with(mock.ANY, limit=2, filters={},
                                                page_size=1)
 
-    @mock.patch('nova.image.api.API.get_all')
+    @mock.patch('nova.image.glance.API.get_all')
     def _detail_request(self, filters, request, get_all_mocked):
         self.controller.detail(request)
         get_all_mocked.assert_called_once_with(mock.ANY, filters=filters)
@@ -342,7 +365,7 @@ class ImagesControllerTestV21(test.NoDBTestCase):
         request = self.http_request.blank(self.url_base + 'images/detail')
         self._detail_request(filters, request)
 
-    @mock.patch('nova.image.api.API.get_all', side_effect=exception.Invalid)
+    @mock.patch('nova.image.glance.API.get_all', side_effect=exception.Invalid)
     def test_image_detail_invalid_marker(self, _get_all_mocked):
         request = self.http_request.blank(self.url_base + '?marker=invalid')
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.detail,
@@ -352,38 +375,45 @@ class ImagesControllerTestV21(test.NoDBTestCase):
         view = images_view.ViewBuilder()
         request = self.http_request.blank(self.url_base + 'images/1')
         generated_url = view._get_alternate_link(request, 1)
-        actual_url = "%s/images/1" % glance.generate_glance_url()
+        actual_url = "%s/images/1" % glance.generate_glance_url('ctx')
         self.assertEqual(generated_url, actual_url)
 
-    def _check_response(self, controller_method, response, expected_code):
-        self.assertEqual(expected_code, controller_method.wsgi_code)
-
-    @mock.patch('nova.image.api.API.delete')
+    @mock.patch('nova.image.glance.API.delete')
     def test_delete_image(self, delete_mocked):
-        request = self.http_request.blank(self.url_base + 'images/124')
+        request = self.http_request.blank(
+            self.url_base + f'images/{self.image_a_uuid}')
         request.method = 'DELETE'
-        response = self.controller.delete(request, '124')
-        self._check_response(self.controller.delete, response, 204)
-        delete_mocked.assert_called_once_with(mock.ANY, '124')
+        delete_method = self.controller.delete
+        delete_method(request, self.image_a_uuid)
+        self.assertEqual(204, delete_method.wsgi_codes(request))
+        delete_mocked.assert_called_once_with(mock.ANY, self.image_a_uuid)
 
-    @mock.patch('nova.image.api.API.delete',
-                side_effect=exception.ImageNotAuthorized(image_id='123'))
-    def test_delete_deleted_image(self, _delete_mocked):
+    def test_delete_deleted_image(self):
         # If you try to delete a deleted image, you get back 403 Forbidden.
-        request = self.http_request.blank(self.url_base + 'images/123')
+        request = self.http_request.blank(
+            self.url_base + f'images/{self.image_a_uuid}')
         request.method = 'DELETE'
-        self.assertRaises(webob.exc.HTTPForbidden, self.controller.delete,
-                          request, '123')
+        with mock.patch(
+            'nova.image.glance.API.delete',
+            side_effect=exception.ImageNotAuthorized(
+                image_id=self.image_a_uuid
+            )
+        ):
+            self.assertRaises(webob.exc.HTTPForbidden, self.controller.delete,
+                              request, self.image_a_uuid)
 
-    @mock.patch('nova.image.api.API.delete',
-                side_effect=exception.ImageNotFound(image_id='123'))
-    def test_delete_image_not_found(self, _delete_mocked):
+    def test_delete_image_not_found(self):
         request = self.http_request.blank(self.url_base + 'images/300')
         request.method = 'DELETE'
-        self.assertRaises(webob.exc.HTTPNotFound,
-                          self.controller.delete, request, '300')
+        with mock.patch(
+            'nova.image.glance.API.delete',
+            side_effect=exception.ImageNotFound(image_id='300')
+        ):
+            self.assertRaises(webob.exc.HTTPNotFound,
+                              self.controller.delete, request, '300')
 
-    @mock.patch('nova.image.api.API.get_all', return_value=[IMAGE_FIXTURES[0]])
+    @mock.patch('nova.image.glance.API.get_all',
+                return_value=[IMAGE_FIXTURES[0]])
     def test_get_image_next_link(self, get_all_mocked):
         request = self.http_request.blank(
             self.url_base + 'imagesl?limit=1')
@@ -395,7 +425,8 @@ class ImagesControllerTestV21(test.NoDBTestCase):
         self.assertThat({'limit': ['1'], 'marker': [IMAGE_FIXTURES[0]['id']]},
                         matchers.DictMatches(params))
 
-    @mock.patch('nova.image.api.API.get_all', return_value=[IMAGE_FIXTURES[0]])
+    @mock.patch('nova.image.glance.API.get_all',
+                return_value=[IMAGE_FIXTURES[0]])
     def test_get_image_details_next_link(self, get_all_mocked):
         request = self.http_request.blank(
             self.url_base + 'images/detail?limit=1')
@@ -408,11 +439,19 @@ class ImagesControllerTestV21(test.NoDBTestCase):
                         matchers.DictMatches(params))
 
 
-class ImagesControllerTestV2(ImagesControllerTestV21):
-    image_controller_class = images.Controller
-    url_base = '/v2/fake'
-    bookmark_base = '/fake'
-    http_request = fakes.HTTPRequest
+class ImagesControllerDeprecationTest(test.NoDBTestCase):
 
-    def _check_response(self, controller_method, response, expected_code):
-        self.assertEqual(expected_code, response.status_int)
+    def setUp(self):
+        super(ImagesControllerDeprecationTest, self).setUp()
+        self.controller = images_v21.ImagesController()
+        self.req = fakes.HTTPRequest.blank('', version='2.36')
+
+    def test_not_found_for_all_images_api(self):
+        self.assertRaises(exception.VersionNotFoundForAPIMethod,
+                          self.controller.show, self.req, fakes.FAKE_UUID)
+        self.assertRaises(exception.VersionNotFoundForAPIMethod,
+                          self.controller.delete, self.req, fakes.FAKE_UUID)
+        self.assertRaises(exception.VersionNotFoundForAPIMethod,
+                          self.controller.index, self.req)
+        self.assertRaises(exception.VersionNotFoundForAPIMethod,
+                          self.controller.detail, self.req)

@@ -13,11 +13,9 @@
 #    under the License.
 
 from collections import OrderedDict
-import os
 
 import fixtures
 
-from nova import exception
 from nova import test
 from nova.tests.unit.virt.disk.vfs import fakeguestfs
 from nova.virt.disk import api as diskapi
@@ -46,19 +44,6 @@ class VirtDiskTest(test.NoDBTestCase):
             imgmodel.LocalFileImage("/some/file", imgmodel.FORMAT_RAW),
             key="mysshkey",
             mandatory=('key',)))
-
-        os_name = os.name
-        os.name = 'nt'  # Cause password injection to fail
-        self.assertRaises(exception.NovaException,
-                          diskapi.inject_data,
-                          imgmodel.LocalFileImage("/some/file",
-                                                  imgmodel.FORMAT_RAW),
-                          admin_password="p",
-                          mandatory=('admin_password',))
-        self.assertFalse(diskapi.inject_data(
-            imgmodel.LocalFileImage("/some/file", imgmodel.FORMAT_RAW),
-            admin_password="p"))
-        os.name = os_name
 
         self.assertFalse(diskapi.inject_data(
             imgmodel.LocalFileImage("/some/fail/file", imgmodel.FORMAT_RAW),
@@ -181,7 +166,7 @@ class VirtDiskTest(test.NoDBTestCase):
         def fake_salt():
             return "1234567890abcdef"
 
-        self.stubs.Set(diskapi, '_generate_salt', fake_salt)
+        self.stub_out('nova.virt.disk.api._generate_salt', fake_salt)
 
         vfs.handle.write("/etc/shadow",
                          "root:$1$12345678$xxxxx:14917:0:99999:7:::\n" +
@@ -193,7 +178,12 @@ class VirtDiskTest(test.NoDBTestCase):
                          "bin:x:1:1:bin:/bin:/sbin/nologin\n" +
                          "daemon:x:2:2:daemon:/sbin:/sbin/nologin\n")
 
-        diskapi._inject_admin_password_into_fs("123456", vfs)
+        try:
+            diskapi._inject_admin_password_into_fs("123456", vfs)
+        except RuntimeError as e:
+            if 'libcrypt is not available' in str(e):
+                self.skipTest('libcrypt is not available')
+            raise
 
         self.assertEqual(vfs.handle.files["/etc/passwd"],
                          {'content': "root:x:0:0:root:/root:/bin/bash\n" +
@@ -267,8 +257,10 @@ class VirtDiskTest(test.NoDBTestCase):
         def fake_make_path(*args, **kwargs):
             called['make_path'] = True
 
-        self.stubs.Set(vfs, 'has_file', fake_has_file)
-        self.stubs.Set(vfs, 'make_path', fake_make_path)
+        self.stub_out('nova.virt.disk.vfs.guestfs.VFSGuestFS.has_file',
+                      fake_has_file)
+        self.stub_out('nova.virt.disk.vfs.guestfs.VFSGuestFS.make_path',
+                      fake_make_path)
 
         # test for already exists dir
         diskapi._inject_files_into_fs([("/path/to/exists/file",

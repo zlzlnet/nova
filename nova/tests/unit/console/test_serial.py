@@ -15,9 +15,7 @@
 """Tests for Serial Console."""
 
 import socket
-
-import mock
-import six.moves
+from unittest import mock
 
 from nova.console import serial
 from nova import exception
@@ -42,18 +40,6 @@ class SerialTestCase(test.NoDBTestCase):
 
     def test_get_port_range_bad_range(self):
         self.flags(port_range='40000:30000', group='serial_console')
-        start, stop = serial._get_port_range()
-        self.assertEqual(10000, start)
-        self.assertEqual(20000, stop)
-
-    def test_get_port_range_not_numeric(self):
-        self.flags(port_range='xxx:yyy', group='serial_console')
-        start, stop = serial._get_port_range()
-        self.assertEqual(10000, start)
-        self.assertEqual(20000, stop)
-
-    def test_get_port_range_invalid_syntax(self):
-        self.flags(port_range='10:20:30', group='serial_console')
         start, stop = serial._get_port_range()
         self.assertEqual(10000, start)
         self.assertEqual(20000, stop)
@@ -86,13 +72,13 @@ class SerialTestCase(test.NoDBTestCase):
             port_range='%d:%d' % (start, stop),
             group='serial_console')
 
-        for port in six.moves.range(start, stop):
+        for port in range(start, stop):
             self.assertEqual(port, serial.acquire_port('127.0.0.1'))
 
-        for port in six.moves.range(start, stop):
+        for port in range(start, stop):
             self.assertEqual(port, serial.acquire_port('127.0.0.2'))
 
-        self.assertTrue(10, len(serial.ALLOCATED_PORTS))
+        self.assertEqual(10, len(serial.ALLOCATED_PORTS))
 
     @mock.patch('nova.console.serial._verify_port')
     def test_acquire_port_in_use(self, fake_verify_port):

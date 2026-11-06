@@ -18,57 +18,27 @@
 import os
 import shutil
 
-from oslo_config import cfg
-from oslo_log import log as logging
-from oslo_utils import strutils
+from oslo_concurrency import processutils
+from oslo_utils import fileutils
 from oslo_utils import units
 
+import nova.conf
 from nova import exception
-from nova.i18n import _LW
-from nova.openstack.common import fileutils
+from nova.objects import fields
+import nova.privsep.fs
 from nova import utils
 from nova import version
 
-LOG = logging.getLogger(__name__)
-
-configdrive_opts = [
-    cfg.StrOpt('config_drive_format',
-               default='iso9660',
-               choices=('iso9660', 'vfat'),
-               help='Config drive format.'),
-    # force_config_drive is a string option, to allow for future behaviors
-    #  (e.g. use config_drive based on image properties)
-    cfg.StrOpt('force_config_drive',
-               choices=('always', 'True', 'False'),
-               help='Set to "always" to force injection to take place on a '
-                    'config drive. NOTE: The "always" will be deprecated in '
-                    'the Liberty release cycle.'),
-    cfg.StrOpt('mkisofs_cmd',
-               default='genisoimage',
-               help='Name and optionally path of the tool used for '
-                    'ISO image creation')
-    ]
-
-CONF = cfg.CONF
-CONF.register_opts(configdrive_opts)
+CONF = nova.conf.CONF
 
 # Config drives are 64mb, if we can't size to the exact size of the data
 CONFIGDRIVESIZE_BYTES = 64 * units.Mi
-
-FS_FORMAT_VFAT = 'vfat'
-FS_FORMAT_ISO9660 = 'iso9660'
-
-IMAGE_TYPE_RAW = 'raw'
-IMAGE_TYPE_PLOOP = 'ploop'
 
 
 class ConfigDriveBuilder(object):
     """Build config drives, optionally as a context manager."""
 
     def __init__(self, instance_md=None):
-        if CONF.force_config_drive == 'always':
-            LOG.warning(_LW('The setting "always" will be deprecated in the '
-                            'Liberty version. Please use "True" instead'))
         self.imagefile = None
         self.mdfiles = []
 
@@ -91,6 +61,10 @@ class ConfigDriveBuilder(object):
         dirname = os.path.dirname(filepath)
         fileutils.ensure_tree(dirname)
         with open(filepath, 'wb') as f:
+            # the given data can be either text or bytes. we can only write
+            # bytes into files.
+            if isinstance(data, str):
+                data = data.encode('utf-8')
             f.write(data)
 
     def add_instance_metadata(self, instance_md):
@@ -107,21 +81,21 @@ class ConfigDriveBuilder(object):
             'version': version.version_string_with_package()
             }
 
-        utils.execute(CONF.mkisofs_cmd,
-                      '-o', path,
-                      '-ldots',
-                      '-allow-lowercase',
-                      '-allow-multidot',
-                      '-l',
-                      '-publisher',
-                      publisher,
-                      '-quiet',
-                      '-J',
-                      '-r',
-                      '-V', 'config-2',
-                      tmpdir,
-                      attempts=1,
-                      run_as_root=False)
+        processutils.execute(CONF.mkisofs_cmd,
+                             '-o', path,
+                             '-ldots',
+                             '-allow-lowercase',
+                             '-allow-multidot',
+                             '-l',
+                             '-publisher',
+                             publisher,
+                             '-quiet',
+                             '-J',
+                             '-r',
+                             '-V', 'config-2',
+                             tmpdir,
+                             attempts=1,
+                             run_as_root=False)
 
     def _make_vfat(self, path, tmpdir):
         # NOTE(mikal): This is a little horrible, but I couldn't find an
@@ -129,17 +103,14 @@ class ConfigDriveBuilder(object):
         with open(path, 'wb') as f:
             f.truncate(CONFIGDRIVESIZE_BYTES)
 
-        utils.mkfs('vfat', path, label='config-2')
+        nova.privsep.fs.unprivileged_mkfs('vfat', path, label='config-2')
 
         with utils.tempdir() as mountdir:
             mounted = False
             try:
-                _, err = utils.trycmd(
-                    'mount', '-o', 'loop,uid=%d,gid=%d' % (os.getuid(),
-                                                           os.getgid()),
-                    path,
-                    mountdir,
-                    run_as_root=True)
+                _, err = nova.privsep.fs.mount(
+                    None, path, mountdir,
+                    ['-o', 'loop,uid=%d,gid=%d' % (os.getuid(), os.getgid())])
                 if err:
                     raise exception.ConfigDriveMountFailed(operation='mount',
                                                            error=err)
@@ -154,82 +125,25 @@ class ConfigDriveBuilder(object):
 
             finally:
                 if mounted:
-                    utils.execute('umount', mountdir, run_as_root=True)
+                    nova.privsep.fs.umount(mountdir)
 
-    def _make_ext4_ploop(self, path, tmpdir):
-        """ploop is a disk loopback block device, that is used in
-        Parallels(OpenVZ) containers. It is similar to Linux loop
-        device but prevents double caching of data in memory and
-        supports snapshots and some other efficiency benefits. Adding
-        ploop is a natural way to add disk device to VZ containers.
-        Ploop device has its own image format. It contains specific
-        partition table with one ext4 partition.
-        """
-        os.mkdir(path)
-        utils.execute('ploop',
-                      'init',
-                      '-s', CONFIGDRIVESIZE_BYTES,
-                      '-t', 'ext4',
-                      path + '/disk.config.hds',
-                      attempts=1,
-                      run_as_root=True)
-        with utils.tempdir() as mountdir:
-            mounted = False
-            try:
-                _, err = utils.trycmd(
-                        'ploop', 'mount',
-                        '-m', mountdir,
-                        '-t', 'ext4',
-                        path + '/DiskDescriptor.xml',
-                        run_as_root=True)
-                if os.path.exists(mountdir):
-                    utils.execute('chown', '-R',
-                            '%(u)d:%(g)d' % {'u': os.getuid(),
-                                             'g': os.getgid()},
-                            mountdir,
-                            run_as_root=True)
-                mounted = True
-                for ent in os.listdir(tmpdir):
-                    shutil.copytree(os.path.join(tmpdir, ent),
-                                    os.path.join(mountdir, ent))
-            finally:
-                if mounted:
-                    utils.execute('ploop', 'umount',
-                            path + '/disk.config.hds', run_as_root=True)
-
-    def make_drive(self, path, image_type=IMAGE_TYPE_RAW):
+    def make_drive(self, path):
         """Make the config drive.
 
         :param path: the path to place the config drive image at
-        :param image_type: host side image format
 
         :raises ProcessExecuteError if a helper process has failed.
         """
-        fs_format = CONF.config_drive_format
-        if fs_format is None:
-            if image_type == IMAGE_TYPE_RAW:
-                fs_format = FS_FORMAT_ISO9660
-
         with utils.tempdir() as tmpdir:
             self._write_md_files(tmpdir)
 
-            if image_type == IMAGE_TYPE_RAW:
-                if fs_format not in (FS_FORMAT_VFAT, FS_FORMAT_ISO9660):
-                    raise exception.ConfigDriveUnsupportedFormat(
-                            format=fs_format,
-                            image_type=image_type,
-                            image_path=path)
-                elif fs_format == FS_FORMAT_ISO9660:
-                    self._make_iso9660(path, tmpdir)
-                elif fs_format == FS_FORMAT_VFAT:
-                    self._make_vfat(path, tmpdir)
-            elif image_type == IMAGE_TYPE_PLOOP:
-                self._make_ext4_ploop(path, tmpdir)
+            if CONF.config_drive_format == 'iso9660':
+                self._make_iso9660(path, tmpdir)
+            elif CONF.config_drive_format == 'vfat':
+                self._make_vfat(path, tmpdir)
             else:
-                raise exception.ConfigDriveUnsupportedFormat(
-                    format=fs_format,
-                    image_type=image_type,
-                    image_path=path)
+                raise exception.ConfigDriveUnknownFormat(
+                    format=CONF.config_drive_format)
 
     def cleanup(self):
         if self.imagefile:
@@ -241,18 +155,18 @@ class ConfigDriveBuilder(object):
 
 def required_by(instance):
 
-    image_prop = utils.instance_sys_meta(instance).get(
-        utils.SM_IMAGE_PROP_PREFIX + 'img_config_drive', 'optional')
-    if image_prop not in ['optional', 'mandatory']:
-        LOG.warning(_LW('Image config drive option %(image_prop)s is invalid '
-                        'and will be ignored'),
-                    {'image_prop': image_prop},
-                    instance=instance)
+    image_prop = instance.image_meta.properties.get(
+        "img_config_drive",
+        fields.ConfigDrivePolicy.OPTIONAL)
 
-    return (instance.get('config_drive') or
-            'always' == CONF.force_config_drive or
-            strutils.bool_from_string(CONF.force_config_drive) or
-            image_prop == 'mandatory'
+    # NOTE(pandatt): Option CONF.force_config_drive only applies to newly
+    # being-built VMs. And already launched VMs shouldn't be forced a config
+    # drive, because they may have been cloud-inited via metadata service, and
+    # do not need and have any config drive device. The `launched_at` property
+    # is an apparent flag to tell VMs being built from launched ones.
+    return (instance.config_drive or
+            (CONF.force_config_drive and not instance.launched_at) or
+            image_prop == fields.ConfigDrivePolicy.MANDATORY
             )
 
 

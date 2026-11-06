@@ -12,10 +12,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import contextlib
+from contextlib import contextmanager
 import re
+from unittest import mock
 
-import mock
 from oslo_utils import units
 from oslo_vmware import exceptions as vexc
 from oslo_vmware.objects import datastore as ds_obj
@@ -37,6 +37,15 @@ class DsUtilTestCase(test.NoDBTestCase):
         super(DsUtilTestCase, self).tearDown()
         fake.reset()
 
+    def test_get_datacenter_ref(self):
+        with mock.patch.object(self.session, '_call_method') as call_method:
+            ds_util.get_datacenter_ref(self.session, "datacenter")
+            call_method.assert_called_once_with(
+                self.session.vim,
+                "FindByInventoryPath",
+                self.session.vim.service_content.searchIndex,
+                inventoryPath="datacenter")
+
     def test_file_delete(self):
         def fake_call_method(module, method, *args, **kwargs):
             self.assertEqual('DeleteDatastoreFile_Task', method)
@@ -46,7 +55,7 @@ class DsUtilTestCase(test.NoDBTestCase):
             self.assertEqual('fake-dc-ref', datacenter)
             return 'fake_delete_task'
 
-        with contextlib.nested(
+        with test.nested(
             mock.patch.object(self.session, '_wait_for_task'),
             mock.patch.object(self.session, '_call_method',
                               fake_call_method)
@@ -70,7 +79,7 @@ class DsUtilTestCase(test.NoDBTestCase):
             self.assertEqual('fake-dst-dc-ref', dst_dc_ref)
             return 'fake_copy_task'
 
-        with contextlib.nested(
+        with test.nested(
             mock.patch.object(self.session, '_wait_for_task'),
             mock.patch.object(self.session, '_call_method',
                               fake_call_method)
@@ -96,7 +105,7 @@ class DsUtilTestCase(test.NoDBTestCase):
             self.assertEqual('fake-dc-ref', destinationDatacenter)
             return 'fake_move_task'
 
-        with contextlib.nested(
+        with test.nested(
             mock.patch.object(self.session, '_wait_for_task'),
             mock.patch.object(self.session, '_call_method',
                               fake_call_method)
@@ -121,7 +130,7 @@ class DsUtilTestCase(test.NoDBTestCase):
             self.assertEqual('fake-dc-ref', dest_datacenter)
             return 'fake_move_task'
 
-        with contextlib.nested(
+        with test.nested(
             mock.patch.object(self.session, '_wait_for_task'),
             mock.patch.object(self.session, '_call_method',
                               fake_call_method)
@@ -132,7 +141,7 @@ class DsUtilTestCase(test.NoDBTestCase):
                    mock.call('fake_move_task')])
 
     def test_disk_copy(self):
-        with contextlib.nested(
+        with test.nested(
             mock.patch.object(self.session, '_wait_for_task'),
             mock.patch.object(self.session, '_call_method',
                               return_value=mock.sentinel.cm)
@@ -148,7 +157,7 @@ class DsUtilTestCase(test.NoDBTestCase):
                     destName='sentinel.dest_ds')
 
     def test_disk_delete(self):
-        with contextlib.nested(
+        with test.nested(
             mock.patch.object(self.session, '_wait_for_task'),
             mock.patch.object(self.session, '_call_method',
                               return_value=mock.sentinel.cm)
@@ -204,7 +213,7 @@ class DsUtilTestCase(test.NoDBTestCase):
             # Should never get here
             self.fail()
 
-        with contextlib.nested(
+        with test.nested(
                 mock.patch.object(self.session, '_call_method',
                                   fake_call_method),
                 mock.patch.object(self.session, '_wait_for_task',
@@ -229,7 +238,7 @@ class DsUtilTestCase(test.NoDBTestCase):
             # Should never get here
             self.fail()
 
-        with contextlib.nested(
+        with test.nested(
                 mock.patch.object(self.session, '_call_method',
                                   fake_call_method),
                 mock.patch.object(self.session, '_wait_for_task',
@@ -239,6 +248,7 @@ class DsUtilTestCase(test.NoDBTestCase):
                     'fake-browser', ds_path, 'fake-file')
             self.assertFalse(file_exists)
 
+    @contextmanager
     def _mock_get_datastore_calls(self, *datastores):
         """Mock vim_util calls made by get_datastore."""
 
@@ -252,10 +262,9 @@ class DsUtilTestCase(test.NoDBTestCase):
 
         def fake_call_method(module, method, *args, **kwargs):
             # Mock the call which returns a list of datastores for the cluster
-            if (module == ds_util.vim_util and
-                    method == 'get_dynamic_property' and
-                    args == ('fake-cluster', 'ClusterComputeResource',
-                             'datastore')):
+            if (module == ds_util.vutil and
+                    method == 'get_object_property' and
+                    args == ('fake-cluster', 'datastore')):
                 fake_ds_mor = fake.DataObject()
                 fake_ds_mor.ManagedObjectReference = fake_ds_list
                 return fake_ds_mor
@@ -270,23 +279,21 @@ class DsUtilTestCase(test.NoDBTestCase):
                 datastores_i[0] = iter(datastores)
                 return next(datastores_i[0])
 
-            # Continue returning results from the current iterator.
-            if (module == ds_util.vutil and
-                    method == 'continue_retrieval'):
-                try:
-                    return next(datastores_i[0])
-                except StopIteration:
-                    return None
-
-            if (method == 'continue_retrieval' or
-                method == 'cancel_retrieval'):
-                return
-
             # Sentinel that get_datastore's use of vim has changed
             self.fail('Unexpected vim call in get_datastore: %s' % method)
 
-        return mock.patch.object(self.session, '_call_method',
-                                 side_effect=fake_call_method)
+        def next_datastore(*args, **kwargs):
+            try:
+                return next(datastores_i[0])
+            except StopIteration:
+                return None
+
+        with mock.patch.object(self.session, '_call_method',
+                               side_effect=fake_call_method), \
+                mock.patch('oslo_vmware.vim_util.continue_retrieval',
+                           side_effect=next_datastore), \
+                mock.patch('oslo_vmware.vim_util.cancel_retrieval'):
+            yield
 
     def test_get_datastore(self):
         fake_objects = fake.FakeRetrieveResult()
@@ -304,7 +311,7 @@ class DsUtilTestCase(test.NoDBTestCase):
 
     def test_get_datastore_with_regex(self):
         # Test with a regex that matches with a datastore
-        datastore_valid_regex = re.compile("^openstack.*\d$")
+        datastore_valid_regex = re.compile(r"^openstack.*\d$")
         fake_objects = fake.FakeRetrieveResult()
         fake_objects.add_object(fake.Datastore("openstack-ds0"))
         fake_objects.add_object(fake.Datastore("fake-ds0"))
@@ -316,7 +323,7 @@ class DsUtilTestCase(test.NoDBTestCase):
         self.assertEqual("openstack-ds0", result.name)
 
     def test_get_datastore_with_token(self):
-        regex = re.compile("^ds.*\d$")
+        regex = re.compile(r"^ds.*\d$")
         fake0 = fake.FakeRetrieveResult()
         fake0.add_object(fake.Datastore("ds0", 10 * units.Gi, 5 * units.Gi))
         fake0.add_object(fake.Datastore("foo", 10 * units.Gi, 9 * units.Gi))
@@ -449,3 +456,30 @@ class DsUtilTestCase(test.NoDBTestCase):
                                                       "normal",
                                                       "VMFS",
                                                       datastore_regex))
+
+    def test_get_connected_hosts_none(self):
+        with mock.patch.object(self.session,
+                               '_call_method') as _call_method:
+            hosts = ds_util.get_connected_hosts(self.session,
+                                                'fake_datastore')
+            self.assertEqual([], hosts)
+            _call_method.assert_called_once_with(
+                    mock.ANY, 'get_object_property',
+                    'fake_datastore', 'host')
+
+    def test_get_connected_hosts(self):
+        host = fake.ManagedObjectReference(value='fake-host',
+                                           name='HostSystem')
+        host_mount = mock.Mock(spec=object)
+        host_mount.key = host
+        host_mounts = mock.Mock(spec=object)
+        host_mounts.DatastoreHostMount = [host_mount]
+
+        with mock.patch.object(self.session, '_call_method',
+                               return_value=host_mounts) as _call_method:
+            hosts = ds_util.get_connected_hosts(self.session,
+                                                'fake_datastore')
+            self.assertEqual(['fake-host'], hosts)
+            _call_method.assert_called_once_with(
+                    mock.ANY, 'get_object_property',
+                    'fake_datastore', 'host')

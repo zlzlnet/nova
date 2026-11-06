@@ -16,10 +16,10 @@
 
 import re
 
-from eventlet import greenthread
 from oslo_concurrency import processutils
 from oslo_log import log as logging
-import six
+
+from nova import utils
 
 LOG = logging.getLogger(__name__)
 
@@ -54,11 +54,9 @@ def fake_execute_default_reply_handler(*ignore_args, **ignore_kwargs):
 def fake_execute(*cmd_parts, **kwargs):
     """This function stubs out execute.
 
-    It optionally executes a preconfigued function to return expected data.
+    It optionally executes a preconfigured function to return expected data.
 
     """
-    global _fake_execute_repliers
-
     process_input = kwargs.get('process_input', None)
     check_exit_code = kwargs.get('check_exit_code', 0)
     delay_on_retry = kwargs.get('delay_on_retry', True)
@@ -77,7 +75,7 @@ def fake_execute(*cmd_parts, **kwargs):
             LOG.debug('Faked command matched %s', fake_replier[0])
             break
 
-    if isinstance(reply_handler, six.string_types):
+    if isinstance(reply_handler, str):
         # If the reply handler is a string, return it as stdout
         reply = reply_handler, ''
     else:
@@ -97,11 +95,11 @@ def fake_execute(*cmd_parts, **kwargs):
         "stderr='%(stderr)s'", {'stdout': reply[0], 'stderr': reply[1]})
 
     # Replicate the sleep call in the real function
-    greenthread.sleep(0)
+    utils.cooperative_yield()
     return reply
 
 
-def stub_out_processutils_execute(stubs):
+def stub_out_processutils_execute(test):
     fake_execute_set_repliers([])
     fake_execute_clear_log()
-    stubs.Set(processutils, 'execute', fake_execute)
+    test.stub_out('oslo_concurrency.processutils.execute', fake_execute)

@@ -12,13 +12,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
-
 from nova import objects
+from nova.objects import network_request
 from nova.tests.unit.objects import test_objects
 
 
 FAKE_UUID = '0C5C9AD2-F967-4E92-A7F3-24410F697440'
+ARQ_UUID = '1F1EF29A-D9F3-4E92-A7F3-24410F697CEB'
+DEV_PROFILE = "smart_nic"
 
 
 class _TestNetworkRequestObject(object):
@@ -27,56 +28,44 @@ class _TestNetworkRequestObject(object):
         request.network_id = '456'
         request.address = '1.2.3.4'
         request.port_id = FAKE_UUID
+        self.assertFalse(request.auto_allocate)
+        self.assertFalse(request.no_allocate)
 
     def test_load(self):
         request = objects.NetworkRequest()
         self.assertIsNone(request.port_id)
+        self.assertFalse(request.auto_allocate)
+        self.assertFalse(request.no_allocate)
 
-    def test_to_tuple_neutron(self):
+    def test_to_tuple(self):
         request = objects.NetworkRequest(network_id='123',
                                          address='1.2.3.4',
                                          port_id=FAKE_UUID,
+                                         arq_uuid=ARQ_UUID,
+                                         device_profile = DEV_PROFILE
                                      )
-        with mock.patch('nova.utils.is_neutron', return_value=True):
-            self.assertEqual(('123', '1.2.3.4', FAKE_UUID, None),
-                             request.to_tuple())
+        self.assertEqual(
+            ('123', '1.2.3.4', FAKE_UUID, None, ARQ_UUID, DEV_PROFILE),
+            request.to_tuple())
 
-    def test_to_tuple_nova(self):
-        request = objects.NetworkRequest(network_id='123',
-                                         address='1.2.3.4',
-                                         port_id=FAKE_UUID)
-        with mock.patch('nova.utils.is_neutron', return_value=False):
-            self.assertEqual(('123', '1.2.3.4'),
-                             request.to_tuple())
+    def test_from_tuples(self):
+        requests = objects.NetworkRequestList.from_tuples(
+            [('123', '1.2.3.4', FAKE_UUID, None, ARQ_UUID, DEV_PROFILE)])
+        self.assertEqual(1, len(requests))
+        self.assertEqual('123', requests[0].network_id)
+        self.assertEqual('1.2.3.4', str(requests[0].address))
+        self.assertEqual(FAKE_UUID, requests[0].port_id)
+        self.assertIsNone(requests[0].pci_request_id)
+        self.assertEqual(ARQ_UUID, requests[0].arq_uuid)
+        self.assertEqual(DEV_PROFILE, requests[0].device_profile)
 
-    def test_from_tuple_neutron(self):
-        request = objects.NetworkRequest.from_tuple(
-            ('123', '1.2.3.4', FAKE_UUID, None))
-        self.assertEqual('123', request.network_id)
-        self.assertEqual('1.2.3.4', str(request.address))
-        self.assertEqual(FAKE_UUID, request.port_id)
-
-    def test_from_tuple_neutron_without_pci_request_id(self):
-        request = objects.NetworkRequest.from_tuple(
-            ('123', '1.2.3.4', FAKE_UUID))
-        self.assertEqual('123', request.network_id)
-        self.assertEqual('1.2.3.4', str(request.address))
-        self.assertEqual(FAKE_UUID, request.port_id)
-
-    def test_from_tuple_nova(self):
-        request = objects.NetworkRequest.from_tuple(
-            ('123', '1.2.3.4'))
-        self.assertEqual('123', request.network_id)
-        self.assertEqual('1.2.3.4', str(request.address))
-        self.assertIsNone(request.port_id)
-
-    @mock.patch('nova.utils.is_neutron', return_value=True)
-    def test_list_as_tuples(self, is_neutron):
+    def test_list_as_tuples(self):
         requests = objects.NetworkRequestList(
             objects=[objects.NetworkRequest(network_id='123'),
                      objects.NetworkRequest(network_id='456')])
         self.assertEqual(
-            [('123', None, None, None), ('456', None, None, None)],
+            [('123', None, None, None, None, None),
+             ('456', None, None, None, None, None)],
              requests.as_tuples())
 
     def test_is_single_unspecified(self):
@@ -90,6 +79,63 @@ class _TestNetworkRequestObject(object):
         requests = objects.NetworkRequestList(
             objects=[objects.NetworkRequest()])
         self.assertTrue(requests.is_single_unspecified)
+
+    def test_auto_allocate(self):
+        # no objects
+        requests = objects.NetworkRequestList()
+        self.assertFalse(requests.auto_allocate)
+        # single object with network uuid
+        requests = objects.NetworkRequestList(
+            objects=[objects.NetworkRequest(network_id=FAKE_UUID)])
+        self.assertFalse(requests.auto_allocate)
+        # multiple objects
+        requests = objects.NetworkRequestList(
+            objects=[objects.NetworkRequest(),
+                     objects.NetworkRequest()])
+        self.assertFalse(requests.auto_allocate)
+        # single object, 'auto' case
+        requests = objects.NetworkRequestList(
+            objects=[objects.NetworkRequest(
+                network_id=network_request.NETWORK_ID_AUTO)])
+        self.assertTrue(requests.auto_allocate)
+
+    def test_no_allocate(self):
+        # no objects
+        requests = objects.NetworkRequestList()
+        self.assertFalse(requests.no_allocate)
+        # single object with network uuid
+        requests = objects.NetworkRequestList(
+            objects=[objects.NetworkRequest(network_id=FAKE_UUID)])
+        self.assertFalse(requests.no_allocate)
+        # multiple objects
+        requests = objects.NetworkRequestList(
+            objects=[objects.NetworkRequest(),
+                     objects.NetworkRequest()])
+        self.assertFalse(requests.no_allocate)
+        # single object, 'none' case
+        requests = objects.NetworkRequestList(
+            objects=[objects.NetworkRequest(
+                network_id=network_request.NETWORK_ID_NONE)])
+        self.assertTrue(requests.no_allocate)
+
+    def test_obj_make_compatible_pre_1_2(self):
+        net_req = objects.NetworkRequest()
+        net_req.tag = 'foo'
+        data = lambda x: x['nova_object.data']
+        primitive = data(net_req.obj_to_primitive(target_version='1.2'))
+        self.assertIn('tag', primitive)
+        primitive = data(net_req.obj_to_primitive(target_version='1.1'))
+        self.assertNotIn('tag', primitive)
+
+    def test_obj_make_compatible_pre_1_3(self):
+        net_req = objects.NetworkRequest()
+        net_req.arq_uuid = ARQ_UUID
+        data = lambda x: x['nova_object.data']
+        primitive = data(net_req.obj_to_primitive(target_version='1.3'))
+        self.assertIn('arq_uuid', primitive)
+        primitive = data(net_req.obj_to_primitive(target_version='1.2'))
+        self.assertNotIn('arq_uuid', primitive)
+        self.assertNotIn('device_profile', primitive)
 
 
 class TestNetworkRequestObject(test_objects._LocalTest,

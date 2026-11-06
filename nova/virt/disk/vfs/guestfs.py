@@ -12,15 +12,15 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from eventlet import tpool
-from oslo_config import cfg
+import os
+
 from oslo_log import log as logging
 from oslo_utils import importutils
-import six
 
+import nova.conf
 from nova import exception
 from nova.i18n import _
-from nova.i18n import _LW
+from nova import utils
 from nova.virt.disk.vfs import api as vfs
 from nova.virt.image import model as imgmodel
 
@@ -30,14 +30,7 @@ LOG = logging.getLogger(__name__)
 guestfs = None
 forceTCG = False
 
-guestfs_opts = [
-    cfg.BoolOpt('debug',
-                default=False,
-                help='Enable guestfs debug')
-]
-
-CONF = cfg.CONF
-CONF.register_opts(guestfs_opts, group='guestfs')
+CONF = nova.conf.CONF
 
 
 def force_tcg(force=True):
@@ -58,6 +51,7 @@ class VFSGuestFS(vfs.VFS):
     the host filesystem, thus avoiding any potential for symlink
     attacks from the guest filesystem.
     """
+
     def __init__(self, image, partition=None):
         """Create a new local VFS instance
 
@@ -81,10 +75,22 @@ class VFSGuestFS(vfs.VFS):
     def inspect_capabilities(self):
         """Determines whether guestfs is well configured."""
         try:
-            g = tpool.Proxy(guestfs.GuestFS())
+            # If guestfs debug is enabled, we can't launch in a thread because
+            # the debug logging callback can make eventlet try to switch
+            # threads and then the launch hangs, causing eternal sadness.
+            if CONF.guestfs.debug:
+                LOG.debug('Inspecting guestfs capabilities non-threaded.')
+                g = guestfs.GuestFS()
+            else:
+                g = utils.tpool_wrap(guestfs.GuestFS())
             g.add_drive("/dev/null")  # sic
             g.launch()
         except Exception as e:
+            kernel_file = "/boot/vmlinuz-%s" % os.uname().release
+            if not os.access(kernel_file, os.R_OK):
+                raise exception.LibguestfsCannotReadKernel(
+                    _("Please change permissions on %s to 0x644")
+                    % kernel_file)
             raise exception.NovaException(
                 _("libguestfs installed but not usable (%s)") % e)
 
@@ -93,8 +99,8 @@ class VFSGuestFS(vfs.VFS):
     def configure_debug(self):
         """Configures guestfs to be verbose."""
         if not self.handle:
-            LOG.warning(_LW("Please consider to execute setup before trying "
-                            "to configure debug log message."))
+            LOG.warning("Please consider to execute setup before trying "
+                        "to configure debug log message.")
         else:
             def log_callback(ev, eh, buf, array):
                 if ev == guestfs.EVENT_APPLIANCE:
@@ -104,8 +110,8 @@ class VFSGuestFS(vfs.VFS):
                               "event": guestfs.event_to_string(ev),
                               "eh": eh, "buf": buf, "array": array})
 
-            events = (guestfs.EVENT_APPLIANCE | guestfs.EVENT_LIBRARY
-                      | guestfs.EVENT_WARNING | guestfs.EVENT_TRACE)
+            events = (guestfs.EVENT_APPLIANCE | guestfs.EVENT_LIBRARY |
+                      guestfs.EVENT_WARNING | guestfs.EVENT_TRACE)
 
             self.handle.set_trace(True)  # just traces libguestfs API calls
             self.handle.set_verbose(True)
@@ -175,16 +181,15 @@ class VFSGuestFS(vfs.VFS):
         LOG.debug("Setting up appliance for %(image)s",
                   {'image': self.image})
         try:
-            self.handle = tpool.Proxy(
+            self.handle = utils.tpool_wrap(
                 guestfs.GuestFS(python_return_dict=False,
                                 close_on_exit=False))
         except TypeError as e:
-            if ('close_on_exit' in six.text_type(e) or
-                'python_return_dict' in six.text_type(e)):
+            if 'close_on_exit' in str(e) or 'python_return_dict' in str(e):
                 # NOTE(russellb) In case we're not using a version of
                 # libguestfs new enough to support parameters close_on_exit
                 # and python_return_dict which were added in libguestfs 1.20.
-                self.handle = tpool.Proxy(guestfs.GuestFS())
+                self.handle = utils.tpool_wrap(guestfs.GuestFS())
             else:
                 raise
 
@@ -193,12 +198,23 @@ class VFSGuestFS(vfs.VFS):
 
         try:
             if forceTCG:
-                self.handle.set_backend_settings("force_tcg")
+                # TODO(mriedem): Should we be using set_backend_setting
+                # instead to just set the single force_tcg setting? Because
+                # according to the guestfs docs, set_backend_settings will
+                # overwrite all backend settings. The question is, what would
+                # the value be? True? "set_backend_setting" is available
+                # starting in 1.27.2 which should be new enough at this point
+                # on modern distributions.
+                ret = self.handle.set_backend_settings(["force_tcg"])
+                if ret != 0:
+                    LOG.warning('Failed to force guestfs TCG mode. '
+                                'guestfs_set_backend_settings returned: %s',
+                                ret)
         except AttributeError as ex:
             # set_backend_settings method doesn't exist in older
             # libguestfs versions, so nothing we can do but ignore
-            LOG.warning(_LW("Unable to force TCG mode, "
-                            "libguestfs too old? %s"), ex)
+            LOG.warning("Unable to force TCG mode, "
+                        "libguestfs too old? %s", ex)
             pass
 
         try:
@@ -246,7 +262,7 @@ class VFSGuestFS(vfs.VFS):
                 if self.mount:
                     self.handle.aug_close()
             except RuntimeError as e:
-                LOG.warning(_LW("Failed to close augeas %s"), e)
+                LOG.warning("Failed to close augeas %s", e)
 
             try:
                 self.handle.shutdown()
@@ -254,7 +270,7 @@ class VFSGuestFS(vfs.VFS):
                 # Older libguestfs versions haven't an explicit shutdown
                 pass
             except RuntimeError as e:
-                LOG.warning(_LW("Failed to shutdown appliance %s"), e)
+                LOG.warning("Failed to shutdown appliance %s", e)
 
             try:
                 self.handle.close()
@@ -262,7 +278,7 @@ class VFSGuestFS(vfs.VFS):
                 # Older libguestfs versions haven't an explicit close
                 pass
             except RuntimeError as e:
-                LOG.warning(_LW("Failed to close guest handle %s"), e)
+                LOG.warning("Failed to close guest handle %s", e)
         finally:
             # dereference object and implicitly close()
             self.handle = None
@@ -291,7 +307,14 @@ class VFSGuestFS(vfs.VFS):
     def read_file(self, path):
         LOG.debug("Read file path=%s", path)
         path = self._canonicalize_path(path)
-        return self.handle.read_file(path)
+        data = self.handle.read_file(path)
+        # NOTE(lyarwood): libguestfs v1.41.1 (0ee02e0117527) switched the
+        # return type of read_file from string to bytes and as such we need to
+        # handle both here, decoding and returning a string if bytes is
+        # provided. https://bugzilla.redhat.com/show_bug.cgi?id=1661871
+        if isinstance(data, bytes):
+            return data.decode()
+        return data
 
     def has_file(self, path):
         LOG.debug("Has file path=%s", path)
@@ -316,13 +339,20 @@ class VFSGuestFS(vfs.VFS):
         uid = -1
         gid = -1
 
-        if user is not None:
-            uid = int(self.handle.aug_get(
-                    "/files/etc/passwd/" + user + "/uid"))
-        if group is not None:
-            gid = int(self.handle.aug_get(
-                    "/files/etc/group/" + group + "/gid"))
+        def _get_item_id(id_path):
+            try:
+                return int(self.handle.aug_get("/files/etc/" + id_path))
+            except RuntimeError as e:
+                msg = _("Error obtaining uid/gid for %(user)s/%(group)s: "
+                        " path %(id_path)s not found (%(e)s)") % {
+                    'id_path': "/files/etc/" + id_path, 'user': user,
+                    'group': group, 'e': e}
+                raise exception.NovaException(msg)
 
+        if user is not None:
+            uid = _get_item_id('passwd/' + user + '/uid')
+        if group is not None:
+            gid = _get_item_id('group/' + group + '/gid')
         LOG.debug("chown uid=%(uid)d gid=%(gid)s",
                   {'uid': uid, 'gid': gid})
         self.handle.chown(uid, gid, path)

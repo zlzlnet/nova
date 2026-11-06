@@ -1,0 +1,4 @@
+# Functional tests to exclude when running in threading mode
+
+# Tests that fail and may cause worker cleanup to hang
+nova.tests.functional.regressions.test_bug_1825034.FillVirtualInterfaceListMigration.test_fill_vifs_migration

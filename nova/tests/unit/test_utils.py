@@ -13,34 +13,33 @@
 #    under the License.
 
 import datetime
-import functools
 import hashlib
-import importlib
 import os
 import os.path
-import socket
-import StringIO
-import struct
-import tempfile
+import threading
+import time
+from unittest import mock
 
-import eventlet
-import mock
-from mox3 import mox
+import fasteners
+import fixtures
+from keystoneauth1.identity import base as ks_identity
+from keystoneauth1 import session as ks_session
 import netaddr
-from oslo_concurrency import processutils
+from openstack import exceptions as sdk_exc
 from oslo_config import cfg
-from oslo_context import context as common_context
-from oslo_context import fixture as context_fixture
+import oslo_service.backend as oslo_backend
 from oslo_utils import encodeutils
-from oslo_utils import timeutils
-from oslo_utils import units
-import six
+from oslo_utils import fixture as utils_fixture
 
-
-import nova
-from nova import context
 from nova import exception
+from nova import monkey_patch
+from nova.objects import base as obj_base
+from nova.objects import instance as instance_obj
+from nova.objects import service as service_obj
 from nova import test
+from nova.tests import fixtures as nova_fixtures
+from nova.tests.unit.objects import test_objects
+from nova.tests.unit import utils as test_utils
 from nova import utils
 
 CONF = cfg.CONF
@@ -73,57 +72,71 @@ class GenericUtilsTestCase(test.NoDBTestCase):
         self.assertEqual(('', ''), result)
 
     def test_hostname_unicode_sanitization(self):
-        hostname = u"\u7684.test.example.com"
-        self.assertEqual("test.example.com",
-                         utils.sanitize_hostname(hostname))
+        hostname = u'\u7684myamazinghostname'
+        self.assertEqual(
+            'myamazinghostname', utils.sanitize_hostname(hostname))
 
     def test_hostname_sanitize_periods(self):
-        hostname = "....test.example.com..."
-        self.assertEqual("test.example.com",
-                         utils.sanitize_hostname(hostname))
+        hostname = '....test.example.com...'
+        self.assertEqual(
+            'test-example-com', utils.sanitize_hostname(hostname))
 
     def test_hostname_sanitize_dashes(self):
-        hostname = "----test.example.com---"
-        self.assertEqual("test.example.com",
-                         utils.sanitize_hostname(hostname))
+        hostname = '----my-amazing-hostname---'
+        self.assertEqual(
+            "my-amazing-hostname", utils.sanitize_hostname(hostname))
 
     def test_hostname_sanitize_characters(self):
         hostname = "(#@&$!(@*--#&91)(__=+--test-host.example!!.com-0+"
-        self.assertEqual("91----test-host.example.com-0",
-                         utils.sanitize_hostname(hostname))
+        self.assertEqual(
+            "91----test-host-example-com-0",
+            utils.sanitize_hostname(hostname))
 
     def test_hostname_translate(self):
         hostname = "<}\x1fh\x10e\x08l\x02l\x05o\x12!{>"
         self.assertEqual("hello", utils.sanitize_hostname(hostname))
 
-    def test_read_cached_file(self):
-        self.mox.StubOutWithMock(os.path, "getmtime")
-        os.path.getmtime(mox.IgnoreArg()).AndReturn(1)
-        self.mox.ReplayAll()
+    def test_hostname_has_default(self):
+        hostname = u"\u7684hello"
+        defaultname = "Server-1"
+        self.assertEqual(
+            "hello", utils.sanitize_hostname(hostname, defaultname))
 
-        cache_data = {"data": 1123, "mtime": 1}
-        data = utils.read_cached_file("/this/is/a/fake", cache_data)
-        self.assertEqual(cache_data["data"], data)
+    def test_hostname_empty_has_default(self):
+        hostname = u"\u7684"
+        defaultname = "Server-1"
+        self.assertEqual(
+            defaultname, utils.sanitize_hostname(hostname, defaultname))
 
-    def test_read_modified_cached_file(self):
-        self.mox.StubOutWithMock(os.path, "getmtime")
-        os.path.getmtime(mox.IgnoreArg()).AndReturn(2)
-        self.mox.ReplayAll()
+    def test_hostname_empty_has_default_too_long(self):
+        hostname = u"\u7684"
+        defaultname = "a" * 64
+        self.assertEqual(
+            "a" * 63, utils.sanitize_hostname(hostname, defaultname))
 
-        fake_contents = "lorem ipsum"
-        m = mock.mock_open(read_data=fake_contents)
-        with mock.patch("__builtin__.open", m, create=True):
-            cache_data = {"data": 1123, "mtime": 1}
-            self.reload_called = False
+    def test_hostname_empty_no_default(self):
+        hostname = u"\u7684"
+        self.assertEqual("", utils.sanitize_hostname(hostname))
 
-            def test_reload(reloaded_data):
-                self.assertEqual(reloaded_data, fake_contents)
-                self.reload_called = True
+    def test_hostname_empty_minus_period(self):
+        hostname = "---..."
+        self.assertEqual("", utils.sanitize_hostname(hostname))
 
-            data = utils.read_cached_file("/this/is/a/fake", cache_data,
-                                                    reload_func=test_reload)
-            self.assertEqual(data, fake_contents)
-            self.assertTrue(self.reload_called)
+    def test_hostname_with_space(self):
+        hostname = " a b c "
+        self.assertEqual("a-b-c", utils.sanitize_hostname(hostname))
+
+    def test_hostname_too_long(self):
+        hostname = "a" * 64
+        self.assertEqual(63, len(utils.sanitize_hostname(hostname)))
+
+    def test_hostname_truncated_no_hyphen(self):
+        hostname = "a" * 62
+        hostname = hostname + '-' + 'a'
+        res = utils.sanitize_hostname(hostname)
+        # we trim to 63 and then trim the trailing dash
+        self.assertEqual(62, len(res))
+        self.assertFalse(res.endswith('-'), 'The hostname ends with a -')
 
     def test_generate_password(self):
         password = utils.generate_password()
@@ -132,48 +145,6 @@ class GenericUtilsTestCase(test.NoDBTestCase):
                          if c in 'abcdefghijklmnopqrstuvwxyz'])
         self.assertTrue([c for c in password
                          if c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'])
-
-    def test_read_file_as_root(self):
-        def fake_execute(*args, **kwargs):
-            if args[1] == 'bad':
-                raise processutils.ProcessExecutionError()
-            return 'fakecontents', None
-
-        self.stubs.Set(utils, 'execute', fake_execute)
-        contents = utils.read_file_as_root('good')
-        self.assertEqual(contents, 'fakecontents')
-        self.assertRaises(exception.FileNotFound,
-                          utils.read_file_as_root, 'bad')
-
-    def test_temporary_chown(self):
-        def fake_execute(*args, **kwargs):
-            if args[0] == 'chown':
-                fake_execute.uid = args[1]
-        self.stubs.Set(utils, 'execute', fake_execute)
-
-        with tempfile.NamedTemporaryFile() as f:
-            with utils.temporary_chown(f.name, owner_uid=2):
-                self.assertEqual(fake_execute.uid, 2)
-            self.assertEqual(fake_execute.uid, os.getuid())
-
-    def test_xhtml_escape(self):
-        self.assertEqual('&quot;foo&quot;', utils.xhtml_escape('"foo"'))
-        self.assertEqual('&apos;foo&apos;', utils.xhtml_escape("'foo'"))
-        self.assertEqual('&amp;', utils.xhtml_escape('&'))
-        self.assertEqual('&gt;', utils.xhtml_escape('>'))
-        self.assertEqual('&lt;', utils.xhtml_escape('<'))
-        self.assertEqual('&lt;foo&gt;', utils.xhtml_escape('<foo>'))
-
-    def test_is_valid_ipv6_cidr(self):
-        self.assertTrue(utils.is_valid_ipv6_cidr("2600::/64"))
-        self.assertTrue(utils.is_valid_ipv6_cidr(
-                "abcd:ef01:2345:6789:abcd:ef01:192.168.254.254/48"))
-        self.assertTrue(utils.is_valid_ipv6_cidr(
-                "0000:0000:0000:0000:0000:0000:0000:0001/32"))
-        self.assertTrue(utils.is_valid_ipv6_cidr(
-                "0000:0000:0000:0000:0000:0000:0000:0001"))
-        self.assertFalse(utils.is_valid_ipv6_cidr("foo"))
-        self.assertFalse(utils.is_valid_ipv6_cidr("127.0.0.1"))
 
     def test_get_shortened_ipv6(self):
         self.assertEqual("abcd:ef01:2345:6789:abcd:ef01:c0a8:fefe",
@@ -208,149 +179,114 @@ class GenericUtilsTestCase(test.NoDBTestCase):
                          "::ffff:127.0.0.1"))
         self.assertEqual("localhost", utils.safe_ip_format("localhost"))
 
+    def test_format_remote_path(self):
+        self.assertEqual("[::1]:/foo/bar",
+                         utils.format_remote_path("::1", "/foo/bar"))
+        self.assertEqual("127.0.0.1:/foo/bar",
+                         utils.format_remote_path("127.0.0.1", "/foo/bar"))
+        self.assertEqual("[::ffff:127.0.0.1]:/foo/bar",
+                         utils.format_remote_path("::ffff:127.0.0.1",
+                                                  "/foo/bar"))
+        self.assertEqual("localhost:/foo/bar",
+                         utils.format_remote_path("localhost", "/foo/bar"))
+        self.assertEqual("/foo/bar", utils.format_remote_path(None,
+                                                              "/foo/bar"))
+
     def test_get_hash_str(self):
-        base_str = "foo"
-        value = hashlib.md5(base_str).hexdigest()
+        base_str = b"foo"
+        base_unicode = u"foo"
+        value = hashlib.md5(base_str, usedforsecurity=False).hexdigest()
         self.assertEqual(
             value, utils.get_hash_str(base_str))
+        self.assertEqual(
+            value, utils.get_hash_str(base_unicode))
 
-    def test_use_rootwrap(self):
-        self.flags(disable_rootwrap=False, group='workarounds')
-        self.flags(rootwrap_config='foo')
-        cmd = utils._get_root_helper()
-        self.assertEqual('sudo nova-rootwrap foo', cmd)
+    def test_get_obj_repr_unicode(self):
+        instance = instance_obj.Instance()
+        instance.display_name = u'\u00CD\u00F1st\u00E1\u00F1c\u00E9'
+        # should be a bytes string if python2 before conversion
+        self.assertIs(str, type(repr(instance)))
+        self.assertIs(str, type(utils.get_obj_repr_unicode(instance)))
 
-    def test_use_sudo(self):
-        self.flags(disable_rootwrap=True, group='workarounds')
-        cmd = utils._get_root_helper()
-        self.assertEqual('sudo', cmd)
-
-    def test_ssh_execute(self):
+    @mock.patch('oslo_concurrency.processutils.execute')
+    def test_ssh_execute(self, mock_execute):
         expected_args = ('ssh', '-o', 'BatchMode=yes',
                          'remotehost', 'ls', '-l')
-        with mock.patch('nova.utils.execute') as mock_method:
-            utils.ssh_execute('remotehost', 'ls', '-l')
-        mock_method.assert_called_once_with(*expected_args)
+        utils.ssh_execute('remotehost', 'ls', '-l')
+        mock_execute.assert_called_once_with(*expected_args)
+
+    def test_generate_hostid(self):
+        host = 'host'
+        project_id = '9b9e3c847e904b0686e8ffb20e4c6381'
+        hostId = 'fa123c6f74efd4aad95f84096f9e187caa0625925a9e7837b2b46792'
+        self.assertEqual(hostId, utils.generate_hostid(host, project_id))
+
+    def test_generate_hostid_with_none_host(self):
+        project_id = '9b9e3c847e904b0686e8ffb20e4c6381'
+        self.assertEqual('', utils.generate_hostid(None, project_id))
+
+    def test_tpool_wrap_eventlet(self):
+        if utils.concurrency_mode_threading():
+            self.skipTest(
+                "In native threading mode this case cannot be tested.")
+
+        mock_target = mock.MagicMock()
+        with mock.patch('eventlet.tpool.Proxy') as mock_tpool:
+            target = utils.tpool_wrap(mock_target)
+
+        mock_tpool.assert_called_once_with(mock_target, autowrap=())
+        self.assertEqual(mock_tpool.return_value, target)
+
+    @mock.patch('nova.utils.concurrency_mode_threading', return_value=True)
+    def test_tpool_wrap_threading(self, mock_concurrency_mode):
+        mock_target = mock.MagicMock()
+        target = utils.tpool_wrap(mock_target)
+
+        self.assertEqual(target, mock_target)
+        mock_concurrency_mode.assert_called_once_with()
 
 
-class VPNPingTestCase(test.NoDBTestCase):
-    """Unit tests for utils.vpn_ping()."""
-    def setUp(self):
-        super(VPNPingTestCase, self).setUp()
-        self.port = 'fake'
-        self.address = 'fake'
-        self.session_id = 0x1234
-        self.fmt = '!BQxxxxxQxxxx'
+class TestCachedFile(test.NoDBTestCase):
+    @mock.patch('os.path.getmtime', return_value=1)
+    def test_read_cached_file(self, getmtime):
+        utils._FILE_CACHE = {
+            '/this/is/a/fake': {"data": 1123, "mtime": 1}
+        }
+        fresh, data = utils.read_cached_file("/this/is/a/fake")
+        fdata = utils._FILE_CACHE['/this/is/a/fake']["data"]
+        self.assertEqual(fdata, data)
 
-    def fake_reply_packet(self, pkt_id=0x40):
-        return struct.pack(self.fmt, pkt_id, 0x0, self.session_id)
+    @mock.patch('os.path.getmtime', return_value=2)
+    def test_read_modified_cached_file(self, getmtime):
 
-    def setup_socket(sefl, mock_socket, return_value, side_effect=None):
-        socket_obj = mock.MagicMock()
-        if side_effect is not None:
-            socket_obj.recv.side_effect = side_effect
-        else:
-            socket_obj.recv.return_value = return_value
-        mock_socket.return_value = socket_obj
+        utils._FILE_CACHE = {
+            '/this/is/a/fake': {"data": 1123, "mtime": 1}
+        }
 
-    @mock.patch.object(socket, 'socket')
-    def test_vpn_ping_timeout(self, mock_socket):
-        """Server doesn't reply within timeout."""
-        self.setup_socket(mock_socket, None, socket.timeout)
-        rc = utils.vpn_ping(self.address, self.port,
-                            session_id=self.session_id)
-        self.assertFalse(rc)
+        fake_contents = "lorem ipsum"
 
-    @mock.patch.object(socket, 'socket')
-    def test_vpn_ping_bad_len(self, mock_socket):
-        """Test a short/invalid server reply."""
-        self.setup_socket(mock_socket, 'fake_reply')
-        rc = utils.vpn_ping(self.address, self.port,
-                            session_id=self.session_id)
-        self.assertFalse(rc)
+        with mock.patch('builtins.open',
+                        mock.mock_open(read_data=fake_contents)):
+            fresh, data = utils.read_cached_file("/this/is/a/fake")
 
-    @mock.patch.object(socket, 'socket')
-    def test_vpn_ping_bad_id(self, mock_socket):
-        """Server sends an unknown packet ID."""
-        self.setup_socket(mock_socket, self.fake_reply_packet(pkt_id=0x41))
-        rc = utils.vpn_ping(self.address, self.port,
-                            session_id=self.session_id)
-        self.assertFalse(rc)
+        self.assertEqual(data, fake_contents)
+        self.assertTrue(fresh)
 
-    @mock.patch.object(socket, 'socket')
-    def test_vpn_ping_ok(self, mock_socket):
-        self.setup_socket(mock_socket, self.fake_reply_packet())
-        rc = utils.vpn_ping(self.address, self.port,
-                            session_id=self.session_id)
-        self.assertTrue(rc)
+    def test_delete_cached_file(self):
+        filename = '/this/is/a/fake/deletion/of/cached/file'
+        utils._FILE_CACHE = {
+            filename: {"data": 1123, "mtime": 1}
+        }
+        self.assertIn(filename, utils._FILE_CACHE)
+        utils.delete_cached_file(filename)
+        self.assertNotIn(filename, utils._FILE_CACHE)
 
-
-class MonkeyPatchTestCase(test.NoDBTestCase):
-    """Unit test for utils.monkey_patch()."""
-    def setUp(self):
-        super(MonkeyPatchTestCase, self).setUp()
-        self.example_package = 'nova.tests.unit.monkey_patch_example.'
-        self.flags(
-            monkey_patch=True,
-            monkey_patch_modules=[self.example_package + 'example_a' + ':'
-            + self.example_package + 'example_decorator'])
-
-    def test_monkey_patch(self):
-        utils.monkey_patch()
-        nova.tests.unit.monkey_patch_example.CALLED_FUNCTION = []
-        from nova.tests.unit.monkey_patch_example import example_a
-        from nova.tests.unit.monkey_patch_example import example_b
-
-        self.assertEqual('Example function', example_a.example_function_a())
-        exampleA = example_a.ExampleClassA()
-        exampleA.example_method()
-        ret_a = exampleA.example_method_add(3, 5)
-        self.assertEqual(ret_a, 8)
-
-        self.assertEqual('Example function', example_b.example_function_b())
-        exampleB = example_b.ExampleClassB()
-        exampleB.example_method()
-        ret_b = exampleB.example_method_add(3, 5)
-
-        self.assertEqual(ret_b, 8)
-        package_a = self.example_package + 'example_a.'
-        self.assertIn(package_a + 'example_function_a',
-                      nova.tests.unit.monkey_patch_example.CALLED_FUNCTION)
-
-        self.assertIn(package_a + 'ExampleClassA.example_method',
-                        nova.tests.unit.monkey_patch_example.CALLED_FUNCTION)
-        self.assertIn(package_a + 'ExampleClassA.example_method_add',
-                        nova.tests.unit.monkey_patch_example.CALLED_FUNCTION)
-        package_b = self.example_package + 'example_b.'
-        self.assertNotIn(package_b + 'example_function_b',
-                         nova.tests.unit.monkey_patch_example.CALLED_FUNCTION)
-        self.assertNotIn(package_b + 'ExampleClassB.example_method',
-                         nova.tests.unit.monkey_patch_example.CALLED_FUNCTION)
-        self.assertNotIn(package_b + 'ExampleClassB.example_method_add',
-                         nova.tests.unit.monkey_patch_example.CALLED_FUNCTION)
-
-
-class MonkeyPatchDefaultTestCase(test.NoDBTestCase):
-    """Unit test for default monkey_patch_modules value."""
-
-    def setUp(self):
-        super(MonkeyPatchDefaultTestCase, self).setUp()
-        self.flags(
-            monkey_patch=True)
-
-    def test_monkey_patch_default_mod(self):
-        # monkey_patch_modules is defined to be
-        #    <module_to_patch>:<decorator_to_patch_with>
-        #  Here we check that both parts of the default values are
-        # valid
-        for module in CONF.monkey_patch_modules:
-            m = module.split(':', 1)
-            # Check we can import the module to be patched
-            importlib.import_module(m[0])
-            # check the decorator is valid
-            decorator_name = m[1].rsplit('.', 1)
-            decorator_module = importlib.import_module(decorator_name[0])
-            getattr(decorator_module, decorator_name[1])
+    def test_delete_cached_file_not_exist(self):
+        # We expect that if cached file does not exist no Exception raised.
+        filename = '/this/is/a/fake/deletion/attempt/of/not/cached/file'
+        self.assertNotIn(filename, utils._FILE_CACHE)
+        utils.delete_cached_file(filename)
+        self.assertNotIn(filename, utils._FILE_CACHE)
 
 
 class AuditPeriodTest(test.NoDBTestCase):
@@ -358,17 +294,13 @@ class AuditPeriodTest(test.NoDBTestCase):
     def setUp(self):
         super(AuditPeriodTest, self).setUp()
         # a fairly random time to test with
-        self.test_time = datetime.datetime(second=23,
-                                           minute=12,
-                                           hour=8,
-                                           day=5,
-                                           month=3,
-                                           year=2012)
-        timeutils.set_time_override(override_time=self.test_time)
-
-    def tearDown(self):
-        timeutils.clear_time_override()
-        super(AuditPeriodTest, self).tearDown()
+        self.useFixture(utils_fixture.TimeFixture(
+            datetime.datetime(second=23,
+                              minute=12,
+                              hour=8,
+                              day=5,
+                              month=3,
+                              year=2012)))
 
     def test_hour(self):
         begin, end = utils.last_completed_audit_period(unit='hour')
@@ -517,65 +449,6 @@ class AuditPeriodTest(test.NoDBTestCase):
                                            year=2011))
 
 
-class MkfsTestCase(test.NoDBTestCase):
-
-    def test_mkfs(self):
-        self.mox.StubOutWithMock(utils, 'execute')
-        utils.execute('mkfs', '-t', 'ext4', '-F', '/my/block/dev',
-                      run_as_root=False)
-        utils.execute('mkfs', '-t', 'msdos', '/my/msdos/block/dev',
-                      run_as_root=False)
-        utils.execute('mkswap', '/my/swap/block/dev',
-                      run_as_root=False)
-        self.mox.ReplayAll()
-
-        utils.mkfs('ext4', '/my/block/dev')
-        utils.mkfs('msdos', '/my/msdos/block/dev')
-        utils.mkfs('swap', '/my/swap/block/dev')
-
-    def test_mkfs_with_label(self):
-        self.mox.StubOutWithMock(utils, 'execute')
-        utils.execute('mkfs', '-t', 'ext4', '-F',
-                      '-L', 'ext4-vol', '/my/block/dev', run_as_root=False)
-        utils.execute('mkfs', '-t', 'msdos',
-                      '-n', 'msdos-vol', '/my/msdos/block/dev',
-                      run_as_root=False)
-        utils.execute('mkswap', '-L', 'swap-vol', '/my/swap/block/dev',
-                      run_as_root=False)
-        self.mox.ReplayAll()
-
-        utils.mkfs('ext4', '/my/block/dev', 'ext4-vol')
-        utils.mkfs('msdos', '/my/msdos/block/dev', 'msdos-vol')
-        utils.mkfs('swap', '/my/swap/block/dev', 'swap-vol')
-
-
-class LastBytesTestCase(test.NoDBTestCase):
-    """Test the last_bytes() utility method."""
-
-    def setUp(self):
-        super(LastBytesTestCase, self).setUp()
-        self.f = StringIO.StringIO('1234567890')
-
-    def test_truncated(self):
-        self.f.seek(0, os.SEEK_SET)
-        out, remaining = utils.last_bytes(self.f, 5)
-        self.assertEqual(out, '67890')
-        self.assertTrue(remaining > 0)
-
-    def test_read_all(self):
-        self.f.seek(0, os.SEEK_SET)
-        out, remaining = utils.last_bytes(self.f, 1000)
-        self.assertEqual(out, '1234567890')
-        self.assertFalse(remaining > 0)
-
-    def test_seek_too_far_real_file(self):
-        # StringIO doesn't raise IOError if you see past the start of the file.
-        flo = tempfile.TemporaryFile()
-        content = '1234567890'
-        flo.write(content)
-        self.assertEqual((content, 0), utils.last_bytes(flo, 1000))
-
-
 class MetadataToDictTestCase(test.NoDBTestCase):
     def test_metadata_to_dict(self):
         self.assertEqual(utils.metadata_to_dict(
@@ -583,70 +456,39 @@ class MetadataToDictTestCase(test.NoDBTestCase):
                  {'key': 'foo2', 'value': 'baz'}]),
                          {'foo1': 'bar', 'foo2': 'baz'})
 
+    def test_metadata_to_dict_with_include_deleted(self):
+        metadata = [{'key': 'foo1', 'value': 'bar', 'deleted': 1442875429,
+                     'other': 'stuff'},
+                    {'key': 'foo2', 'value': 'baz', 'deleted': 0,
+                     'other': 'stuff2'}]
+        self.assertEqual({'foo1': 'bar', 'foo2': 'baz'},
+                         utils.metadata_to_dict(metadata,
+                                                include_deleted=True))
+        self.assertEqual({'foo2': 'baz'},
+                         utils.metadata_to_dict(metadata,
+                                                include_deleted=False))
+        # verify correct default behavior
+        self.assertEqual(utils.metadata_to_dict(metadata),
+                         utils.metadata_to_dict(metadata,
+                                                include_deleted=False))
+
     def test_metadata_to_dict_empty(self):
-        self.assertEqual(utils.metadata_to_dict([]), {})
+        self.assertEqual({}, utils.metadata_to_dict([]))
+        self.assertEqual({}, utils.metadata_to_dict([], include_deleted=True))
+        self.assertEqual({}, utils.metadata_to_dict([], include_deleted=False))
 
     def test_dict_to_metadata(self):
+        def sort_key(adict):
+            return sorted(adict.items())
+
+        metadata = utils.dict_to_metadata(dict(foo1='bar1', foo2='bar2'))
         expected = [{'key': 'foo1', 'value': 'bar1'},
                     {'key': 'foo2', 'value': 'bar2'}]
-        self.assertEqual(sorted(utils.dict_to_metadata(dict(foo1='bar1',
-                                                     foo2='bar2'))),
-                         sorted(expected))
+        self.assertEqual(sorted(metadata, key=sort_key),
+                         sorted(expected, key=sort_key))
 
     def test_dict_to_metadata_empty(self):
         self.assertEqual(utils.dict_to_metadata({}), [])
-
-
-class WrappedCodeTestCase(test.NoDBTestCase):
-    """Test the get_wrapped_function utility method."""
-
-    def _wrapper(self, function):
-        @functools.wraps(function)
-        def decorated_function(self, *args, **kwargs):
-            function(self, *args, **kwargs)
-        return decorated_function
-
-    def test_single_wrapped(self):
-        @self._wrapper
-        def wrapped(self, instance, red=None, blue=None):
-            pass
-
-        func = utils.get_wrapped_function(wrapped)
-        func_code = func.func_code
-        self.assertEqual(4, len(func_code.co_varnames))
-        self.assertIn('self', func_code.co_varnames)
-        self.assertIn('instance', func_code.co_varnames)
-        self.assertIn('red', func_code.co_varnames)
-        self.assertIn('blue', func_code.co_varnames)
-
-    def test_double_wrapped(self):
-        @self._wrapper
-        @self._wrapper
-        def wrapped(self, instance, red=None, blue=None):
-            pass
-
-        func = utils.get_wrapped_function(wrapped)
-        func_code = func.func_code
-        self.assertEqual(4, len(func_code.co_varnames))
-        self.assertIn('self', func_code.co_varnames)
-        self.assertIn('instance', func_code.co_varnames)
-        self.assertIn('red', func_code.co_varnames)
-        self.assertIn('blue', func_code.co_varnames)
-
-    def test_triple_wrapped(self):
-        @self._wrapper
-        @self._wrapper
-        @self._wrapper
-        def wrapped(self, instance, red=None, blue=None):
-            pass
-
-        func = utils.get_wrapped_function(wrapped)
-        func_code = func.func_code
-        self.assertEqual(4, len(func_code.co_varnames))
-        self.assertIn('self', func_code.co_varnames)
-        self.assertIn('instance', func_code.co_varnames)
-        self.assertIn('red', func_code.co_varnames)
-        self.assertIn('blue', func_code.co_varnames)
 
 
 class ExpectedArgsTestCase(test.NoDBTestCase):
@@ -658,6 +500,9 @@ class ExpectedArgsTestCase(test.NoDBTestCase):
         @dec
         def func(foo, bar, baz="lol"):
             pass
+
+        # Call to ensure nothing errors
+        func(None, None)
 
     def test_raises(self):
         @utils.expects_func_args('foo', 'baz')
@@ -677,6 +522,9 @@ class ExpectedArgsTestCase(test.NoDBTestCase):
         @dec
         def func(bar, *args, **kwargs):
             pass
+
+        # Call to ensure nothing errors
+        func(None)
 
     def test_more_layers(self):
         @utils.expects_func_args('foo', 'baz')
@@ -724,25 +572,7 @@ class StringLengthTestCase(test.NoDBTestCase):
 
 
 class ValidateIntegerTestCase(test.NoDBTestCase):
-    def test_valid_inputs(self):
-        self.assertEqual(
-            utils.validate_integer(42, "answer"), 42)
-        self.assertEqual(
-            utils.validate_integer("42", "answer"), 42)
-        self.assertEqual(
-            utils.validate_integer(
-                "7", "lucky", min_value=7, max_value=8), 7)
-        self.assertEqual(
-            utils.validate_integer(
-                7, "lucky", min_value=6, max_value=7), 7)
-        self.assertEqual(
-            utils.validate_integer(
-                300, "Spartaaa!!!", min_value=300), 300)
-        self.assertEqual(
-            utils.validate_integer(
-                "300", "Spartaaa!!!", max_value=300), 300)
-
-    def test_invalid_inputs(self):
+    def test_exception_converted(self):
         self.assertRaises(exception.InvalidInput,
                           utils.validate_integer,
                           "im-not-an-int", "not-an-int")
@@ -759,21 +589,8 @@ class ValidateIntegerTestCase(test.NoDBTestCase):
                           max_value=54)
         self.assertRaises(exception.InvalidInput,
                           utils.validate_integer,
-                          unichr(129), "UnicodeError",
+                          chr(129), "UnicodeError",
                           max_value=1000)
-
-
-class ValidateNeutronConfiguration(test.NoDBTestCase):
-    def test_nova_network(self):
-        self.assertFalse(utils.is_neutron())
-
-    def test_neutron(self):
-        self.flags(network_api_class='nova.network.neutronv2.api.API')
-        self.assertTrue(utils.is_neutron())
-
-    def test_quantum(self):
-        self.flags(network_api_class='nova.network.quantumv2.api.API')
-        self.assertTrue(utils.is_neutron())
 
 
 class AutoDiskConfigUtilTestCase(test.NoDBTestCase):
@@ -827,9 +644,27 @@ class GetSystemMetadataFromImageTestCase(test.NoDBTestCase):
         sys_meta = utils.get_system_metadata_from_image(image)
 
         # Verify that we inherit all the image properties
-        for key, expected in six.iteritems(image["properties"]):
+        for key, expected in image["properties"].items():
             sys_key = "%s%s" % (utils.SM_IMAGE_PROP_PREFIX, key)
             self.assertEqual(sys_meta[sys_key], expected)
+
+    def test_skip_image_properties(self):
+        image = self.get_image()
+        image["properties"] = {
+            "foo1": "bar", "foo2": "baz",
+            "mappings": "wizz", "img_block_device_mapping": "eek",
+        }
+
+        sys_meta = utils.get_system_metadata_from_image(image)
+
+        # Verify that we inherit all the image properties
+        for key, expected in image["properties"].items():
+            sys_key = "%s%s" % (utils.SM_IMAGE_PROP_PREFIX, key)
+
+            if key in utils.SM_SKIP_KEYS:
+                self.assertNotIn(sys_key, sys_meta)
+            else:
+                self.assertEqual(sys_meta[sys_key], expected)
 
     def test_vhd_min_disk_image(self):
         image = self.get_image()
@@ -873,6 +708,8 @@ class GetImageFromSystemMetadataTestCase(test.NoDBTestCase):
         sys_meta = self.get_system_metadata()
         sys_meta["%soo1" % utils.SM_IMAGE_PROP_PREFIX] = "bar"
         sys_meta["%soo2" % utils.SM_IMAGE_PROP_PREFIX] = "baz"
+        sys_meta["%simg_block_device_mapping" %
+                 utils.SM_IMAGE_PROP_PREFIX] = "eek"
 
         image = utils.get_image_from_system_metadata(sys_meta)
 
@@ -884,9 +721,11 @@ class GetImageFromSystemMetadataTestCase(test.NoDBTestCase):
         # Verify that we inherit the rest of metadata as properties
         self.assertIn("properties", image)
 
-        for key, value in six.iteritems(image["properties"]):
+        for key in image["properties"]:
             sys_key = "%s%s" % (utils.SM_IMAGE_PROP_PREFIX, key)
             self.assertEqual(image["properties"][key], sys_meta[sys_key])
+
+        self.assertNotIn("img_block_device_mapping", image["properties"])
 
     def test_dont_inherit_empty_values(self):
         sys_meta = self.get_system_metadata()
@@ -902,133 +741,12 @@ class GetImageFromSystemMetadataTestCase(test.NoDBTestCase):
             self.assertNotIn(key, image)
 
 
-class GetImageMetadataFromVolumeTestCase(test.NoDBTestCase):
-    def test_inherit_image_properties(self):
-        properties = {"fake_prop": "fake_value"}
-        volume = {"volume_image_metadata": properties}
-        image_meta = utils.get_image_metadata_from_volume(volume)
-        self.assertEqual(properties, image_meta["properties"])
-
-    def test_image_size(self):
-        volume = {"size": 10}
-        image_meta = utils.get_image_metadata_from_volume(volume)
-        self.assertEqual(10 * units.Gi, image_meta["size"])
-
-    def test_image_status(self):
-        volume = {}
-        image_meta = utils.get_image_metadata_from_volume(volume)
-        self.assertEqual("active", image_meta["status"])
-
-    def test_values_conversion(self):
-        properties = {"min_ram": "5", "min_disk": "7"}
-        volume = {"volume_image_metadata": properties}
-        image_meta = utils.get_image_metadata_from_volume(volume)
-        self.assertEqual(5, image_meta["min_ram"])
-        self.assertEqual(7, image_meta["min_disk"])
-
-
-class VersionTestCase(test.NoDBTestCase):
-    def test_convert_version_to_int(self):
-        self.assertEqual(utils.convert_version_to_int('6.2.0'), 6002000)
-        self.assertEqual(utils.convert_version_to_int((6, 4, 3)), 6004003)
-        self.assertEqual(utils.convert_version_to_int((5, )), 5)
-        self.assertRaises(exception.NovaException,
-                          utils.convert_version_to_int, '5a.6b')
-
-    def test_convert_version_to_string(self):
-        self.assertEqual(utils.convert_version_to_str(6007000), '6.7.0')
-        self.assertEqual(utils.convert_version_to_str(4), '4')
-
-    def test_convert_version_to_tuple(self):
-        self.assertEqual(utils.convert_version_to_tuple('6.7.0'), (6, 7, 0))
-
-
-class ConstantTimeCompareTestCase(test.NoDBTestCase):
-    def test_constant_time_compare(self):
-        self.assertTrue(utils.constant_time_compare("abcd1234", "abcd1234"))
-        self.assertFalse(utils.constant_time_compare("abcd1234", "a"))
-        self.assertFalse(utils.constant_time_compare("abcd1234", "ABCD234"))
-
-
-class ResourceFilterTestCase(test.NoDBTestCase):
-    def _assert_filtering(self, res_list, filts, expected_tags):
-        actual_tags = utils.filter_and_format_resource_metadata('instance',
-                res_list, filts, 'metadata')
-        self.assertJsonEqual(expected_tags, actual_tags)
-
-    def test_filter_and_format_resource_metadata(self):
-        # Create some tags
-        # One overlapping pair, and one different key value pair
-        # i1 : foo=bar, bax=wibble
-        # i2 : foo=bar, baz=quux
-
-        # resources
-        i1 = {
-                'uuid': '1',
-                'metadata': {'foo': 'bar', 'bax': 'wibble'},
-            }
-        i2 = {
-                'uuid': '2',
-                'metadata': {'foo': 'bar', 'baz': 'quux'},
-            }
-
-        # Resources list
-        rl = [i1, i2]
-
-        # tags
-        i11 = {'instance_id': '1', 'key': 'foo', 'value': 'bar'}
-        i12 = {'instance_id': '1', 'key': 'bax', 'value': 'wibble'}
-        i21 = {'instance_id': '2', 'key': 'foo', 'value': 'bar'}
-        i22 = {'instance_id': '2', 'key': 'baz', 'value': 'quux'}
-
-        # No filter
-        self._assert_filtering(rl, [], [i11, i12, i21, i22])
-        self._assert_filtering(rl, {}, [i11, i12, i21, i22])
-
-        # Key search
-
-        # Both should have tags with key 'foo' and value 'bar'
-        self._assert_filtering(rl, {'key': 'foo', 'value': 'bar'}, [i11, i21])
-
-        # Both should have tags with key 'foo'
-        self._assert_filtering(rl, {'key': 'foo'}, [i11, i21])
-
-        # Only i2 should have tags with key 'baz' and value 'quux'
-        self._assert_filtering(rl, {'key': 'baz', 'value': 'quux'}, [i22])
-
-        # Only i2 should have tags with value 'quux'
-        self._assert_filtering(rl, {'value': 'quux'}, [i22])
-
-        # Empty list should be returned when no tags match
-        self._assert_filtering(rl, {'key': 'split', 'value': 'banana'}, [])
-
-        # Multiple values
-
-        # Only i2 should have tags with key 'baz' and values in the set
-        # ['quux', 'wibble']
-        self._assert_filtering(rl, {'key': 'baz', 'value': ['quux', 'wibble']},
-                [i22])
-
-        # But when specified as two different filters, no tags should be
-        # returned. This is because, the filter will mean "return tags which
-        # have (key=baz AND value=quux) AND (key=baz AND value=wibble)
-        self._assert_filtering(rl, [{'key': 'baz', 'value': 'quux'},
-            {'key': 'baz', 'value': 'wibble'}], [])
-
-        # Test for regex
-        self._assert_filtering(rl, {'value': '\\Aqu..*\\Z(?s)'}, [i22])
-
-        # Make sure bug #1365887 is fixed
-        i1['metadata']['key3'] = 'a'
-        self._assert_filtering(rl, {'value': 'banana'}, [])
-
-
 class SafeTruncateTestCase(test.NoDBTestCase):
     def test_exception_to_dict_with_long_message_3_bytes(self):
         # Generate Chinese byte string whose length is 300. This Chinese UTF-8
         # character occupies 3 bytes. After truncating, the byte string length
         # should be 255.
-        msg = encodeutils.safe_decode('\xe8\xb5\xb5' * 100)
+        msg = u'\u8d75' * 100
         truncated_msg = utils.safe_truncate(msg, 255)
         byte_message = encodeutils.safe_encode(truncated_msg)
         self.assertEqual(255, len(byte_message))
@@ -1043,66 +761,1045 @@ class SafeTruncateTestCase(test.NoDBTestCase):
         self.assertEqual(254, len(byte_message))
 
 
-class SpawnNTestCase(test.NoDBTestCase):
+class TestObjectCallHelpers(test.NoDBTestCase):
+    def test_with_primitives(self):
+        tester = mock.Mock()
+        tester.foo(1, 'two', three='four')
+        self.assertTrue(
+            test_utils.obj_called_with(tester.foo, 1, 'two', three='four'))
+        self.assertFalse(
+            test_utils.obj_called_with(tester.foo, 42, 'two', three='four'))
+
+    def test_with_object(self):
+        obj_base.NovaObjectRegistry.register(test_objects.MyObj)
+        obj = test_objects.MyObj(foo=1, bar='baz')
+        tester = mock.Mock()
+        tester.foo(1, obj)
+        self.assertTrue(
+            test_utils.obj_called_with(
+                tester.foo, 1,
+                test_objects.MyObj(foo=1, bar='baz')))
+        self.assertFalse(
+            test_utils.obj_called_with(
+                tester.foo, 1,
+                test_objects.MyObj(foo=2, bar='baz')))
+
+    def test_with_object_multiple(self):
+        obj_base.NovaObjectRegistry.register(test_objects.MyObj)
+        obj1 = test_objects.MyObj(foo=1, bar='baz')
+        obj2 = test_objects.MyObj(foo=3, bar='baz')
+        tester = mock.Mock()
+        tester.foo(1, obj1)
+        tester.foo(1, obj1)
+        tester.foo(3, obj2)
+
+        # Called at all
+        self.assertTrue(
+            test_utils.obj_called_with(
+                tester.foo, 1,
+                test_objects.MyObj(foo=1, bar='baz')))
+
+        # Called once (not true)
+        self.assertFalse(
+            test_utils.obj_called_once_with(
+                tester.foo, 1,
+                test_objects.MyObj(foo=1, bar='baz')))
+
+        # Not called with obj.foo=2
+        self.assertFalse(
+            test_utils.obj_called_with(
+                tester.foo, 1,
+                test_objects.MyObj(foo=2, bar='baz')))
+
+        # Called with obj.foo.3
+        self.assertTrue(
+            test_utils.obj_called_with(
+                tester.foo, 3,
+                test_objects.MyObj(foo=3, bar='baz')))
+
+        # Called once with obj.foo.3
+        self.assertTrue(
+            test_utils.obj_called_once_with(
+                tester.foo, 3,
+                test_objects.MyObj(foo=3, bar='baz')))
+
+
+class GetKSAAdapterTestCase(test.NoDBTestCase):
+    """Tests for nova.utils.get_ksa_adapter()."""
+
     def setUp(self):
-        super(SpawnNTestCase, self).setUp()
-        self.useFixture(context_fixture.ClearRequestContext())
-        self.spawn_name = 'spawn_n'
+        super(GetKSAAdapterTestCase, self).setUp()
+        self.sess = mock.create_autospec(ks_session.Session, instance=True)
+        self.auth = mock.create_autospec(ks_identity.BaseIdentityPlugin,
+                                         instance=True)
 
-    def test_spawn_n_no_context(self):
-        self.assertIsNone(common_context.get_current())
+        load_adap_p = mock.patch(
+            'keystoneauth1.loading.load_adapter_from_conf_options')
+        self.addCleanup(load_adap_p.stop)
+        self.load_adap = load_adap_p.start()
 
-        def _fake_spawn(func, *args, **kwargs):
-            # call the method to ensure no error is raised
-            func(*args, **kwargs)
-            self.assertEqual('test', args[0])
+        ksa_fixture = self.useFixture(nova_fixtures.KSAFixture())
+        self.mock_ksa_load_auth = ksa_fixture.mock_load_auth
+        self.mock_ksa_load_sess = ksa_fixture.mock_load_sess
+        self.mock_ksa_session = ksa_fixture.mock_session
 
-        def fake(arg):
-            pass
+        self.mock_ksa_load_auth.return_value = self.auth
+        self.mock_ksa_load_sess.return_value = self.sess
 
-        with mock.patch.object(eventlet, self.spawn_name, _fake_spawn):
-            getattr(utils, self.spawn_name)(fake, 'test')
-        self.assertIsNone(common_context.get_current())
+    def test_bogus_service_type(self):
+        self.assertRaises(exception.ConfGroupForServiceTypeNotFound,
+                          utils.get_ksa_adapter, 'bogus')
+        self.mock_ksa_load_auth.assert_not_called()
+        self.mock_ksa_load_sess.assert_not_called()
+        self.load_adap.assert_not_called()
 
-    def test_spawn_n_context(self):
-        self.assertIsNone(common_context.get_current())
-        ctxt = context.RequestContext('user', 'project')
+    def test_all_params(self):
+        ret = utils.get_ksa_adapter(
+            'image', ksa_auth='auth', ksa_session='sess',
+            min_version='min', max_version='max')
+        # Returned the result of load_adapter_from_conf_options
+        self.assertEqual(self.load_adap.return_value, ret)
+        # Because we supplied ksa_auth, load_auth* not called
+        self.mock_ksa_load_auth.assert_not_called()
+        # Ditto ksa_session/load_session*
+        self.mock_ksa_load_sess.assert_not_called()
+        # load_adapter* called with what we passed in (and the right group)
+        self.load_adap.assert_called_once_with(
+            utils.CONF, 'glance', session='sess', auth='auth',
+            min_version='min', max_version='max', raise_exc=False)
 
-        def _fake_spawn(func, *args, **kwargs):
-            # call the method to ensure no error is raised
-            func(*args, **kwargs)
-            self.assertEqual(ctxt, args[0])
-            self.assertEqual('test', kwargs['kwarg1'])
+    def test_auth_from_session(self):
+        self.sess.auth = 'auth'
+        ret = utils.get_ksa_adapter('baremetal', ksa_session=self.sess)
+        # Returned the result of load_adapter_from_conf_options
+        self.assertEqual(self.load_adap.return_value, ret)
+        # Because ksa_auth found in ksa_session, load_auth* not called
+        self.mock_ksa_load_auth.assert_not_called()
+        # Because we supplied ksa_session, load_session* not called
+        self.mock_ksa_load_sess.assert_not_called()
+        # load_adapter* called with the auth from the session
+        self.load_adap.assert_called_once_with(
+            utils.CONF, 'ironic', session=self.sess, auth='auth',
+            min_version=None, max_version=None, raise_exc=False)
 
-        def fake(context, kwarg1=None):
-            pass
-
-        with mock.patch.object(eventlet, self.spawn_name, _fake_spawn):
-            getattr(utils, self.spawn_name)(fake, ctxt, kwarg1='test')
-        self.assertEqual(ctxt, common_context.get_current())
-
-    def test_spawn_n_context_different_from_passed(self):
-        self.assertIsNone(common_context.get_current())
-        ctxt = context.RequestContext('user', 'project')
-        ctxt_passed = context.RequestContext('user', 'project',
-                overwrite=False)
-        self.assertEqual(ctxt, common_context.get_current())
-
-        def _fake_spawn(func, *args, **kwargs):
-            # call the method to ensure no error is raised
-            func(*args, **kwargs)
-            self.assertEqual(ctxt_passed, args[0])
-            self.assertEqual('test', kwargs['kwarg1'])
-
-        def fake(context, kwarg1=None):
-            pass
-
-        with mock.patch.object(eventlet, self.spawn_name, _fake_spawn):
-            getattr(utils, self.spawn_name)(fake, ctxt_passed, kwarg1='test')
-        self.assertEqual(ctxt, common_context.get_current())
+    def test_load_auth_and_session(self):
+        ret = utils.get_ksa_adapter('volumev3')
+        # Returned the result of load_adapter_from_conf_options
+        self.assertEqual(self.load_adap.return_value, ret)
+        # Had to load the auth
+        self.mock_ksa_load_auth.assert_called_once_with(utils.CONF, 'cinder')
+        # Had to load the session, passed in the loaded auth
+        self.mock_ksa_load_sess.assert_called_once_with(utils.CONF, 'cinder',
+                                                        auth=self.auth)
+        # load_adapter* called with the loaded auth & session
+        self.load_adap.assert_called_once_with(
+            utils.CONF, 'cinder', session=self.sess, auth=self.auth,
+            min_version=None, max_version=None, raise_exc=False)
 
 
-class SpawnTestCase(SpawnNTestCase):
+class TestResourceClassNormalize(test.NoDBTestCase):
+
+    def test_normalize_name(self):
+        values = [
+            ("foo", "CUSTOM_FOO"),
+            ("VCPU", "CUSTOM_VCPU"),
+            ("CUSTOM_BOB", "CUSTOM_CUSTOM_BOB"),
+            ("CUSTM_BOB", "CUSTOM_CUSTM_BOB"),
+        ]
+        for test_value, expected in values:
+            result = utils.normalize_rc_name(test_value)
+            self.assertEqual(expected, result)
+
+    def test_normalize_name_bug_1762789(self):
+        """The .upper() builtin treats sharp S (\xdf) differently in py2 vs.
+        py3.  Make sure normalize_name handles it properly.
+        """
+        name = u'Fu\xdfball'
+        self.assertEqual(u'CUSTOM_FU_BALL', utils.normalize_rc_name(name))
+
+
+class TestGetConfGroup(test.NoDBTestCase):
+    """Tests for nova.utils._get_conf_group"""
+    @mock.patch('nova.utils.CONF')
+    @mock.patch('nova.utils._SERVICE_TYPES.get_project_name')
+    def test__get_conf_group(self, mock_get_project_name, mock_conf):
+        test_conf_grp = 'test_confgrp'
+        test_service_type = 'test_service_type'
+        mock_get_project_name.return_value = test_conf_grp
+
+        # happy path
+        mock_conf.test_confgrp = None
+        actual_conf_grp = utils._get_conf_group(test_service_type)
+        self.assertEqual(test_conf_grp, actual_conf_grp)
+        mock_get_project_name.assert_called_once_with(test_service_type)
+
+        # service type as the conf group
+        del mock_conf.test_confgrp
+        mock_conf.test_service_type = None
+        actual_conf_grp = utils._get_conf_group(test_service_type)
+        self.assertEqual(test_service_type, actual_conf_grp)
+
+    @mock.patch('nova.utils._SERVICE_TYPES.get_project_name')
+    def test__get_conf_group_fail(self, mock_get_project_name):
+        test_service_type = 'test_service_type'
+
+        # not confgrp
+        mock_get_project_name.return_value = None
+        self.assertRaises(exception.ConfGroupForServiceTypeNotFound,
+                          utils._get_conf_group, None)
+
+        # not hasattr
+        mock_get_project_name.return_value = 'test_fail'
+        self.assertRaises(exception.ConfGroupForServiceTypeNotFound,
+                          utils._get_conf_group, test_service_type)
+
+
+class TestGetAuthAndSession(test.NoDBTestCase):
+    """Tests for nova.utils._get_auth_and_session"""
+
     def setUp(self):
-        super(SpawnTestCase, self).setUp()
-        self.spawn_name = 'spawn'
+        super(TestGetAuthAndSession, self).setUp()
+
+        self.test_auth = 'test_auth'
+        self.test_session = 'test_session'
+        self.test_session_auth = 'test_session_auth'
+        self.test_confgrp = 'test_confgrp'
+        self.mock_session = mock.Mock()
+        self.mock_session.auth = self.test_session_auth
+
+    @mock.patch('nova.utils.ks_loading.load_auth_from_conf_options')
+    @mock.patch('nova.utils.ks_loading.load_session_from_conf_options')
+    def test_auth_and_session(self, mock_load_session, mock_load_auth):
+        # yes auth, yes session
+        actual = utils._get_auth_and_session(self.test_confgrp,
+                                             ksa_auth=self.test_auth,
+                                             ksa_session=self.test_session)
+        self.assertEqual(actual, (self.test_auth, self.test_session))
+        mock_load_session.assert_not_called()
+        mock_load_auth.assert_not_called()
+
+    @mock.patch('nova.utils.ks_loading.load_auth_from_conf_options')
+    @mock.patch('nova.utils.ks_loading.load_session_from_conf_options')
+    @mock.patch('nova.utils.CONF')
+    def test_no_session(self, mock_CONF, mock_load_session, mock_load_auth):
+        # yes auth, no session
+        mock_load_session.return_value = self.test_session
+
+        actual = utils._get_auth_and_session(self.test_confgrp,
+                                             ksa_auth=self.test_auth,
+                                             ksa_session=None)
+
+        self.assertEqual(actual, (self.test_auth, self.test_session))
+        mock_load_session.assert_called_once_with(mock_CONF, self.test_confgrp,
+                                                  auth=self.test_auth)
+        mock_load_auth.assert_not_called()
+
+    @mock.patch('nova.utils.ks_loading.load_auth_from_conf_options')
+    @mock.patch('nova.utils.ks_loading.load_session_from_conf_options')
+    def test_no_auth(self, mock_load_session, mock_load_auth):
+        # no auth, yes session, yes session.auth
+        actual = utils._get_auth_and_session(self.test_confgrp, ksa_auth=None,
+                                             ksa_session=self.mock_session)
+        self.assertEqual(actual, (self.test_session_auth, self.mock_session))
+        mock_load_session.assert_not_called()
+        mock_load_auth.assert_not_called()
+
+    @mock.patch('nova.utils.ks_loading.load_auth_from_conf_options')
+    @mock.patch('nova.utils.ks_loading.load_session_from_conf_options')
+    @mock.patch('nova.utils.CONF')
+    def test_no_auth_no_sauth(self, mock_CONF, mock_load_session,
+                              mock_load_auth):
+        # no auth, yes session, no session.auth
+        mock_load_auth.return_value = self.test_auth
+        self.mock_session.auth = None
+        actual = utils._get_auth_and_session(self.test_confgrp, ksa_auth=None,
+                                             ksa_session=self.mock_session)
+        self.assertEqual(actual, (self.test_auth, self.mock_session))
+        mock_load_session.assert_not_called()
+        mock_load_auth.assert_called_once_with(mock_CONF, self.test_confgrp)
+
+    @mock.patch('nova.utils.ks_loading.load_auth_from_conf_options')
+    @mock.patch('nova.utils.ks_loading.load_session_from_conf_options')
+    @mock.patch('nova.utils.CONF')
+    def test__get_auth_and_session(self, mock_CONF, mock_load_session,
+                                   mock_load_auth):
+        # no auth, no session
+        mock_load_auth.return_value = self.test_auth
+        mock_load_session.return_value = self.test_session
+        actual = utils._get_auth_and_session(self.test_confgrp, ksa_auth=None,
+                                             ksa_session=None)
+        self.assertEqual(actual, (self.test_auth, self.test_session))
+        mock_load_session.assert_called_once_with(mock_CONF, self.test_confgrp,
+                                                  auth=self.test_auth)
+        mock_load_auth.assert_called_once_with(mock_CONF, self.test_confgrp)
+
+
+class TestGetSDKAdapter(test.NoDBTestCase):
+    """Tests for nova.utils.get_sdk_adapter"""
+
+    def setUp(self):
+        super(TestGetSDKAdapter, self).setUp()
+
+        self.mock_get_confgrp = self.useFixture(fixtures.MockPatch(
+            'nova.utils._get_conf_group')).mock
+
+        self.mock_get_auth_sess = self.useFixture(fixtures.MockPatch(
+            'nova.utils._get_auth_and_session')).mock
+        self.mock_get_auth_sess.return_value = (None, mock.sentinel.session)
+
+        self.service_type = 'test_service'
+        self.mock_connection = self.useFixture(fixtures.MockPatch(
+            'nova.utils.connection.Connection')).mock
+        self.mock_connection.return_value = mock.Mock(
+            test_service=mock.sentinel.proxy)
+
+        # We need to stub the CONF global in nova.utils to assert that the
+        # Connection constructor picks it up.
+        self.mock_conf = self.useFixture(fixtures.MockPatch(
+            'nova.utils.CONF')).mock
+
+    def _test_get_sdk_adapter(self, admin, strict=False):
+        actual = utils.get_sdk_adapter(
+            self.service_type, admin, check_service=strict
+        )
+
+        self.mock_get_confgrp.assert_called_once_with(self.service_type)
+        self.mock_get_auth_sess.assert_called_once_with(
+            self.mock_get_confgrp.return_value)
+        self.mock_connection.assert_called_once_with(
+            session=mock.sentinel.session, oslo_conf=self.mock_conf,
+            service_types={'test_service'}, strict_proxies=strict)
+
+        return actual
+
+    def test_get_sdk_adapter(self):
+        self.assertEqual(
+            self._test_get_sdk_adapter(admin=True), mock.sentinel.proxy
+        )
+
+    def test_get_sdk_adapter_ksa_auth(self):
+        # When ksa_auth is provided it takes precedence over the admin
+        # flag: the session is built from the given auth plugin rather
+        # than from nova's service credentials or the user's token.
+        auth = mock.sentinel.auth
+        actual = utils.get_sdk_adapter(
+            self.service_type, admin=True, ksa_auth=auth)
+
+        self.mock_get_confgrp.assert_called_once_with(self.service_type)
+        self.mock_get_auth_sess.assert_called_once_with(
+            self.mock_get_confgrp.return_value, ksa_auth=auth)
+        self.mock_connection.assert_called_once_with(
+            session=mock.sentinel.session, oslo_conf=self.mock_conf,
+            service_types={'test_service'}, strict_proxies=False)
+        self.assertEqual(mock.sentinel.proxy, actual)
+
+    def test_get_sdk_adapter_strict(self):
+        self.assertEqual(
+            self._test_get_sdk_adapter(True, strict=True), mock.sentinel.proxy)
+
+    def test_get_sdk_adapter_strict_fail(self):
+        self.mock_connection.side_effect = sdk_exc.ServiceDiscoveryException()
+        self.assertRaises(
+            exception.ServiceUnavailable,
+            self._test_get_sdk_adapter, True, strict=True)
+
+    def test_get_sdk_adapter_conf_group_fail(self):
+        self.mock_get_confgrp.side_effect = (
+            exception.ConfGroupForServiceTypeNotFound(stype=self.service_type))
+
+        self.assertRaises(exception.ConfGroupForServiceTypeNotFound,
+                          utils.get_sdk_adapter, self.service_type, True)
+        self.mock_get_confgrp.assert_called_once_with(self.service_type)
+        self.mock_connection.assert_not_called()
+        self.mock_get_auth_sess.assert_not_called()
+
+
+class TestOldComputeCheck(test.NoDBTestCase):
+
+    @mock.patch('nova.objects.service.get_minimum_version_all_cells')
+    def test_no_compute(self, mock_get_min_service):
+        mock_get_min_service.return_value = 0
+
+        utils.raise_if_old_compute()
+
+        mock_get_min_service.assert_called_once_with(
+            mock.ANY, ['nova-compute'])
+
+    @mock.patch('nova.objects.service.get_minimum_version_all_cells')
+    def test_old_but_supported_compute(self, mock_get_min_service):
+        oldest = service_obj.SERVICE_VERSION_ALIASES[
+            service_obj.OLDEST_SUPPORTED_SERVICE_VERSION]
+        mock_get_min_service.return_value = oldest
+
+        utils.raise_if_old_compute()
+
+        mock_get_min_service.assert_called_once_with(
+            mock.ANY, ['nova-compute'])
+
+    @mock.patch('nova.objects.service.get_minimum_version_all_cells')
+    def test_new_compute(self, mock_get_min_service):
+        mock_get_min_service.return_value = service_obj.SERVICE_VERSION
+
+        utils.raise_if_old_compute()
+
+        mock_get_min_service.assert_called_once_with(
+            mock.ANY, ['nova-compute'])
+
+    @mock.patch('nova.objects.service.Service.get_minimum_version')
+    def test_too_old_compute_cell(self, mock_get_min_service):
+        self.flags(group='api_database', connection=None)
+        oldest = service_obj.SERVICE_VERSION_ALIASES[
+            service_obj.OLDEST_SUPPORTED_SERVICE_VERSION]
+        mock_get_min_service.return_value = oldest - 1
+
+        ex = self.assertRaises(
+            exception.TooOldComputeService, utils.raise_if_old_compute)
+
+        self.assertIn('cell', str(ex))
+        mock_get_min_service.assert_called_once_with(mock.ANY, 'nova-compute')
+
+    @mock.patch('nova.objects.service.get_minimum_version_all_cells')
+    def test_too_old_compute_top_level(self, mock_get_min_service):
+        self.flags(group='api_database', connection='fake db connection')
+        oldest = service_obj.SERVICE_VERSION_ALIASES[
+            service_obj.OLDEST_SUPPORTED_SERVICE_VERSION]
+        mock_get_min_service.return_value = oldest - 1
+
+        ex = self.assertRaises(
+            exception.TooOldComputeService, utils.raise_if_old_compute)
+
+        self.assertIn('system', str(ex))
+        mock_get_min_service.assert_called_once_with(
+            mock.ANY, ['nova-compute'])
+
+    @mock.patch.object(utils.LOG, 'warning')
+    @mock.patch('nova.objects.service.Service.get_minimum_version')
+    @mock.patch('nova.objects.service.get_minimum_version_all_cells')
+    def test_api_db_is_configured_but_the_service_cannot_access_db(
+            self, mock_get_all, mock_get, mock_warn):
+        # This is the case when the nova-compute service is wrongly configured
+        # with db credentials but nova-compute is never allowed to access the
+        # db directly.
+        mock_get_all.side_effect = exception.DBNotAllowed(
+            binary='nova-compute')
+
+        oldest = service_obj.SERVICE_VERSION_ALIASES[
+            service_obj.OLDEST_SUPPORTED_SERVICE_VERSION]
+        mock_get.return_value = oldest - 1
+
+        ex = self.assertRaises(
+            exception.TooOldComputeService, utils.raise_if_old_compute)
+
+        self.assertIn('cell', str(ex))
+        mock_get_all.assert_called_once_with(mock.ANY, ['nova-compute'])
+        mock_get.assert_called_once_with(mock.ANY, 'nova-compute')
+        mock_warn.assert_called_once_with(
+            'This service is configured for access to the API database but is '
+            'not allowed to directly access the database. You should run this '
+            'service without the [api_database]/connection config option. The '
+            'service version check will only query the local cell.')
+
+
+class RunOnceTests(test.NoDBTestCase):
+
+    fake_logger = mock.MagicMock()
+
+    @utils.run_once("already ran once", fake_logger)
+    def dummy_test_func(self, fail=False):
+        if fail:
+            raise ValueError()
+        return True
+
+    def setUp(self):
+        super(RunOnceTests, self).setUp()
+        self.dummy_test_func.reset()
+        RunOnceTests.fake_logger.reset_mock()
+
+    def test_wrapped_functions_called_once(self):
+        self.assertFalse(self.dummy_test_func.called)
+        result = self.dummy_test_func()
+        self.assertTrue(result)
+        self.assertTrue(self.dummy_test_func.called)
+
+        # assert that on second invocation no result
+        # is returned and that the logger is invoked.
+        result = self.dummy_test_func()
+        RunOnceTests.fake_logger.assert_called_once()
+        self.assertIsNone(result)
+
+    def test_wrapped_functions_called_once_raises(self):
+        self.assertFalse(self.dummy_test_func.called)
+        self.assertRaises(ValueError, self.dummy_test_func, fail=True)
+        self.assertTrue(self.dummy_test_func.called)
+
+        # assert that on second invocation no result
+        # is returned and that the logger is invoked.
+        result = self.dummy_test_func()
+        RunOnceTests.fake_logger.assert_called_once()
+        self.assertIsNone(result)
+
+    def test_wrapped_functions_can_be_reset(self):
+        # assert we start with a clean state
+        self.assertFalse(self.dummy_test_func.called)
+        result = self.dummy_test_func()
+        self.assertTrue(result)
+
+        self.dummy_test_func.reset()
+        # assert we restored a clean state
+        self.assertFalse(self.dummy_test_func.called)
+        result = self.dummy_test_func()
+        self.assertTrue(result)
+
+        # assert that we never called the logger
+        RunOnceTests.fake_logger.assert_not_called()
+
+    def test_reset_calls_cleanup(self):
+        mock_clean = mock.Mock()
+
+        @utils.run_once("already ran once", self.fake_logger,
+                        cleanup=mock_clean)
+        def f():
+            pass
+
+        f()
+        self.assertTrue(f.called)
+
+        f.reset()
+        self.assertFalse(f.called)
+        mock_clean.assert_called_once_with()
+
+    def test_clean_is_not_called_at_reset_if_wrapped_not_called(self):
+        mock_clean = mock.Mock()
+
+        @utils.run_once("already ran once", self.fake_logger,
+                        cleanup=mock_clean)
+        def f():
+            pass
+
+        self.assertFalse(f.called)
+
+        f.reset()
+        self.assertFalse(f.called)
+        self.assertFalse(mock_clean.called)
+
+    def test_reset_works_even_if_cleanup_raises(self):
+        mock_clean = mock.Mock(side_effect=ValueError())
+
+        @utils.run_once("already ran once", self.fake_logger,
+                        cleanup=mock_clean)
+        def f():
+            pass
+
+        f()
+        self.assertTrue(f.called)
+
+        self.assertRaises(ValueError, f.reset)
+        self.assertFalse(f.called)
+        mock_clean.assert_called_once_with()
+
+
+class LatchErrorOnRaiseTests(test.NoDBTestCase):
+
+    error = test.TestingException()
+    unrecoverable = ValueError('some error')
+
+    @utils.latch_error_on_raise(retryable=(test.TestingException,))
+    def dummy_test_func(self, error=None):
+        if error:
+            raise error
+        return True
+
+    def setUp(self):
+        super().setUp()
+        self.dummy_test_func.reset()
+
+    @mock.patch.object(utils.LOG, 'exception')
+    def test_wrapped_success(self, fake_logger):
+        self.assertTrue(self.dummy_test_func())
+        fake_logger.assert_not_called()
+        self.assertIsNone(self.dummy_test_func.error)
+
+    @mock.patch.object(utils.LOG, 'exception')
+    def test_wrapped_raises_recoverable(self, fake_logger):
+        expected = LatchErrorOnRaiseTests.error
+        e = self.assertRaises(
+            type(expected), self.dummy_test_func, error=expected)
+        self.assertIs(expected, e)
+        # we just leave recoverable exception flow though the decorator
+        # without catching them so the logger should not be called by the
+        # decorator
+        fake_logger.assert_not_called()
+        self.assertIsNone(self.dummy_test_func.error)
+        self.assertTrue(self.dummy_test_func())
+
+    @mock.patch.object(utils.LOG, 'exception')
+    def test_wrapped_raises_unrecoverable(self, fake_logger):
+        expected = LatchErrorOnRaiseTests.unrecoverable
+        e = self.assertRaises(
+            type(expected), self.dummy_test_func, error=expected)
+        self.assertIs(expected, e)
+        fake_logger.assert_called_once_with(expected)
+        self.assertIsNotNone(self.dummy_test_func.error)
+        self.assertIs(self.dummy_test_func.error, expected)
+
+    @mock.patch.object(utils.LOG, 'exception', new=mock.MagicMock())
+    def test_wrapped_raises_forever(self):
+        expected = LatchErrorOnRaiseTests.unrecoverable
+        first = self.assertRaises(
+            type(expected), self.dummy_test_func, error=expected)
+        self.assertIs(expected, first)
+        second = self.assertRaises(
+            type(expected), self.dummy_test_func, error=expected)
+        self.assertIs(first, second)
+
+
+class OsloServiceBackendSelectionTestCase(test.NoDBTestCase):
+    def setUp(self):
+        # NOTE(gibi): We need this as the base test class would trigger
+        # monkey patching and would prevent us to test the threading code path
+        self.useFixture(
+            fixtures.MonkeyPatch(
+                "nova.monkey_patch._monkey_patch", lambda: True))
+        super().setUp()
+        origi = monkey_patch.MONKEY_PATCHED
+        monkey_patch.MONKEY_PATCHED = False
+
+        def reset():
+            monkey_patch.MONKEY_PATCHED = origi
+        self.addCleanup(reset)
+
+    @mock.patch('oslo_log.versionutils.report_deprecated_feature')
+    @mock.patch('oslo_service.backend.init_backend')
+    def test_eventlet_selected(self, init_backend, mock_deprecated):
+        env = os.environ.get('OS_NOVA_DISABLE_EVENTLET_PATCHING', '').lower()
+        if env in ('1', 'true', 'yes'):
+            self.skipTest(
+                "In native threading mode this is covered by "
+                "test_threading_selected*")
+
+        monkey_patch.patch()
+
+        init_backend.assert_called_once_with(oslo_backend.BackendType.EVENTLET)
+
+    @mock.patch('oslo_service.backend.init_backend')
+    def test_threading_eventlet_poisoned(self, init_backend):
+        env = os.environ.get(
+            'OS_NOVA_DISABLE_EVENTLET_PATCHING', 'false').lower()
+        if env == 'false':
+            self.skipTest("This test can only be run in native threaded mode")
+
+        monkey_patch.patch(backend="threading")
+
+        init_backend.assert_called_once_with(
+            oslo_backend.BackendType.THREADING)
+
+        def eventlet_import():
+            import eventlet  # noqa
+
+        ex = self.assertRaises(ImportError, eventlet_import)
+        self.assertEqual(
+            "The service started in native threading mode so it should not "
+            "import eventlet", str(ex))
+
+    @mock.patch('oslo_service.backend.init_backend')
+    def test_threading_selected_by_default(self, init_backend):
+        env = os.environ.get(
+            'OS_NOVA_DISABLE_EVENTLET_PATCHING', 'false').lower()
+        if env == 'false':
+            self.skipTest("This test can only be run in native threaded mode")
+
+        with mock.patch.dict(os.environ):
+            del os.environ["OS_NOVA_DISABLE_EVENTLET_PATCHING"]
+            monkey_patch.patch(backend='threading')
+
+        init_backend.assert_called_once_with(
+            oslo_backend.BackendType.THREADING)
+
+    def test_invalid_default_backend(self):
+        ex = self.assertRaises(ValueError, monkey_patch.patch, backend='foo')
+        self.assertEqual(
+            "the backend can only be 'eventlet' or 'threading'", str(ex))
+
+    @mock.patch('oslo_log.versionutils.report_deprecated_feature')
+    @mock.patch('nova.monkey_patch.poison_eventlet')
+    @mock.patch('oslo_service.backend.init_backend')
+    @mock.patch('nova.monkey_patch._get_concurrency_from_config',
+                return_value='threading')
+    def test_config_threading_overrides_eventlet_default(
+            self, mock_cfg, init_backend, mock_poison, mock_deprecated):
+        # When the env var is absent and concurrency_backend=threading in
+        # config, native threading must be selected even if the binary default
+        # is eventlet.
+        with mock.patch.dict(os.environ,
+                             {'OS_NOVA_DISABLE_EVENTLET_PATCHING': ''}):
+            monkey_patch.patch(backend='eventlet')
+
+        init_backend.assert_called_once_with(
+            oslo_backend.BackendType.THREADING)
+        mock_poison.assert_called_once()
+        mock_deprecated.assert_not_called()
+
+    @mock.patch('oslo_log.versionutils.report_deprecated_feature')
+    @mock.patch('oslo_service.backend.init_backend')
+    @mock.patch('nova.monkey_patch._get_concurrency_from_config',
+                return_value='eventlet')
+    def test_config_eventlet_overrides_threading_default(
+            self, mock_cfg, init_backend, mock_deprecated):
+        # When the env var is absent and concurrency_backend=eventlet in
+        # config, eventlet must be selected even if the binary default is
+        # threading.
+        with mock.patch.dict(os.environ,
+                             {'OS_NOVA_DISABLE_EVENTLET_PATCHING': ''}):
+            monkey_patch.patch(backend='threading')
+
+        init_backend.assert_called_once_with(oslo_backend.BackendType.EVENTLET)
+        mock_deprecated.assert_called_once()
+
+    @mock.patch('oslo_log.versionutils.report_deprecated_feature')
+    @mock.patch('nova.monkey_patch.poison_eventlet')
+    @mock.patch('oslo_service.backend.init_backend')
+    @mock.patch('nova.monkey_patch._get_concurrency_from_config',
+                return_value='auto')
+    def test_config_auto_defers_to_binary_default_threading(
+            self, mock_cfg, init_backend, mock_poison, mock_deprecated):
+        # When concurrency_backend=auto the per-binary default (backend=)
+        # must be honoured. Test the threading branch.
+        with mock.patch.dict(os.environ,
+                             {'OS_NOVA_DISABLE_EVENTLET_PATCHING': ''}):
+            monkey_patch.patch(backend='threading')
+
+        init_backend.assert_called_once_with(
+            oslo_backend.BackendType.THREADING)
+        mock_poison.assert_called_once()
+        mock_deprecated.assert_not_called()
+
+    @mock.patch('oslo_log.versionutils.report_deprecated_feature')
+    @mock.patch('oslo_service.backend.init_backend')
+    @mock.patch('nova.monkey_patch._get_concurrency_from_config',
+                return_value='auto')
+    def test_config_auto_defers_to_binary_default_eventlet(
+            self, mock_cfg, init_backend, mock_deprecated):
+        # When concurrency_backend=auto the per-binary default (backend=)
+        # must be honoured. Test the eventlet branch.
+        with mock.patch.dict(os.environ,
+                             {'OS_NOVA_DISABLE_EVENTLET_PATCHING': ''}):
+            monkey_patch.patch(backend='eventlet')
+
+        init_backend.assert_called_once_with(oslo_backend.BackendType.EVENTLET)
+
+
+class TestFairLockGuard(test.NoDBTestCase):
+
+    def test_aquire_single_lock(self):
+        lock_name = 'test_aquire_single_lock'
+        test_lock = utils.NOVA_FAIR_LOCKS.get(lock_name)
+        self.assertFalse(test_lock.has_pending_writers)
+        lock_guard = utils.FairLockGuard([lock_name])
+        with lock_guard:
+            self.assertTrue(lock_guard.is_locked())
+            self.assertIs(lock_guard.locks[0], test_lock)
+            self.assertTrue(test_lock.is_writer())
+
+    def test_aquire_multiple_locks(self):
+        lock_names = ['test_aquire_multiple_locks1',
+            'test_aquire_multiple_locks2']
+        test_locks = [utils.NOVA_FAIR_LOCKS.get(
+            lock_name) for lock_name in lock_names]
+        for lock in test_locks:
+            self.assertFalse(lock.has_pending_writers)
+        lock_guard = utils.FairLockGuard(lock_names)
+        with lock_guard:
+            self.assertTrue(lock_guard.is_locked())
+            for i, lock in enumerate(lock_guard.locks):
+                self.assertIs(lock, test_locks[i])
+                self.assertTrue(lock_guard.locks[i].is_writer())
+
+    def test_aquire_multiple_locks_sorted(self):
+        lock_names = ['test_aquire_multiple_locks_sorted2',
+            'test_aquire_multiple_locks_sorted1']
+        self.assertNotEqual(lock_names, sorted(lock_names))
+        test_locks = [utils.NOVA_FAIR_LOCKS.get(
+            lock_name) for lock_name in lock_names]
+        for lock in test_locks:
+            self.assertFalse(lock.has_pending_writers)
+        lock_guard = utils.FairLockGuard(lock_names)
+        with lock_guard:
+            self.assertTrue(lock_guard.is_locked())
+            for i, name in enumerate(sorted(lock_names)):
+                self.assertIs(lock_guard.locks[i],
+                              utils.NOVA_FAIR_LOCKS.get(name))
+                self.assertTrue(lock_guard.locks[i].is_writer())
+
+    def test_locks_are_released_on_exception(self):
+        lock_names = ['test_locks_are_released_on_exception1',
+            'test_locks_are_released_on_exception2']
+        test_locks = [utils.NOVA_FAIR_LOCKS.get(
+            lock_name) for lock_name in lock_names]
+        lock_guard = utils.FairLockGuard(lock_names)
+        try:
+            with lock_guard:
+                self.assertTrue(lock_guard.is_locked())
+                raise ValueError()
+        except ValueError:
+            pass
+        self.assertFalse(lock_guard.is_locked())
+        for lock in test_locks:
+            self.assertFalse(lock.is_writer())
+
+    def test_partial_acquire(self):
+        lock_names = ['test_partial_acquire1', 'test_partial_acquire2']
+        test_locks = [utils.NOVA_FAIR_LOCKS.get(
+            lock_name) for lock_name in lock_names]
+
+        lock_acquired = threading.Event()
+        lock_released = threading.Event()
+        worker_continue = threading.Event()
+
+        def worker():
+            test_locks[0].acquire_write_lock()
+            lock_acquired.set()
+            worker_continue.wait()
+            time.sleep(1)
+            test_locks[0].release_write_lock()
+            lock_released.set()
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        lock_guard = utils.FairLockGuard(lock_names)
+        self.assertFalse(lock_guard.is_locked())
+        lock_acquired.wait()
+        # we should not have acquired the lock yet
+        # as the worker thread is still holding it
+        self.assertFalse(test_locks[0].is_writer())
+        # Note the first lock is still held by the worker thread
+        # so this will block until the worker releases it
+        worker_continue.set()
+        with lock_guard:
+            self.assertTrue(lock_guard.is_locked())
+            self.assertTrue(test_locks[0].is_writer())
+            self.assertTrue(test_locks[1].is_writer())
+            self.assertTrue(lock_released.is_set())
+        thread.join()
+        self.assertFalse(lock_guard.is_locked())
+        self.assertFalse(test_locks[0].is_writer())
+        self.assertFalse(test_locks[1].is_writer())
+
+    def test_thread_ordering_subset_locks(self):
+        """Test that a thread requesting a subset of locks waits for the
+        first thread that requested all locks to complete first.
+        """
+        lock_names_t1 = ['test_thread_ordering_A',
+                         'test_thread_ordering_B',
+                         'test_thread_ordering_C']
+        lock_names_t2 = ['test_thread_ordering_A',
+                         'test_thread_ordering_B']
+        test_locks = [utils.NOVA_FAIR_LOCKS.get(
+            lock_name) for lock_name in lock_names_t1]
+
+        t1_acquired = threading.Event()
+        t1_acquired_time = None
+        t1_released = threading.Event()
+        t2_started = threading.Event()
+        t2_acquired = threading.Event()
+        t2_acquired_time = None
+        t1_continue = threading.Event()
+
+        def thread1():
+            lock_guard = utils.FairLockGuard(lock_names_t1)
+            with lock_guard:
+                nonlocal t1_acquired_time
+                t1_acquired_time = time.time()
+                t1_acquired.set()
+                # Wait for T2 to start trying to acquire locks
+                t2_started.wait()
+                # Give T2 time to block on the locks
+                time.sleep(0.1)
+                t1_continue.wait()
+                # Hold locks for a bit to ensure T2 is waiting
+                time.sleep(0.5)
+            t1_released.set()
+
+        def thread2():
+            t2_started.set()
+            lock_guard = utils.FairLockGuard(lock_names_t2)
+            # This should block until T1 releases all locks
+            with lock_guard:
+                nonlocal t2_acquired_time
+                t2_acquired_time = time.time()
+                t2_acquired.set()
+
+        t1 = threading.Thread(target=thread1)
+        t2 = threading.Thread(target=thread2)
+
+        t1.start()
+        # Wait for T1 to acquire all locks
+        self.assertTrue(t1_acquired.wait(timeout=2))
+        self.assertIsNotNone(t1_acquired_time)
+        t2.start()
+        # Wait for T2 to start trying to acquire locks
+        self.assertTrue(t2_started.wait(timeout=2))
+        # T2 should not have acquired locks yet
+        self.assertIsNone(t2_acquired_time)
+        t1_continue.set()
+        t1.join()
+        t2.join()
+
+        # T1 should have released all locks
+        self.assertTrue(t1_released.is_set())
+        # T2 should have acquired its subset of locks
+        self.assertTrue(t2_acquired.is_set())
+        self.assertIsNotNone(t2_acquired_time)
+        # T1 should have acquired its locks before T2
+        self.assertLess(t1_acquired_time, t2_acquired_time)
+
+        # and since all thread are now finished,
+        # all locks should be released
+        for lock in test_locks:
+            self.assertFalse(lock.is_writer())
+
+    def test_context_manager_shared_between_threads(self):
+        """Test that a context manager can be shared between threads
+        and that the locks are acquired in the correct order.
+        Do not do this in production code, while it works this is not
+        the intended usage pattern.
+        """
+        lock_names = ['test_context_manager_shared_between_threads1',
+            'test_context_manager_shared_between_threads2']
+        lock_guard = utils.FairLockGuard(lock_names)
+        sum = 0
+        started = threading.Event()
+
+        def worker(id, lock_guard):
+            started.wait()
+            nonlocal sum
+            with lock_guard:
+                sum += id
+        thread1 = threading.Thread(target=worker, args=(1, lock_guard))
+        thread2 = threading.Thread(target=worker, args=(2, lock_guard))
+        thread1.start()
+        thread2.start()
+        started.set()
+        thread1.join()
+        thread2.join()
+        self.assertEqual(3, sum)
+
+    def test_context_manager_can_be_acquired_multiple_times(self):
+        lock_names = ['test_context_manager_can_be_acquired_multiple_times1',
+            'test_context_manager_can_be_acquired_multiple_times2']
+        test_locks = [utils.NOVA_FAIR_LOCKS.get(
+            lock_name) for lock_name in lock_names]
+        lock_guard = utils.FairLockGuard(lock_names)
+        with lock_guard:
+            self.assertTrue(lock_guard.is_locked())
+            self.assertTrue(test_locks[0].is_writer())
+            self.assertTrue(test_locks[1].is_writer())
+
+        self.assertFalse(lock_guard.is_locked())
+        for lock in test_locks:
+            self.assertFalse(lock.is_writer())
+        with lock_guard:
+            self.assertTrue(lock_guard.is_locked())
+            self.assertTrue(test_locks[0].is_writer())
+            self.assertTrue(test_locks[1].is_writer())
+
+    def test_nested_context_managers(self):
+        lock_names = ['test_nested_context_managers1',
+            'test_nested_context_managers2']
+        test_locks = [utils.NOVA_FAIR_LOCKS.get(
+            lock_name) for lock_name in lock_names]
+        lock_guard = utils.FairLockGuard(lock_names)
+        lock_guard2 = utils.FairLockGuard(lock_names)
+
+        # on any one thread we can acquire the same lock
+        # multiple times provided we use separate context managers.
+        # In other words the locks are renterent.
+        # This is an implementation detail of the ReaderWriterLock
+        # provided by fasteners. if this test fails the api behavior
+        # of the FairLock has changed.
+        with lock_guard:
+            self.assertTrue(lock_guard.is_locked())
+            self.assertTrue(test_locks[0].is_writer())
+            self.assertTrue(test_locks[1].is_writer())
+            with lock_guard2:
+                self.assertTrue(lock_guard2.is_locked())
+                self.assertTrue(test_locks[0].is_writer())
+                self.assertTrue(test_locks[1].is_writer())
+            self.assertTrue(lock_guard.is_locked())
+            self.assertTrue(test_locks[0].is_writer())
+            self.assertTrue(test_locks[1].is_writer())
+
+        # Same instance nesting now works - locks are already held,
+        # so nested entry just increments depth counter.
+        with lock_guard:
+            self.assertTrue(lock_guard.is_locked())
+            self.assertTrue(test_locks[0].is_writer())
+            self.assertTrue(test_locks[1].is_writer())
+            with lock_guard:
+                # Still locked in nested context
+                self.assertTrue(lock_guard.is_locked())
+                self.assertTrue(test_locks[0].is_writer())
+                self.assertTrue(test_locks[1].is_writer())
+            # Still locked after inner exit
+            self.assertTrue(lock_guard.is_locked())
+            self.assertTrue(test_locks[0].is_writer())
+            self.assertTrue(test_locks[1].is_writer())
+        # Released after outer exit
+        self.assertFalse(lock_guard.is_locked())
+        self.assertFalse(test_locks[0].is_writer())
+        self.assertFalse(test_locks[1].is_writer())
+
+    @mock.patch.object(utils, 'NOVA_FAIR_LOCKS')
+    def test_deep_nesting(self, mock_fair_locks):
+        """Test that nesting works correctly at 3+ levels deep."""
+        test_lock = fasteners.ReaderWriterLock()
+        mock_fair_locks.get.return_value = test_lock
+        lock_guard = utils.FairLockGuard(['deep-test'])
+
+        with lock_guard:
+            self.assertTrue(lock_guard.is_locked())
+            with lock_guard:
+                self.assertTrue(lock_guard.is_locked())
+                with lock_guard:
+                    # Third level of nesting
+                    self.assertTrue(lock_guard.is_locked())
+                    self.assertTrue(test_lock.is_writer())
+                # Still locked after level 3 exit
+                self.assertTrue(lock_guard.is_locked())
+            # Still locked after level 2 exit
+            self.assertTrue(lock_guard.is_locked())
+        # Released after outermost exit
+        self.assertFalse(lock_guard.is_locked())
+        self.assertFalse(test_lock.is_writer())
+
+    @mock.patch.object(utils, 'NOVA_FAIR_LOCKS')
+    def test_nested_exception_outer_still_holds_locks(self, mock_fair_locks):
+        """Test that outer context retains locks when inner context raises."""
+        test_lock = fasteners.ReaderWriterLock()
+        mock_fair_locks.get.return_value = test_lock
+        lock_guard = utils.FairLockGuard(['exception-test'])
+
+        with lock_guard:
+            self.assertTrue(lock_guard.is_locked())
+            try:
+                with lock_guard:
+                    self.assertTrue(lock_guard.is_locked())
+                    raise ValueError("Test exception")
+            except ValueError:
+                pass
+            # Outer context still holds locks after inner raised
+            self.assertTrue(lock_guard.is_locked())
+            self.assertTrue(test_lock.is_writer())
+        # Released after outer exit
+        self.assertFalse(lock_guard.is_locked())
+        self.assertFalse(test_lock.is_writer())
+
+    @mock.patch.object(utils, 'NOVA_FAIR_LOCKS')
+    def test_empty_lock_list(self, mock_fair_locks):
+        """Test FairLockGuard with empty lock list."""
+        lock_guard = utils.FairLockGuard([])
+
+        with lock_guard:
+            # No locks to acquire, but should still work
+            self.assertFalse(lock_guard.is_locked())
+
+        mock_fair_locks.get.assert_not_called()

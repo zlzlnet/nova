@@ -16,9 +16,14 @@
 Tests For weights.
 """
 
-import mock
+import io
+import logging
+from unittest import mock
+
+from oslo_log import formatters
 
 from nova.scheduler import weights as scheduler_weights
+from nova.scheduler.weights import ram
 from nova import test
 from nova.tests.unit.scheduler import fakes
 from nova import weights
@@ -31,7 +36,7 @@ class TestWeigher(test.NoDBTestCase):
                 pass
 
         self.assertEqual(1.0,
-                         FakeWeigher().weight_multiplier())
+                         FakeWeigher().weight_multiplier(None))
 
     def test_no_weight_object(self):
         class FakeWeigher(weights.BaseWeigher):
@@ -56,6 +61,39 @@ class TestWeigher(test.NoDBTestCase):
             ret = weights.normalize(seq, minval=minval, maxval=maxval)
             self.assertEqual(tuple(ret), result)
 
+    def test_debug_log_with_json_formatter(self):
+        """Regression test for bug 2028518 via the real JSONFormatter.
+
+        When use_json=True is configured, oslo.log's JSONFormatter calls
+        json.dumps() on log record args. With tuple dict keys this raises
+        TypeError because json.dumps() requires string keys.
+        """
+        self.flags(use_json=True)
+
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(formatters.JSONFormatter())
+
+        log = weights.LOG.logger
+        original_level = log.level
+        log.addHandler(handler)
+        log.setLevel(logging.DEBUG)
+        self.addCleanup(log.removeHandler, handler)
+        self.addCleanup(log.setLevel, original_level)
+
+        host_values = [
+            ('host1', 'node1', {'free_ram_mb': 512}),
+            ('host2', 'node2', {'free_ram_mb': 1024}),
+        ]
+        hostinfo = [fakes.FakeHostState(host, node, values)
+                    for host, node, values in host_values]
+
+        weight_handler = scheduler_weights.HostWeightHandler()
+        weighers = [ram.RAMWeigher()]
+        self.assertRaises(
+            TypeError,
+            weight_handler.get_weighed_objects, weighers, hostinfo, {})
+
     @mock.patch('nova.weights.BaseWeigher.weigh_objects')
     def test_only_one_host(self, mock_weigh):
         host_values = [
@@ -65,7 +103,7 @@ class TestWeigher(test.NoDBTestCase):
                     for host, node, values in host_values]
 
         weight_handler = scheduler_weights.HostWeightHandler()
-        weighers = [scheduler_weights.ram.RAMWeigher()]
+        weighers = [ram.RAMWeigher()]
         weighed_host = weight_handler.get_weighed_objects(weighers,
                                                           hostinfo, {})
         self.assertEqual(1, len(weighed_host))

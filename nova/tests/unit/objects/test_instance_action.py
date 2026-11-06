@@ -12,13 +12,17 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import copy
 import traceback
+from unittest import mock
 
-import mock
+from oslo_utils import fixture as utils_fixture
+from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import timeutils
-import six
 
-from nova import db
+from nova.db.main import api as db
+from nova import exception
+from nova import objects
 from nova.objects import instance_action
 from nova import test
 from nova.tests.unit.objects import test_objects
@@ -32,7 +36,7 @@ fake_action = {
     'deleted': False,
     'id': 123,
     'action': 'fake-action',
-    'instance_uuid': 'fake-uuid',
+    'instance_uuid': uuids.instance,
     'request_id': 'fake-request',
     'user_id': 'fake-user',
     'project_id': 'fake-project',
@@ -52,6 +56,8 @@ fake_event = {
     'finish_time': None,
     'result': 'fake-result',
     'traceback': 'fake-tb',
+    'host': 'fake-host',
+    'details': None
 }
 
 
@@ -78,7 +84,7 @@ class _TestInstanceActionObject(object):
                          self.context.timestamp)
 
     def test_pack_action_finish(self):
-        timeutils.set_time_override(override_time=NOW)
+        self.useFixture(utils_fixture.TimeFixture(NOW))
         values = instance_action.InstanceAction.pack_action_finish(
             self.context, 'fake-uuid')
         self.assertEqual(values['request_id'], self.context.request_id)
@@ -111,7 +117,7 @@ class _TestInstanceActionObject(object):
 
     @mock.patch.object(db, 'action_finish')
     def test_action_finish(self, mock_finish):
-        timeutils.set_time_override(override_time=NOW)
+        self.useFixture(utils_fixture.TimeFixture(NOW))
         test_class = instance_action.InstanceAction
         expected_packed_values = test_class.pack_action_finish(
             self.context, 'fake-uuid')
@@ -124,7 +130,7 @@ class _TestInstanceActionObject(object):
 
     @mock.patch.object(db, 'action_finish')
     def test_action_finish_no_result(self, mock_finish):
-        timeutils.set_time_override(override_time=NOW)
+        self.useFixture(utils_fixture.TimeFixture(NOW))
         test_class = instance_action.InstanceAction
         expected_packed_values = test_class.pack_action_finish(
             self.context, 'fake-uuid')
@@ -138,24 +144,26 @@ class _TestInstanceActionObject(object):
     @mock.patch.object(db, 'action_finish')
     @mock.patch.object(db, 'action_start')
     def test_finish(self, mock_start, mock_finish):
-        timeutils.set_time_override(override_time=NOW)
+        self.useFixture(utils_fixture.TimeFixture(NOW))
         expected_packed_action_start = {
             'request_id': self.context.request_id,
             'user_id': self.context.user_id,
             'project_id': self.context.project_id,
-            'instance_uuid': 'fake-uuid',
+            'instance_uuid': uuids.instance,
             'action': 'fake-action',
             'start_time': self.context.timestamp,
+            'updated_at': self.context.timestamp,
         }
         expected_packed_action_finish = {
             'request_id': self.context.request_id,
-            'instance_uuid': 'fake-uuid',
+            'instance_uuid': uuids.instance,
             'finish_time': NOW,
+            'updated_at': NOW,
         }
         mock_start.return_value = fake_action
         mock_finish.return_value = fake_action
         action = instance_action.InstanceAction.action_start(
-            self.context, 'fake-uuid', 'fake-action')
+            self.context, uuids.instance, 'fake-action')
         action.finish()
         mock_start.assert_called_once_with(self.context,
                                            expected_packed_action_start)
@@ -172,7 +180,23 @@ class _TestInstanceActionObject(object):
             self.context, 'fake-uuid')
         for index, action in enumerate(obj_list):
             self.compare_obj(action, fake_actions[index])
-        mock_get.assert_called_once_with(self.context, 'fake-uuid')
+        mock_get.assert_called_once_with(self.context, 'fake-uuid', None,
+                                         None, None)
+
+    def test_create_id_in_updates_error(self):
+        action = instance_action.InstanceAction(self.context, id=1)
+        ex = self.assertRaises(exception.ObjectActionError, action.create)
+        self.assertIn('already created', str(ex))
+
+    @mock.patch('nova.db.main.api.action_start')
+    def test_create(self, mock_action_start):
+        mock_action_start.return_value = fake_action
+        action = instance_action.InstanceAction(self.context)
+        expected_updates = action.obj_get_changes()
+        action.create()
+        mock_action_start.assert_called_once_with(
+            self.context, expected_updates)
+        self.compare_obj(action, fake_action)
 
 
 class TestInstanceActionObject(test_objects._LocalTest,
@@ -197,7 +221,7 @@ class _TestInstanceActionEventObject(object):
 
     @mock.patch.object(db, 'action_event_start')
     def test_event_start(self, mock_start):
-        timeutils.set_time_override(override_time=NOW)
+        self.useFixture(utils_fixture.TimeFixture(NOW))
         test_class = instance_action.InstanceActionEvent
         expected_packed_values = test_class.pack_action_event_start(
             self.context, 'fake-uuid', 'fake-event')
@@ -210,7 +234,7 @@ class _TestInstanceActionEventObject(object):
 
     @mock.patch.object(db, 'action_event_start')
     def test_event_start_no_result(self, mock_start):
-        timeutils.set_time_override(override_time=NOW)
+        self.useFixture(utils_fixture.TimeFixture(NOW))
         test_class = instance_action.InstanceActionEvent
         expected_packed_values = test_class.pack_action_event_start(
             self.context, 'fake-uuid', 'fake-event')
@@ -223,11 +247,12 @@ class _TestInstanceActionEventObject(object):
 
     @mock.patch.object(db, 'action_event_finish')
     def test_event_finish(self, mock_finish):
-        timeutils.set_time_override(override_time=NOW)
+        self.useFixture(utils_fixture.TimeFixture(NOW))
         test_class = instance_action.InstanceActionEvent
         expected_packed_values = test_class.pack_action_event_finish(
             self.context, 'fake-uuid', 'fake-event')
-        expected_packed_values['finish_time'] = timeutils.utcnow()
+        expected_packed_values['finish_time'] = NOW
+        self.assertNotIn('details', expected_packed_values)
         mock_finish.return_value = fake_event
         event = instance_action.InstanceActionEvent.event_finish(
             self.context, 'fake-uuid', 'fake-event', want_result=True)
@@ -237,11 +262,11 @@ class _TestInstanceActionEventObject(object):
 
     @mock.patch.object(db, 'action_event_finish')
     def test_event_finish_no_result(self, mock_finish):
-        timeutils.set_time_override(override_time=NOW)
+        self.useFixture(utils_fixture.TimeFixture(NOW))
         test_class = instance_action.InstanceActionEvent
         expected_packed_values = test_class.pack_action_event_finish(
             self.context, 'fake-uuid', 'fake-event')
-        expected_packed_values['finish_time'] = timeutils.utcnow()
+        expected_packed_values['finish_time'] = NOW
         mock_finish.return_value = fake_event
         event = instance_action.InstanceActionEvent.event_finish(
             self.context, 'fake-uuid', 'fake-event', want_result=False)
@@ -252,55 +277,70 @@ class _TestInstanceActionEventObject(object):
     @mock.patch.object(traceback, 'format_tb')
     @mock.patch.object(db, 'action_event_finish')
     def test_event_finish_with_failure(self, mock_finish, mock_tb):
-        timeutils.set_time_override(override_time=NOW)
+        self.useFixture(utils_fixture.TimeFixture(NOW))
         test_class = instance_action.InstanceActionEvent
+        # The NovaException message will get formatted for the 'details' field.
+        exc_val = exception.NoValidHost(reason='some error')
         expected_packed_values = test_class.pack_action_event_finish(
-            self.context, 'fake-uuid', 'fake-event', 'val', 'fake-tb')
-        expected_packed_values['finish_time'] = timeutils.utcnow()
+            self.context, 'fake-uuid', 'fake-event', exc_val, 'fake-tb')
+        expected_packed_values['finish_time'] = NOW
+        self.assertEqual(exc_val.format_message(),
+                         expected_packed_values['details'])
 
-        mock_finish.return_value = fake_event
+        fake_event_with_details = copy.deepcopy(fake_event)
+        fake_event_with_details['details'] = expected_packed_values['details']
+        mock_finish.return_value = fake_event_with_details
         event = test_class.event_finish_with_failure(
-            self.context, 'fake-uuid', 'fake-event', 'val', 'fake-tb',
+            self.context, 'fake-uuid', 'fake-event', exc_val, 'fake-tb',
             want_result=True)
         mock_finish.assert_called_once_with(self.context,
                                             expected_packed_values)
-        self.compare_obj(event, fake_event)
+        self.compare_obj(event, fake_event_with_details)
+        mock_tb.assert_not_called()
 
     @mock.patch.object(traceback, 'format_tb')
     @mock.patch.object(db, 'action_event_finish')
     def test_event_finish_with_failure_legacy(self, mock_finish, mock_tb):
         # Tests that exc_tb is serialized when it's not a string type.
         mock_tb.return_value = 'fake-tb'
-        timeutils.set_time_override(override_time=NOW)
+        self.useFixture(utils_fixture.TimeFixture(NOW))
         test_class = instance_action.InstanceActionEvent
+        # A non-NovaException will use the exception class name for
+        # the 'details' field.
+        exc_val = test.TestingException('non-nova-error')
         expected_packed_values = test_class.pack_action_event_finish(
-            self.context, 'fake-uuid', 'fake-event', 'val', 'fake-tb')
-        expected_packed_values['finish_time'] = timeutils.utcnow()
+            self.context, 'fake-uuid', 'fake-event', exc_val, 'fake-tb')
+        expected_packed_values['finish_time'] = NOW
+        self.assertEqual('TestingException', expected_packed_values['details'])
 
-        mock_finish.return_value = fake_event
+        fake_event_with_details = copy.deepcopy(fake_event)
+        fake_event_with_details['details'] = expected_packed_values['details']
+        mock_finish.return_value = fake_event_with_details
         fake_tb = mock.sentinel.fake_tb
         event = test_class.event_finish_with_failure(
-            self.context, 'fake-uuid', 'fake-event', exc_val='val',
+            self.context, 'fake-uuid', 'fake-event', exc_val=exc_val,
             exc_tb=fake_tb, want_result=True)
+        # When calling event_finish_with_failure and using exc_val as a kwarg
+        # serialize_args will convert exc_val to non-nova exception class name
+        # form before it reaches event_finish_with_failure.
         mock_finish.assert_called_once_with(self.context,
                                             expected_packed_values)
-        self.compare_obj(event, fake_event)
+        self.compare_obj(event, fake_event_with_details)
         mock_tb.assert_called_once_with(fake_tb)
 
     @mock.patch.object(db, 'action_event_finish')
     def test_event_finish_with_failure_legacy_unicode(self, mock_finish):
         # Tests that traceback.format_tb is not called when exc_tb is unicode.
-        timeutils.set_time_override(override_time=NOW)
+        self.useFixture(utils_fixture.TimeFixture(NOW))
         test_class = instance_action.InstanceActionEvent
         expected_packed_values = test_class.pack_action_event_finish(
-            self.context, 'fake-uuid', 'fake-event', 'val',
-            six.text_type('fake-tb'))
-        expected_packed_values['finish_time'] = timeutils.utcnow()
+            self.context, 'fake-uuid', 'fake-event', 'val', 'fake-tb')
+        expected_packed_values['finish_time'] = NOW
 
         mock_finish.return_value = fake_event
         event = test_class.event_finish_with_failure(
             self.context, 'fake-uuid', 'fake-event', exc_val='val',
-            exc_tb=six.text_type('fake-tb'), want_result=True)
+            exc_tb='fake-tb', want_result=True)
         mock_finish.assert_called_once_with(self.context,
                                             expected_packed_values)
         self.compare_obj(event, fake_event)
@@ -311,11 +351,11 @@ class _TestInstanceActionEventObject(object):
         # Tests that traceback.format_tb is not called when exc_tb is a str
         # and want_result is False, so no event should come back.
         mock_tb.return_value = 'fake-tb'
-        timeutils.set_time_override(override_time=NOW)
+        self.useFixture(utils_fixture.TimeFixture(NOW))
         test_class = instance_action.InstanceActionEvent
         expected_packed_values = test_class.pack_action_event_finish(
             self.context, 'fake-uuid', 'fake-event', 'val', 'fake-tb')
-        expected_packed_values['finish_time'] = timeutils.utcnow()
+        expected_packed_values['finish_time'] = NOW
 
         mock_finish.return_value = fake_event
         event = test_class.event_finish_with_failure(
@@ -344,17 +384,48 @@ class _TestInstanceActionEventObject(object):
                                                   mock_pack):
         mock_format.return_value = 'traceback'
         mock_pack.side_effect = test.TestingException
+        exc = exception.NotFound()
         self.assertRaises(
             test.TestingException,
             instance_action.InstanceActionEvent.event_finish_with_failure,
             self.context, 'fake-uuid', 'fake-event',
-            exc_val=mock.sentinel.exc_val,
+            exc_val=exc,
             exc_tb=mock.sentinel.exc_tb)
         mock_pack.assert_called_once_with(self.context, 'fake-uuid',
                                           'fake-event',
-                                          exc_val=str(mock.sentinel.exc_val),
+                                          exc_val=exc.format_message(),
                                           exc_tb='traceback')
         mock_format.assert_called_once_with(mock.sentinel.exc_tb)
+
+    def test_create_id_in_updates_error(self):
+        event = instance_action.InstanceActionEvent(self.context, id=1)
+        ex = self.assertRaises(
+            exception.ObjectActionError, event.create,
+            fake_action['instance_uuid'], fake_action['request_id'])
+        self.assertIn('already created', str(ex))
+
+    @mock.patch('nova.db.main.api.action_event_start')
+    def test_create(self, mock_action_event_start):
+        mock_action_event_start.return_value = fake_event
+        event = instance_action.InstanceActionEvent(self.context)
+        expected_updates = event.obj_get_changes()
+        expected_updates['instance_uuid'] = fake_action['instance_uuid']
+        expected_updates['request_id'] = fake_action['request_id']
+        event.create(fake_action['instance_uuid'], fake_action['request_id'])
+        mock_action_event_start.assert_called_once_with(
+            self.context, expected_updates)
+        self.compare_obj(event, fake_event)
+
+    def test_obj_make_compatible(self):
+        action_event_obj = objects.InstanceActionEvent(
+            details=None,       # added in 1.4
+            host='fake-host'    # added in 1.2
+        )
+        data = lambda x: x['nova_object.data']
+        primitive = data(action_event_obj.obj_to_primitive(
+            target_version='1.3'))
+        self.assertIn('host', primitive)
+        self.assertNotIn('details', primitive)
 
 
 class TestInstanceActionEventObject(test_objects._LocalTest,

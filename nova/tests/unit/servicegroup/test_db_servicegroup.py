@@ -12,9 +12,13 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import datetime
-import mock
+from unittest import mock
 
+import oslo_messaging as messaging
+from oslo_utils import fixture as utils_fixture
+from oslo_utils import timeutils
+
+from nova import exception
 from nova import objects
 from nova import servicegroup
 from nova import test
@@ -29,50 +33,53 @@ class DBServiceGroupTestCase(test.NoDBTestCase):
                    servicegroup_driver='db')
         self.servicegroup_api = servicegroup.API()
 
-    @mock.patch('oslo_utils.timeutils.utcnow')
-    def test_is_up(self, now_mock):
-        service_ref = {
-            'host': 'fake-host',
-            'topic': 'compute',
-        }
-        fts_func = datetime.datetime.fromtimestamp
-        fake_now = 1000
+    def test_is_up(self):
+        now = timeutils.utcnow()
+        service = objects.Service(
+            host='fake-host',
+            topic='compute',
+            binary='nova-compute',
+            created_at=now,
+            updated_at=now,
+            last_seen_up=now,
+            forced_down=False,
+        )
+        time_fixture = self.useFixture(utils_fixture.TimeFixture(now))
 
         # Up (equal)
-        now_mock.return_value = fts_func(fake_now)
-        service_ref['last_seen_up'] = fts_func(fake_now - self.down_time)
-        service_ref['updated_at'] = fts_func(fake_now - self.down_time)
-        service_ref['created_at'] = fts_func(fake_now - self.down_time)
-
-        result = self.servicegroup_api.service_is_up(service_ref)
+        result = self.servicegroup_api.service_is_up(service)
         self.assertTrue(result)
 
         # Up
-        service_ref['last_seen_up'] = fts_func(fake_now - self.down_time + 1)
-        service_ref['updated_at'] = fts_func(fake_now - self.down_time + 1)
-        service_ref['created_at'] = fts_func(fake_now - self.down_time + 1)
-        result = self.servicegroup_api.service_is_up(service_ref)
+        time_fixture.advance_time_seconds(self.down_time)
+        result = self.servicegroup_api.service_is_up(service)
         self.assertTrue(result)
 
         # Down
-        service_ref['last_seen_up'] = fts_func(fake_now - self.down_time - 3)
-        service_ref['updated_at'] = fts_func(fake_now - self.down_time - 3)
-        service_ref['created_at'] = fts_func(fake_now - self.down_time - 3)
-        result = self.servicegroup_api.service_is_up(service_ref)
+        time_fixture.advance_time_seconds(1)
+        result = self.servicegroup_api.service_is_up(service)
         self.assertFalse(result)
 
         # "last_seen_up" says down, "updated_at" says up.
         # This can happen if we do a service disable/enable while it's down.
-        service_ref['updated_at'] = fts_func(fake_now - self.down_time + 1)
-        result = self.servicegroup_api.service_is_up(service_ref)
+        service.updated_at = timeutils.utcnow()
+        result = self.servicegroup_api.service_is_up(service)
         self.assertFalse(result)
+
+        # "last_seen_up" is none before compute node reports its status,
+        # just use 'created_at' as last_heartbeat.
+        service.last_seen_up = None
+        service.created_at = timeutils.utcnow()
+        result = self.servicegroup_api.service_is_up(service)
+        self.assertTrue(result)
 
     def test_join(self):
         service = mock.MagicMock(report_interval=1)
 
         self.servicegroup_api.join('fake-host', 'fake-topic', service)
         fn = self.servicegroup_api._driver._report_state
-        service.tg.add_timer.assert_called_once_with(1, fn, 5, service)
+        service.tg.add_timer_args.assert_called_once_with(
+            1, fn, args=[service], initial_delay=5)
 
     @mock.patch.object(objects.Service, 'save')
     def test_report_state(self, upd_mock):
@@ -84,3 +91,40 @@ class DBServiceGroupTestCase(test.NoDBTestCase):
         fn(service)
         upd_mock.assert_called_once_with()
         self.assertEqual(11, service_ref.report_count)
+        self.assertFalse(service.model_disconnected)
+
+    @mock.patch.object(objects.Service, 'save')
+    def _test_report_state_error(self, exc_cls, upd_mock):
+        upd_mock.side_effect = exc_cls("service save failed")
+        service_ref = objects.Service(host='fake-host', topic='compute',
+                                      report_count=10, binary='nova-compute')
+        service = mock.MagicMock(model_disconnected=False,
+                                 service_ref=service_ref)
+        fn = self.servicegroup_api._driver._report_state
+        fn(service)  # fail if exception not caught
+        self.assertTrue(service.model_disconnected)
+        return service_ref
+
+    def test_report_state_error_handling_timeout(self):
+        self._test_report_state_error(messaging.MessagingTimeout)
+
+    def test_report_state_unexpected_error(self):
+        self._test_report_state_error(RuntimeError)
+
+    def test_report_state_service_not_found(self):
+        service_ref = self._test_report_state_error(exception.ServiceNotFound)
+        self.assertIn('The services table record for the %s service on '
+                      'host %s is gone.' %
+                      (service_ref.binary, service_ref.host),
+                      self.stdlog.logger.output)
+
+    def test_get_updated_time(self):
+        retval = "2016-11-02T22:40:31.000000"
+        service_ref = {
+            'host': 'fake-host',
+            'topic': 'compute',
+            'updated_at': retval
+        }
+
+        result = self.servicegroup_api.get_updated_time(service_ref)
+        self.assertEqual(retval, result)

@@ -13,11 +13,6 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import ast
-import re
-
-import pep8
-
 """
 Guidelines for writing new hacking checks
 
@@ -32,11 +27,21 @@ Guidelines for writing new hacking checks
 
 """
 
+import ast
+import os
+import re
+
+from hacking import core
+
+
 UNDERSCORE_IMPORT_FILES = []
 
 session_check = re.compile(r"\w*def [a-zA-Z0-9].*[(].*session.*[)]")
 cfg_re = re.compile(r".*\scfg\.")
-vi_header_re = re.compile(r"^#\s+vim?:.+")
+# Excludes oslo.config OptGroup objects
+cfg_opt_re = re.compile(r".*[\s\[]cfg\.[a-zA-Z]*Opt\(")
+rule_default_re = re.compile(r".*RuleDefault\(")
+policy_enforce_re = re.compile(r".*_ENFORCER\.enforce\(")
 virt_file_re = re.compile(r"\./nova/(?:tests/)?virt/(\w+)/")
 virt_import_re = re.compile(
     r"^\s*(?:import|from) nova\.(?:tests\.)?virt\.(\w+)")
@@ -44,18 +49,14 @@ virt_config_re = re.compile(
     r"CONF\.import_opt\('.*?', 'nova\.virt\.(\w+)('|.)")
 asse_trueinst_re = re.compile(
                      r"(.)*assertTrue\(isinstance\((\w|\.|\'|\"|\[|\])+, "
-                     "(\w|\.|\'|\"|\[|\])+\)\)")
+                     r"(\w|\.|\'|\"|\[|\])+\)\)")
 asse_equal_type_re = re.compile(
                        r"(.)*assertEqual\(type\((\w|\.|\'|\"|\[|\])+\), "
-                       "(\w|\.|\'|\"|\[|\])+\)")
+                       r"(\w|\.|\'|\"|\[|\])+\)")
 asse_equal_in_end_with_true_or_false_re = re.compile(r"assertEqual\("
                     r"(\w|[][.'\"])+ in (\w|[][.'\", ])+, (True|False)\)")
 asse_equal_in_start_with_true_or_false_re = re.compile(r"assertEqual\("
                     r"(True|False), (\w|[][.'\"])+ in (\w|[][.'\", ])+\)")
-asse_equal_end_with_none_re = re.compile(
-                           r"assertEqual\(.*?,\s+None\)$")
-asse_equal_start_with_none_re = re.compile(
-                           r"assertEqual\(None,")
 # NOTE(snikitin): Next two regexes weren't united to one for more readability.
 #                 asse_true_false_with_in_or_not_in regex checks
 #                 assertTrue/False(A in B) cases where B argument has no spaces
@@ -74,17 +75,7 @@ asse_true_false_with_in_or_not_in_spaces = re.compile(r"assert(True|False)"
                     r"[\[|'|\"](, .*)?\)")
 asse_raises_regexp = re.compile(r"assertRaisesRegexp\(")
 conf_attribute_set_re = re.compile(r"CONF\.[a-z0-9_.]+\s*=\s*\w")
-log_translation = re.compile(
-    r"(.)*LOG\.(audit|error|critical)\(\s*('|\")")
-log_translation_info = re.compile(
-    r"(.)*LOG\.(info)\(\s*(_\(|'|\")")
-log_translation_exception = re.compile(
-    r"(.)*LOG\.(exception)\(\s*(_\(|'|\")")
-log_translation_LW = re.compile(
-    r"(.)*LOG\.(warning|warn)\(\s*(_\(|'|\")")
-translated_log = re.compile(
-    r"(.)*LOG\.(audit|error|info|critical|exception)"
-    "\(\s*_\(\s*('|\")")
+translated_log = re.compile(r"(.)*LOG\.\w+\(\s*_\(\s*('|\")")
 mutable_default_args = re.compile(r"^\s*def .+\((.+=\{\}|.+=\[\])")
 string_translation = re.compile(r"[^_]*_\(\s*('|\")")
 underscore_import_check = re.compile(r"(.)*import _(.)*")
@@ -92,25 +83,78 @@ import_translation_for_log_or_exception = re.compile(
     r"(.)*(from\snova.i18n\simport)\s_")
 # We need this for cases where they have created their own _ function.
 custom_underscore_check = re.compile(r"(.)*_\s*=\s*(.)*")
-api_version_re = re.compile(r"@.*api_version")
+api_version_re = re.compile(r"@.*\bapi_version\b")
 dict_constructor_with_list_copy_re = re.compile(r".*\bdict\((\[)?(\(|\[)")
 decorator_re = re.compile(r"@.*")
 http_not_implemented_re = re.compile(r"raise .*HTTPNotImplemented\(")
+spawn_re = re.compile(
+    r".*(eventlet|greenthread)\.(?P<spawn_part>spawn(_n)?)\(.*\)")
+contextlib_nested = re.compile(r"^with (contextlib\.)?nested\(")
+doubled_words_re = re.compile(
+    r"\b(then?|[iao]n|i[fst]|but|f?or|at|and|[dt]o)\s+\1\b")
+log_remove_context = re.compile(
+    r"(.)*LOG\.(.*)\(.*(context=[_a-zA-Z0-9].*)+.*\)")
+return_not_followed_by_space = re.compile(r"^\s*return(?:\(|{|\"|'|#).*$")
+uuid4_re = re.compile(r"uuid4\(\)($|[^\.]|\.hex)")
+redundant_import_alias_re = re.compile(r"import (?:.*\.)?(.+) as \1$")
+yield_not_followed_by_space = re.compile(r"^\s*yield(?:\(|{|\[|\"|').*$")
+asse_regexpmatches = re.compile(
+    r"(assertRegexpMatches|assertNotRegexpMatches)\(")
+privsep_file_re = re.compile('^nova/privsep[./]')
+privsep_import_re = re.compile(
+    r"^(?:import|from).*\bprivsep\b")
+# Redundant parenthetical masquerading as a tuple, used with ``in``:
+# Space, "in", space, open paren
+# Optional single or double quote (so we match strings or symbols)
+# A sequence of the characters that can make up a symbol. (This is weak: a
+#   string can contain other characters; and a numeric symbol can start with a
+#   minus, and a method call has a param list, and... Not sure this gets better
+#   without a lexer.)
+# The same closing quote
+# Close paren
+disguised_as_tuple_re = re.compile(r''' in \((['"]?)[a-zA-Z0-9_.]+\1\)''')
 
-# TODO(dims): When other oslo libraries switch over non-namespace'd
-# imports, we need to add them to the regexp below.
-oslo_namespace_imports = re.compile(r"from[\s]*oslo[.]"
-                                    r"(concurrency|config|context|db|i18n|"
-                                    r"log|messaging|middleware|rootwrap|"
-                                    r"serialization|utils|vmware)")
-oslo_namespace_imports_2 = re.compile(r"from[\s]*oslo[\s]*import[\s]*"
-                                    r"(concurrency|config|context|db|i18n|"
-                                    r"log|messaging|middleware|rootwrap|"
-                                    r"serialization|utils|vmware)")
-oslo_namespace_imports_3 = re.compile(r"import[\s]*oslo\."
-                                    r"(concurrency|config|context|db|i18n|"
-                                    r"log|messaging|middleware|rootwrap|"
-                                    r"serialization|utils|vmware)")
+# NOTE(takashin): The patterns of nox-existent mock assertion methods and
+# attributes do not cover all cases. If you find a new pattern,
+# add the pattern in the following regex patterns.
+mock_assert_method_re = re.compile(
+    r"\.((called_once(_with)*|has_calls)|"
+    r"mock_assert_(called(_(once|with|once_with))?"
+    r"|any_call|has_calls|not_called)|"
+    r"(asser|asset|asssert|assset)_(called(_(once|with|once_with))?"
+    r"|any_call|has_calls|not_called))\(")
+mock_attribute_re = re.compile(r"[\.\(](retrun_value)[,=\s]")
+# Regex for useless assertions
+useless_assertion_re = re.compile(
+    r"\.((assertIsNone)\(None|(assertTrue)\((True|\d+|'.+'|\".+\")),")
+# Regex for misuse of assert_has_calls
+mock_assert_has_calls_re = re.compile(r"\.assert_has_calls\s?=")
+
+# Regex for catching aliasing mock.Mock class in test
+mock_class_aliasing_re = re.compile(
+    r"^[A-Za-z0-9_.]+\s*=\s*mock\.(Magic|NonCallable)?Mock$")
+# Regex for catching aliasing mock.Mock class in test
+mock_class_as_new_value_in_patching_re = re.compile(
+    r"mock\.patch(\.object)?.* new=mock\.(Magic|NonCallable)?Mock[^(]")
+# Regex for direct use of oslo.concurrency lockutils.ReaderWriterLock
+rwlock_re = re.compile(
+    r"(?P<module_part>(oslo_concurrency\.)?(lockutils|fasteners))"
+    r"\.ReaderWriterLock\(.*\)")
+six_re = re.compile(r"^(import six(\..*)?|from six(\..*)? import .*)$")
+# Regex for catching the setDaemon method
+set_daemon_re = re.compile(r"\.setDaemon\(")
+eventlet_stdlib_primitives_re = re.compile(
+    r".*(eventlet|greenthread)\.sleep\(.*")
+eventlet_yield_re = re.compile(r".*time\.sleep\(0\).*")
+eventlet_primitives_re = re.compile(
+    r".*(eventlet)\.(semaphore|timeout|event).*"
+    r"|from\s+eventlet\s+import\s+(semaphore|timeout|event)")
+threading_event_mock_re = re.compile(
+    r"mock.patch\(.threading.Event.wait|"
+    r"mock.patch.object\(threading, .Event.wait|"
+    r"mock.patch\(.threading.Event|"
+    r"mock.patch.object\(threading, .Event"
+)
 
 
 class BaseASTChecker(ast.NodeVisitor):
@@ -128,7 +172,7 @@ class BaseASTChecker(ast.NodeVisitor):
     """
 
     def __init__(self, tree, filename):
-        """This object is created automatically by pep8.
+        """This object is created automatically by pycodestyle.
 
         :param tree: an AST tree
         :param filename: name of the file being analyzed
@@ -138,12 +182,12 @@ class BaseASTChecker(ast.NodeVisitor):
         self._errors = []
 
     def run(self):
-        """Called automatically by pep8."""
+        """Called automatically by pycodestyle."""
         self.visit(self._tree)
         return self._errors
 
     def add_error(self, node, message=None):
-        """Add an error caused by a node to the list of errors for pep8."""
+        """Add an error caused by a node to the list of errors."""
         message = message or self.CHECK_DESC
         error = (node.lineno, node.col_offset, message, self.__class__)
         self._errors.append(error)
@@ -156,6 +200,7 @@ class BaseASTChecker(ast.NodeVisitor):
         return False
 
 
+@core.flake8ext
 def import_no_db_in_virt(logical_line, filename):
     """Check for db calls from nova/virt
 
@@ -165,16 +210,18 @@ def import_no_db_in_virt(logical_line, filename):
     N307
     """
     if "nova/virt" in filename and not filename.endswith("fake.py"):
-        if logical_line.startswith("from nova import db"):
-            yield (0, "N307: nova.db import not allowed in nova/virt/*")
+        if logical_line.startswith("from nova.db.main import api"):
+            yield (0, "N307: nova.db.* import not allowed in nova/virt/*")
 
 
+@core.flake8ext
 def no_db_session_in_public_api(logical_line, filename):
     if "db/api.py" in filename:
         if session_check.match(logical_line):
             yield (0, "N309: public db api methods may not accept session")
 
 
+@core.flake8ext
 def use_timeutils_utcnow(logical_line, filename):
     # tools are OK to use the standard datetime module
     if "/tools/" in filename:
@@ -195,13 +242,13 @@ def _get_virt_name(regex, data):
         return None
     driver = m.group(1)
     # Ignore things we mis-detect as virt drivers in the regex
-    if driver in ["test_virt_drivers", "driver", "firewall",
-                  "disk", "api", "imagecache", "cpu", "hardware",
-                  "image"]:
+    if driver in ["test_virt_drivers", "driver", "disk", "api", "imagecache",
+                  "cpu", "hardware", "image"]:
         return None
     return driver
 
 
+@core.flake8ext
 def import_no_virt_driver_import_deps(physical_line, filename):
     """Check virt drivers' modules aren't imported by other drivers
 
@@ -221,6 +268,7 @@ def import_no_virt_driver_import_deps(physical_line, filename):
         return (0, "N311: importing code from other virt drivers forbidden")
 
 
+@core.flake8ext
 def import_no_virt_driver_config_deps(physical_line, filename):
     """Check virt drivers' config vars aren't used by other drivers
 
@@ -239,6 +287,7 @@ def import_no_virt_driver_config_deps(physical_line, filename):
         return (0, "N312: using config vars from other virt drivers forbidden")
 
 
+@core.flake8ext
 def capital_cfg_help(logical_line, tokens):
     msg = "N313: capitalize help string"
 
@@ -247,23 +296,10 @@ def capital_cfg_help(logical_line, tokens):
             if tokens[t][1] == "help":
                 txt = tokens[t + 2][1]
                 if len(txt) > 1 and txt[1].islower():
-                    yield(0, msg)
+                    yield (0, msg)
 
 
-def no_vi_headers(physical_line, line_number, lines):
-    """Check for vi editor configuration in source files.
-
-    By default vi modelines can only appear in the first or
-    last 5 lines of a source file.
-
-    N314
-    """
-    # NOTE(gilliard): line_number is 1-indexed
-    if line_number <= 5 or line_number > len(lines) - 5:
-        if vi_header_re.match(physical_line):
-            return 0, "N314: Don't put vi configuration in source files"
-
-
+@core.flake8ext
 def assert_true_instance(logical_line):
     """Check for assertTrue(isinstance(a, b)) sentences
 
@@ -273,6 +309,7 @@ def assert_true_instance(logical_line):
         yield (0, "N316: assertTrue(isinstance(a, b)) sentences not allowed")
 
 
+@core.flake8ext
 def assert_equal_type(logical_line):
     """Check for assertEqual(type(A), B) sentences
 
@@ -282,35 +319,20 @@ def assert_equal_type(logical_line):
         yield (0, "N317: assertEqual(type(A), B) sentences not allowed")
 
 
-def assert_equal_none(logical_line):
-    """Check for assertEqual(A, None) or assertEqual(None, A) sentences
+@core.flake8ext
+def no_translate_logs(logical_line, filename):
+    """Check for 'LOG.foo(_('
 
-    N318
-    """
-    res = (asse_equal_start_with_none_re.search(logical_line) or
-           asse_equal_end_with_none_re.search(logical_line))
-    if res:
-        yield (0, "N318: assertEqual(A, None) or assertEqual(None, A) "
-               "sentences not allowed")
-
-
-def no_translate_debug_logs(logical_line, filename):
-    """Check for 'LOG.debug(_('
-
-    As per our translation policy,
-    https://wiki.openstack.org/wiki/LoggingStandards#Log_Translation
-    we shouldn't translate debug level logs.
-
-    * This check assumes that 'LOG' is a logger.
-    * Use filename so we can start enforcing this in specific folders instead
-      of needing to do so all at once.
+    As per our translation policy, we shouldn't translate logs.
+    This check assumes that 'LOG' is a logger.
 
     N319
     """
-    if logical_line.startswith("LOG.debug(_("):
-        yield(0, "N319 Don't translate debug level logs")
+    if translated_log.match(logical_line):
+        yield (0, "N319 Don't translate logs")
 
 
+@core.flake8ext
 def no_import_translation_in_tests(logical_line, filename):
     """Check for 'from nova.i18n import _'
     N337
@@ -318,9 +340,10 @@ def no_import_translation_in_tests(logical_line, filename):
     if 'nova/tests/' in filename:
         res = import_translation_for_log_or_exception.match(logical_line)
         if res:
-            yield(0, "N337 Don't import translation in tests")
+            yield (0, "N337 Don't import translation in tests")
 
 
+@core.flake8ext
 def no_setting_conf_directly_in_tests(logical_line, filename):
     """Check for setting CONF.* attributes directly in tests
 
@@ -337,34 +360,14 @@ def no_setting_conf_directly_in_tests(logical_line, filename):
                       "forbidden. Use self.flags(option=value) instead")
 
 
-def validate_log_translations(logical_line, physical_line, filename):
-    # Translations are not required in the test directory
-    # and the Xen utilities
-    if ("nova/tests" in filename or
-                "plugins/xenserver/xenapi/etc/xapi.d" in filename):
-        return
-    if pep8.noqa(physical_line):
-        return
-    msg = "N328: LOG.info messages require translations `_LI()`!"
-    if log_translation_info.match(logical_line):
-        yield (0, msg)
-    msg = "N329: LOG.exception messages require translations `_LE()`!"
-    if log_translation_exception.match(logical_line):
-        yield (0, msg)
-    msg = "N330: LOG.warning, LOG.warn messages require translations `_LW()`!"
-    if log_translation_LW.match(logical_line):
-        yield (0, msg)
-    msg = "N321: Log messages require translations!"
-    if log_translation.match(logical_line):
-        yield (0, msg)
-
-
+@core.flake8ext
 def no_mutable_default_args(logical_line):
     msg = "N322: Method's default argument shouldn't be mutable!"
     if mutable_default_args.match(logical_line):
         yield (0, msg)
 
 
+@core.flake8ext
 def check_explicit_underscore_import(logical_line, filename):
     """Check for explicit import of the _ function
 
@@ -381,18 +384,12 @@ def check_explicit_underscore_import(logical_line, filename):
     elif (underscore_import_check.match(logical_line) or
           custom_underscore_check.match(logical_line)):
         UNDERSCORE_IMPORT_FILES.append(filename)
-    elif (translated_log.match(logical_line) or
-         string_translation.match(logical_line)):
-        yield(0, "N323: Found use of _() without explicit import of _ !")
+    elif string_translation.match(logical_line):
+        yield (0, "N323: Found use of _() without explicit import of _ !")
 
 
+@core.flake8ext
 def use_jsonutils(logical_line, filename):
-    # the code below that path is not meant to be executed from neutron
-    # tree where jsonutils module is present, so don't enforce its usage
-    # for this subdirectory
-    if "plugins/xenserver" in filename:
-        return
-
     # tools are OK to use the standard json module
     if "/tools/" in filename:
         return
@@ -407,50 +404,14 @@ def use_jsonutils(logical_line, filename):
                 yield (pos, msg % {'fun': f[:-1]})
 
 
+@core.flake8ext
 def check_api_version_decorator(logical_line, previous_logical, blank_before,
                                 filename):
     msg = ("N332: the api_version decorator must be the first decorator"
            " on a method.")
     if blank_before == 0 and re.match(api_version_re, logical_line) \
            and re.match(decorator_re, previous_logical):
-        yield(0, msg)
-
-
-class CheckForStrUnicodeExc(BaseASTChecker):
-    """Checks for the use of str() or unicode() on an exception.
-
-    This currently only handles the case where str() or unicode()
-    is used in the scope of an exception handler.  If the exception
-    is passed into a function, returned from an assertRaises, or
-    used on an exception created in the same scope, this does not
-    catch it.
-    """
-
-    CHECK_DESC = ('N325 str() and unicode() cannot be used on an '
-                  'exception.  Remove or use six.text_type()')
-
-    def __init__(self, tree, filename):
-        super(CheckForStrUnicodeExc, self).__init__(tree, filename)
-        self.name = []
-        self.already_checked = []
-
-    def visit_TryExcept(self, node):
-        for handler in node.handlers:
-            if handler.name:
-                self.name.append(handler.name.id)
-                super(CheckForStrUnicodeExc, self).generic_visit(node)
-                self.name = self.name[:-1]
-            else:
-                super(CheckForStrUnicodeExc, self).generic_visit(node)
-
-    def visit_Call(self, node):
-        if self._check_call_names(node, ['str', 'unicode']):
-            if node not in self.already_checked:
-                self.already_checked.append(node)
-                if isinstance(node.args[0], ast.Name):
-                    if node.args[0].id in self.name:
-                        self.add_error(node.args[0])
-        super(CheckForStrUnicodeExc, self).generic_visit(node)
+        yield (0, msg)
 
 
 class CheckForTransAdd(BaseASTChecker):
@@ -461,38 +422,99 @@ class CheckForTransAdd(BaseASTChecker):
     string to give the translators the most information.
     """
 
+    name = 'check_for_trans_add'
+    version = '0.1'
+
     CHECK_DESC = ('N326 Translated messages cannot be concatenated.  '
                   'String should be included in translated message.')
 
-    TRANS_FUNC = ['_', '_LI', '_LW', '_LE', '_LC']
+    TRANS_FUNC = ['_']
 
     def visit_BinOp(self, node):
         if isinstance(node.op, ast.Add):
-            if self._check_call_names(node.left, self.TRANS_FUNC):
-                self.add_error(node.left)
-            elif self._check_call_names(node.right, self.TRANS_FUNC):
-                self.add_error(node.right)
+            for node_x in (node.left, node.right):
+                if isinstance(node_x, ast.Call):
+                    if isinstance(node_x.func, ast.Name):
+                        if node_x.func.id == '_':
+                            self.add_error(node_x)
         super(CheckForTransAdd, self).generic_visit(node)
 
 
-def check_oslo_namespace_imports(logical_line, blank_before, filename):
-    if re.match(oslo_namespace_imports, logical_line):
-        msg = ("N333: '%s' must be used instead of '%s'.") % (
-               logical_line.replace('oslo.', 'oslo_'),
-               logical_line)
-        yield(0, msg)
-    match = re.match(oslo_namespace_imports_2, logical_line)
-    if match:
-        msg = ("N333: 'module %s should not be imported "
-               "from oslo namespace.") % match.group(1)
-        yield(0, msg)
-    match = re.match(oslo_namespace_imports_3, logical_line)
-    if match:
-        msg = ("N333: 'module %s should not be imported "
-               "from oslo namespace.") % match.group(1)
-        yield(0, msg)
+class _FindVariableReferences(ast.NodeVisitor):
+    def __init__(self):
+        super(_FindVariableReferences, self).__init__()
+        self._references = []
+
+    def visit_Name(self, node):
+        if isinstance(node.ctx, ast.Load):
+            # This means the value of a variable was loaded. For example a
+            # variable 'foo' was used like:
+            # mocked_thing.bar = foo
+            # foo()
+            # self.assertRaises(exception, foo)
+            self._references.append(node.id)
+        super(_FindVariableReferences, self).generic_visit(node)
 
 
+class CheckForUncalledTestClosure(BaseASTChecker):
+    """Look for closures that are never called in tests.
+
+    A recurring pattern when using multiple mocks is to create a closure
+    decorated with mocks like:
+
+    def test_thing(self):
+            @mock.patch.object(self.compute, 'foo')
+            @mock.patch.object(self.compute, 'bar')
+            def _do_test(mock_bar, mock_foo):
+                # Test things
+        _do_test()
+
+    However it is easy to leave off the _do_test() and have the test pass
+    because nothing runs. This check looks for methods defined within a test
+    method and ensures that there is a reference to them. Only methods defined
+    one level deep are checked. Something like:
+
+    def test_thing(self):
+        class FakeThing:
+            def foo(self):
+
+    would not ensure that foo is referenced.
+
+    N349
+    """
+
+    name = 'check_for_uncalled_test_closure'
+    version = '0.1'
+
+    def __init__(self, tree, filename):
+        super(CheckForUncalledTestClosure, self).__init__(tree, filename)
+        self._filename = filename
+
+    def visit_FunctionDef(self, node):
+        # self._filename is 'stdin' in the unit test for this check.
+        if (not os.path.basename(self._filename).startswith('test_') and
+                os.path.basename(self._filename) != 'stdin'):
+            return
+
+        closures = []
+        references = []
+        # Walk just the direct nodes of the test method
+        for child_node in ast.iter_child_nodes(node):
+            if isinstance(child_node, ast.FunctionDef):
+                closures.append(child_node.name)
+
+        # Walk all nodes to find references
+        find_references = _FindVariableReferences()
+        find_references.generic_visit(node)
+        references = find_references._references
+
+        missed = set(closures) - set(references)
+        if missed:
+            self.add_error(node, 'N349: Test closures not called: %s'
+                    % ','.join(missed))
+
+
+@core.flake8ext
 def assert_true_or_false_with_in(logical_line):
     """Check for assertTrue/False(A in B), assertTrue/False(A not in B),
     assertTrue/False(A in B, message) or assertTrue/False(A not in B, message)
@@ -508,6 +530,7 @@ def assert_true_or_false_with_in(logical_line):
                   "contents.")
 
 
+@core.flake8ext
 def assert_raises_regexp(logical_line):
     """Check for usage of deprecated assertRaisesRegexp
 
@@ -519,6 +542,7 @@ def assert_raises_regexp(logical_line):
                   "of assertRaisesRegexp")
 
 
+@core.flake8ext
 def dict_constructor_with_list_copy(logical_line):
     msg = ("N336: Must use a dict comprehension instead of a dict constructor"
            " with a sequence of key-value pairs."
@@ -527,6 +551,7 @@ def dict_constructor_with_list_copy(logical_line):
         yield (0, msg)
 
 
+@core.flake8ext
 def assert_equal_in(logical_line):
     """Check for assertEqual(A in B, True), assertEqual(True, A in B),
     assertEqual(A in B, False) or assertEqual(False, A in B) sentences
@@ -541,41 +566,575 @@ def assert_equal_in(logical_line):
                   "contents.")
 
 
-def check_http_not_implemented(logical_line, physical_line, filename):
+@core.flake8ext
+def check_http_not_implemented(logical_line, filename, noqa):
     msg = ("N339: HTTPNotImplemented response must be implemented with"
            " common raise_feature_not_supported().")
-    if pep8.noqa(physical_line):
+    if noqa:
         return
-    if "nova/api/openstack/compute/plugins/v3" not in filename:
+    if ("nova/api/openstack/compute" not in filename):
         return
     if re.match(http_not_implemented_re, logical_line):
-        yield(0, msg)
+        yield (0, msg)
 
 
-def factory(register):
-    register(import_no_db_in_virt)
-    register(no_db_session_in_public_api)
-    register(use_timeutils_utcnow)
-    register(import_no_virt_driver_import_deps)
-    register(import_no_virt_driver_config_deps)
-    register(capital_cfg_help)
-    register(no_vi_headers)
-    register(no_import_translation_in_tests)
-    register(assert_true_instance)
-    register(assert_equal_type)
-    register(assert_equal_none)
-    register(assert_raises_regexp)
-    register(no_translate_debug_logs)
-    register(no_setting_conf_directly_in_tests)
-    register(validate_log_translations)
-    register(no_mutable_default_args)
-    register(check_explicit_underscore_import)
-    register(use_jsonutils)
-    register(check_api_version_decorator)
-    register(CheckForStrUnicodeExc)
-    register(CheckForTransAdd)
-    register(check_oslo_namespace_imports)
-    register(assert_true_or_false_with_in)
-    register(dict_constructor_with_list_copy)
-    register(assert_equal_in)
-    register(check_http_not_implemented)
+@core.flake8ext
+def check_greenthread_spawns(logical_line, filename):
+    """Check for use of greenthread.spawn(), greenthread.spawn_n(),
+    eventlet.spawn(), and eventlet.spawn_n()
+
+    N340
+    """
+    msg = ("N340: Use nova.thread_pool_factory.spawn() rather than "
+           "greenthread.%(spawn)s() and eventlet.%(spawn)s()")
+    if "nova/thread_pool_factory.py" in filename or "nova/tests/" in filename:
+        return
+
+    match = re.match(spawn_re, logical_line)
+
+    if match:
+        yield (0, msg % {'spawn': match.group('spawn_part')})
+
+
+@core.flake8ext
+def check_no_contextlib_nested(logical_line, filename):
+    msg = ("N341: contextlib.nested is deprecated. With Python 2.7 and later "
+           "the with-statement supports multiple nested objects. See https://"
+           "docs.python.org/2/library/contextlib.html#contextlib.nested for "
+           "more information. nova.test.nested() is an alternative as well.")
+
+    if contextlib_nested.match(logical_line):
+        yield (0, msg)
+
+
+@core.flake8ext
+def check_config_option_in_central_place(logical_line, filename):
+    msg = ("N342: Config options should be in the central location "
+           "'/nova/conf/*'. Do not declare new config options outside "
+           "of that folder.")
+    # That's the correct location
+    if "nova/conf/" in filename:
+        return
+
+    # (macsz) All config options (with exceptions that are clarified
+    # in the list below) were moved to the central place. List below is for
+    # all options that were impossible to move without doing a major impact
+    # on code. Add full path to a module or folder.
+    conf_exceptions = [
+        # CLI opts are allowed to be outside of nova/conf directory
+        'nova/cmd/manage.py',
+        'nova/cmd/policy.py',
+        'nova/cmd/status.py',
+        # config options should not be declared in tests, but there is
+        # another checker for it (N320)
+        'nova/tests',
+    ]
+
+    if any(f in filename for f in conf_exceptions):
+        return
+
+    if cfg_opt_re.match(logical_line):
+        yield (0, msg)
+
+
+@core.flake8ext
+def check_policy_registration_in_central_place(logical_line, filename):
+    msg = ('N350: Policy registration should be in the central location(s) '
+           '"/nova/policies/*"')
+    # This is where registration should happen
+    if "nova/policies/" in filename:
+        return
+    # A couple of policy tests register rules
+    if "nova/tests/unit/test_policy.py" in filename:
+        return
+
+    if rule_default_re.match(logical_line):
+        yield (0, msg)
+
+
+@core.flake8ext
+def check_policy_enforce(logical_line, filename):
+    """Look for uses of nova.policy._ENFORCER.enforce()
+
+    Now that policy defaults are registered in code the _ENFORCER.authorize
+    method should be used. That ensures that only registered policies are used.
+    Uses of _ENFORCER.enforce could allow unregistered policies to be used, so
+    this check looks for uses of that method.
+
+    N351
+    """
+
+    msg = ('N351: nova.policy._ENFORCER.enforce() should not be used. '
+           'Use the authorize() method instead.')
+
+    if policy_enforce_re.match(logical_line):
+        yield (0, msg)
+
+
+@core.flake8ext
+def check_doubled_words(physical_line, filename):
+    """Check for the common doubled-word typos
+
+    N343
+    """
+    msg = ("N343: Doubled word '%(word)s' typo found")
+
+    match = re.search(doubled_words_re, physical_line)
+
+    if match:
+        return (0, msg % {'word': match.group(1)})
+
+
+@core.flake8ext
+def no_os_popen(logical_line):
+    """Disallow 'os.popen('
+
+    Deprecated library function os.popen() Replace it using subprocess
+    https://bugs.launchpad.net/tempest/+bug/1529836
+
+    N348
+    """
+
+    if 'os.popen(' in logical_line:
+        yield (0, 'N348 Deprecated library function os.popen(). '
+                  'Replace it using subprocess module. ')
+
+
+@core.flake8ext
+def no_log_warn(logical_line):
+    """Disallow 'LOG.warn('
+
+    Deprecated LOG.warn(), instead use LOG.warning
+    https://bugs.launchpad.net/senlin/+bug/1508442
+
+    N352
+    """
+
+    msg = ("N352: LOG.warn is deprecated, please use LOG.warning!")
+    if "LOG.warn(" in logical_line:
+        yield (0, msg)
+
+
+@core.flake8ext
+def check_context_log(logical_line, filename, noqa):
+    """check whether context is being passed to the logs
+
+    Not correct: LOG.info("Rebooting instance", context=context)
+    Correct:  LOG.info("Rebooting instance")
+    https://bugs.launchpad.net/nova/+bug/1500896
+
+    N353
+    """
+    if noqa:
+        return
+
+    if "nova/tests" in filename:
+        return
+
+    if log_remove_context.match(logical_line):
+        yield (0,
+               "N353: Nova is using oslo.context's RequestContext "
+               "which means the context object is in scope when "
+               "doing logging using oslo.log, so no need to pass it as "
+               "kwarg.")
+
+
+@core.flake8ext
+def no_assert_equal_true_false(logical_line):
+    """Enforce use of assertTrue/assertFalse.
+
+    Prevent use of assertEqual(A, True|False), assertEqual(True|False, A),
+    assertNotEqual(A, True|False), and assertNotEqual(True|False, A).
+
+    N355
+    """
+    _start_re = re.compile(r'assert(Not)?Equal\((True|False),')
+    _end_re = re.compile(r'assert(Not)?Equal\(.*,\s+(True|False)\)$')
+
+    if _start_re.search(logical_line) or _end_re.search(logical_line):
+        yield (0, "N355: assertEqual(A, True|False), "
+               "assertEqual(True|False, A), assertNotEqual(A, True|False), "
+               "or assertEqual(True|False, A) sentences must not be used. "
+               "Use assertTrue(A) or assertFalse(A) instead")
+
+
+@core.flake8ext
+def no_assert_true_false_is_not(logical_line):
+    """Enforce use of assertIs/assertIsNot.
+
+    Prevent use of assertTrue(A is|is not B) and assertFalse(A is|is not B).
+
+    N356
+    """
+    _re = re.compile(r'assert(True|False)\(.+\s+is\s+(not\s+)?.+\)$')
+
+    if _re.search(logical_line):
+        yield (0, "N356: assertTrue(A is|is not B) or "
+               "assertFalse(A is|is not B) sentences must not be used. "
+               "Use assertIs(A, B) or assertIsNot(A, B) instead")
+
+
+@core.flake8ext
+def check_uuid4(logical_line):
+    """Generating UUID
+
+    Use oslo_utils.uuidutils or uuidsentinel(in case of test cases) to generate
+    UUID instead of uuid4().
+
+    N357
+    """
+
+    msg = ("N357: Use oslo_utils.uuidutils or uuidsentinel(in case of test "
+           "cases) to generate UUID instead of uuid4().")
+
+    if uuid4_re.search(logical_line):
+        yield (0, msg)
+
+
+@core.flake8ext
+def return_followed_by_space(logical_line):
+    """Return should be followed by a space.
+
+    Return should be followed by a space to clarify that return is
+    not a function. Adding a space may force the developer to rethink
+    if there are unnecessary parentheses in the written code.
+
+    Not correct: return(42), return(a, b)
+    Correct: return, return 42, return (a, b), return a, b
+
+    N358
+    """
+    if return_not_followed_by_space.match(logical_line):
+        yield (0,
+               "N358: Return keyword should be followed by a space.")
+
+
+@core.flake8ext
+def no_redundant_import_alias(logical_line):
+    """Check for redundant import aliases.
+
+    Imports should not be in the forms below.
+
+    from x import y as y
+    import x as x
+    import x.y as y
+
+    N359
+    """
+    if re.search(redundant_import_alias_re, logical_line):
+        yield (0, "N359: Import alias should not be redundant.")
+
+
+@core.flake8ext
+def yield_followed_by_space(logical_line):
+    """Yield should be followed by a space.
+
+    Yield should be followed by a space to clarify that yield is
+    not a function. Adding a space may force the developer to rethink
+    if there are unnecessary parentheses in the written code.
+
+    Not correct: yield(x), yield(a, b)
+    Correct: yield x, yield (a, b), yield a, b
+
+    N360
+    """
+    if yield_not_followed_by_space.match(logical_line):
+        yield (0,
+               "N360: Yield keyword should be followed by a space.")
+
+
+@core.flake8ext
+def assert_regexpmatches(logical_line):
+    """Check for usage of deprecated assertRegexpMatches/assertNotRegexpMatches
+
+    N361
+    """
+    res = asse_regexpmatches.search(logical_line)
+    if res:
+        yield (0, "N361: assertRegex/assertNotRegex must be used instead "
+                  "of assertRegexpMatches/assertNotRegexpMatches.")
+
+
+@core.flake8ext
+def privsep_imports_not_aliased(logical_line, filename):
+    """Do not abbreviate or alias privsep module imports.
+
+    When accessing symbols under nova.privsep in code or tests, the full module
+    path (e.g. nova.privsep.path.readfile(...)) should be used
+    explicitly rather than importing and using an alias/abbreviation such as:
+
+      from nova.privsep import path
+      ...
+      path.readfile(...)
+
+    See Ief177dbcb018da6fbad13bb0ff153fc47292d5b9.
+
+    N362
+    """
+    if (
+            # Give modules under nova.privsep a pass
+            not privsep_file_re.match(filename) and
+            # Any style of import of privsep...
+            privsep_import_re.match(logical_line) and
+            # ...that isn't 'import nova.privsep[.foo...]'
+            logical_line.count(' ') > 1):
+        yield (0, "N362: always import privsep modules so that the use of "
+                  "escalated permissions is obvious to callers. For example, "
+                  "use 'import nova.privsep.path' instead of "
+                  "'from nova.privsep import path'.")
+
+
+@core.flake8ext
+def did_you_mean_tuple(logical_line):
+    """Disallow ``(not_a_tuple)`` because you meant ``(a_tuple_of_one,)``.
+
+    N363
+    """
+    if disguised_as_tuple_re.search(logical_line):
+        yield (0, "N363: You said ``in (not_a_tuple)`` when you almost "
+                  "certainly meant ``in (a_tuple_of_one,)``.")
+
+
+@core.flake8ext
+def nonexistent_assertion_methods_and_attributes(logical_line, filename):
+    """Check non-existent mock assertion methods and attributes.
+
+    The following assertion methods do not exist.
+
+    - called_once()
+    - called_once_with()
+    - has_calls()
+    - mock_assert_*()
+
+    The following typos were found in the past cases.
+
+    - asser_*
+    - asset_*
+    - assset_*
+    - asssert_*
+    - retrun_value
+
+    N364
+    """
+    msg = ("N364: Non existent mock assertion method or attribute (%s) is "
+           "used. Check a typo or whether the assertion method should begin "
+           "with 'assert_'.")
+    if 'nova/tests/' in filename:
+        match = mock_assert_method_re.search(logical_line)
+        if match:
+            yield (0, msg % match.group(1))
+
+        match = mock_attribute_re.search(logical_line)
+        if match:
+            yield (0, msg % match.group(1))
+
+
+@core.flake8ext
+def useless_assertion(logical_line, filename):
+    """Check useless assertions in tests.
+
+    The following assertions are useless.
+
+    - assertIsNone(None, ...)
+    - assertTrue(True, ...)
+    - assertTrue(2, ...)   # Constant number
+    - assertTrue('Constant string', ...)
+    - assertTrue("Constant string", ...)
+
+    They are usually misuses of assertIsNone or assertTrue.
+
+    N365
+    """
+    msg = "N365: Misuse of %s."
+    if 'nova/tests/' in filename:
+        match = useless_assertion_re.search(logical_line)
+        if match:
+            yield (0, msg % (match.group(2) or match.group(3)))
+
+
+@core.flake8ext
+def check_assert_has_calls(logical_line, filename):
+    """Check misuse of assert_has_calls.
+
+    Not correct: mock_method.assert_has_calls = [mock.call(0)]
+    Correct:     mock_method.assert_has_calls([mock.call(0)])
+
+    N366
+    """
+    msg = "N366: The assert_has_calls is a method rather than a variable."
+    if ('nova/tests/' in filename and
+            mock_assert_has_calls_re.search(logical_line)):
+        yield (0, msg)
+
+
+@core.flake8ext
+def do_not_alias_mock_class(logical_line, filename):
+    """Check for aliasing Mock class
+
+    Aliasing Mock class almost always a bad idea. Consider the test code
+    trying to catch the instantiation of the Rados class but instead
+    introducing a global change on the Mock object:
+    https://github.com/openstack/nova/blob/10b1dc84f47a71061340f8e0ae0fe32dca44061a/nova/tests/unit/storage/test_rbd.py#L122-L125
+    After this code every test that assumes that mock.Mock().shutdown is a new
+    auto-generated mock.Mock() object will fail a shutdown is now defined in
+    the Mock class level and therefore surviving between test cases.
+
+    N367
+    """
+    if 'nova/tests/' in filename:
+        res = mock_class_aliasing_re.match(logical_line)
+        if res:
+            yield (
+                0,
+                "N367: Aliasing mock.Mock class is dangerous as it easy to "
+                "introduce class level changes in Mock that survives "
+                "between test cases. If you want to mock object creation "
+                "then mock the class under test with a mock _instance_ and "
+                "set the return_value of the mock to return mock instances. "
+                "See for example: "
+                "https://review.opendev.org/c/openstack/nova/+/805657"
+            )
+
+
+@core.flake8ext
+def do_not_use_mock_class_as_new_mock_value(logical_line, filename):
+    """Check if mock.Mock class is used during set up of a patcher as new
+    kwargs.
+
+    The mock.patch and mock.patch.object takes a `new` kwargs and use that
+    value as the replacement during the patching. Using new=mock.Mock
+    (instead of new=mock.Mock() or new_callable=mock.Mock) results in code
+    under test pointing to the Mock class. This is almost always a wrong thing
+    as any changes on that class will leak between test cases uncontrollably.
+
+    N368
+    """
+    if 'nova/tests/' in filename:
+        res = mock_class_as_new_value_in_patching_re.search(logical_line)
+        if res:
+            yield (
+                0,
+                "N368: Using mock.patch(..., new=mock.Mock) causes that the "
+                "patching will introduce the Mock class as replacement value "
+                "instead of a mock object. Any change on the Mock calls will "
+                "leak out from the test and can cause interference. "
+                "Use new=mock.Mock() or new_callable=mock.Mock instead."
+            )
+
+
+@core.flake8ext
+def check_lockutils_rwlocks(logical_line):
+    """Check for direct use of oslo.concurrency lockutils.ReaderWriterLock()
+
+    oslo.concurrency lockutils uses fasteners.ReaderWriterLock to provide
+    read/write locks and fasteners calls threading.current_thread() to track
+    and identify lock holders and waiters. The eventlet implementation of
+    current_thread() only supports greenlets of type GreenThread, else it falls
+    back on the native threading.current_thread() method.
+
+    See https://github.com/eventlet/eventlet/issues/731 for details.
+
+    N369
+    """
+    msg = ("N369: %(module)s.ReaderWriterLock() does not "
+           "function correctly with eventlet patched code. "
+           "Use nova.utils.ReaderWriterLock() instead.")
+    match = re.match(rwlock_re, logical_line)
+    if match:
+        yield (
+            0,
+            msg % {'module': match.group('module_part')}
+        )
+
+
+@core.flake8ext
+def check_six(logical_line):
+    """Check for use of six
+
+    nova is now Python 3-only so we don't want six. However, people might use
+    it out of habit and it will likely work since six is a transitive
+    dependency.
+
+    N370
+    """
+    match = re.match(six_re, logical_line)
+    if match:
+        yield (0, "N370: Don't use or import six")
+
+
+@core.flake8ext
+def check_set_daemon(logical_line):
+    """Check for use of the setDaemon method of the threading.Thread class
+
+    The setDaemon method of the threading.Thread class has been deprecated
+    since Python 3.10. Use the daemon attribute instead.
+
+    See
+    https://docs.python.org/3.10/library/threading.html#threading.Thread.setDaemon
+    for details.
+
+    N372
+    """
+    res = set_daemon_re.search(logical_line)
+    if res:
+        yield (0, "N372: Don't use the setDaemon method. "
+                  "Use the daemon attribute instead.")
+
+
+@core.flake8ext
+def check_eventlet_primitives(logical_line, filename):
+    """Check for use of any eventlet primitives where the stdlib equivalent
+    should be used
+
+    N373
+    """
+    msg = (
+        "N373: Use the stdlib concurrency primitive instead of the Eventlet "
+        "specific one")
+
+    match = re.match(eventlet_stdlib_primitives_re, logical_line)
+
+    if match:
+        yield (0, msg)
+
+    match = re.match(eventlet_primitives_re, logical_line)
+
+    if match:
+        yield (0, msg)
+
+
+@core.flake8ext
+def check_eventlet_yield(logical_line, filename):
+    """Check for use of time.sleep(0) triggering eventlet yield
+
+    N374
+    """
+    msg = (
+        "N374: Use the nova.utils.cooperative_yield instead of time.sleep(0) "
+        "to trigger an eventlet context switch")
+
+    match = re.match(eventlet_yield_re, logical_line)
+
+    if match:
+        yield (0, msg)
+
+
+@core.flake8ext
+def check_threading_event_mock(physical_line, filename):
+    """Check to prevent mocking threading.Event creation and usage.
+
+    N375
+    """
+    msg = (
+        "N375: Mocking threading.Event creation or usage leads to unexpected"
+        "behavior in our base libs like oslo.service.LoopingCall and our test"
+        "fixtures and causes leaked calls across test cases. Target your"
+        "mocking to the specific Event instance instead.")
+
+    if filename == 'nova/tests/unit/test_hacking.py':
+        return
+
+    match = re.search(threading_event_mock_re, physical_line)
+
+    if match:
+        return 0, msg

@@ -14,6 +14,9 @@
 
 import copy
 
+from oslo_utils import versionutils
+
+from nova.network import model as network_model
 from nova import objects
 from nova.objects import base
 from nova.objects import fields
@@ -21,11 +24,28 @@ from nova import utils
 from nova.virt import hardware
 
 
+NULLABLE_STRING_FIELDS = ['name', 'checksum', 'owner',
+                          'container_format', 'disk_format']
+NULLABLE_INTEGER_FIELDS = ['size', 'virtual_size']
+
+__all__ = [
+    'ImageMeta',
+    'ImageMetaProps',
+]
+
+
 @base.NovaObjectRegistry.register
 class ImageMeta(base.NovaObject):
     # Version 1.0: Initial version
     # Version 1.1: updated ImageMetaProps
-    VERSION = '1.1'
+    # Version 1.2: ImageMetaProps version 1.2
+    # Version 1.3: ImageMetaProps version 1.3
+    # Version 1.4: ImageMetaProps version 1.4
+    # Version 1.5: ImageMetaProps version 1.5
+    # Version 1.6: ImageMetaProps version 1.6
+    # Version 1.7: ImageMetaProps version 1.7
+    # Version 1.8: ImageMetaProps version 1.8
+    VERSION = '1.8'
 
     # These are driven by what the image client API returns
     # to Nova from Glance. This is defined in the glance
@@ -34,7 +54,10 @@ class ImageMeta(base.NovaObject):
     # self, file, schema - Nova does not appear to ever use
     # these field; locations - modelling the arbitrary
     # data in the 'metadata' subfield is non-trivial as
-    # there's no clear spec
+    # there's no clear spec.
+    #
+    # TODO(ft): In version 2.0, these fields should be nullable:
+    # name, checksum, owner, size, virtual_size, container_format, disk_format
     #
     fields = {
         'id': fields.UUIDField(),
@@ -55,11 +78,6 @@ class ImageMeta(base.NovaObject):
         'min_ram': fields.IntegerField(),
         'min_disk': fields.IntegerField(),
         'properties': fields.ObjectField('ImageMetaProps'),
-    }
-
-    obj_relationships = {
-        'properties': [('1.0', '1.0'),
-                       ('1.1', '1.1')],
     }
 
     @classmethod
@@ -83,6 +101,18 @@ class ImageMeta(base.NovaObject):
             objects.ImageMetaProps.from_dict(
                 image_meta.get("properties", {}))
 
+        # Some fields are nullable in Glance DB schema, but was not marked that
+        # in ImageMeta initially by mistake. To keep compatibility with compute
+        # nodes which are run with previous versions these fields are still
+        # not nullable in ImageMeta, but the code below converts None to
+        # appropriate empty values.
+        for fld in NULLABLE_STRING_FIELDS:
+            if fld in image_meta and image_meta[fld] is None:
+                image_meta[fld] = ''
+        for fld in NULLABLE_INTEGER_FIELDS:
+            if fld in image_meta and image_meta[fld] is None:
+                image_meta[fld] = 0
+
         return cls(**image_meta)
 
     @classmethod
@@ -92,21 +122,214 @@ class ImageMeta(base.NovaObject):
         :param instance: Instance object
 
         Creates a new object instance, initializing from the
-        system metadata "image_" properties associated with
+        system metadata "image_*" properties associated with
         instance
 
         :returns: an ImageMeta instance
         """
         sysmeta = utils.instance_sys_meta(instance)
         image_meta = utils.get_image_from_system_metadata(sysmeta)
+
+        # NOTE(lyarwood): Provide the id of the image in image_meta if it
+        # wasn't persisted in the system_metadata of the instance previously.
+        # This is only provided to allow users of image_meta to avoid the need
+        # to pass around references to instance.image_ref alongside image_meta.
+        if image_meta.get('id') is None and instance.image_ref:
+            image_meta['id'] = instance.image_ref
+
         return cls.from_dict(image_meta)
+
+    @classmethod
+    def from_image_ref(cls, context, image_api, image_ref):
+        """Create instance from glance image
+
+        :param context: the request context
+        :param image_api: the glance client API
+        :param image_ref: the glance image identifier
+
+        Creates a new object instance, initializing from the
+        properties associated with a glance image
+
+        :returns: an ImageMeta instance
+        """
+
+        image_meta = image_api.get(context, image_ref)
+        image = cls.from_dict(image_meta)
+        setattr(image, "id", image_ref)
+        return image
 
 
 @base.NovaObjectRegistry.register
 class ImageMetaProps(base.NovaObject):
     # Version 1.0: Initial version
     # Version 1.1: added os_require_quiesce field
-    VERSION = ImageMeta.VERSION
+    # Version 1.2: added img_hv_type and img_hv_requested_version fields
+    # Version 1.3: HVSpec version 1.1
+    # Version 1.4: added hw_vif_multiqueue_enabled field
+    # Version 1.5: added os_admin_user field
+    # Version 1.6: Added 'lxc' and 'uml' enum types to DiskBusField
+    # Version 1.7: added img_config_drive field
+    # Version 1.8: Added 'lxd' to hypervisor types
+    # Version 1.9: added hw_cpu_thread_policy field
+    # Version 1.10: added hw_cpu_realtime_mask field
+    # Version 1.11: Added hw_firmware_type field
+    # Version 1.12: Added properties for image signature verification
+    # Version 1.13: added os_secure_boot field
+    # Version 1.14: Added 'hw_pointer_model' field
+    # Version 1.15: Added hw_rescue_bus and hw_rescue_device.
+    # Version 1.16: WatchdogActionField supports 'disabled' enum.
+    # Version 1.17: Add lan9118 as valid nic for hw_vif_model property for qemu
+    # Version 1.18: Pull signature properties from cursive library
+    # Version 1.19: Added 'img_hide_hypervisor_id' type field
+    # Version 1.20: Added 'traits_required' list field
+    # Version 1.21: Added 'hw_time_hpet' field
+    # Version 1.22: Added 'gop', 'virtio' and 'none' to hw_video_model field
+    # Version 1.23: Added 'hw_pmu' field
+    # Version 1.24: Added 'hw_mem_encryption' field
+    # Version 1.25: Added 'hw_pci_numa_affinity_policy' field
+    # Version 1.26: Added 'mixed' to 'hw_cpu_policy' field
+    # Version 1.27: Added 'hw_tpm_model' and 'hw_tpm_version' fields
+    # Version 1.28: Added 'socket' to 'hw_pci_numa_affinity_policy'
+    # Version 1.29: Added 'hw_input_bus' field
+    # Version 1.30: Added 'bochs' as an option to 'hw_video_model'
+    # Version 1.31: Added 'hw_emulation_architecture' field
+    # Version 1.32: Added 'hw_ephemeral_encryption' and
+    #                     'hw_ephemeral_encryption_format' fields
+    # Version 1.33: Added 'hw_locked_memory' field
+    # Version 1.34: Added 'hw_viommu_model' field
+    # Version 1.35: Added 'hw_virtio_packed_ring' field
+    # Version 1.36: Added 'hw_maxphysaddr_mode' and
+    #                     'hw_maxphysaddr_bits' field
+    # Version 1.37: Added 'hw_ephemeral_encryption_secret_uuid' field
+    # Version 1.38: Added 'hw_firmware_stateless' field
+    # Version 1.39: Added igb value to 'hw_vif_model' enum
+    # Version 1.40: Added 'hw_sound_model' field
+    # Version 1.41: Added 'hw_usb_model' and 'hw_redirected_usb_ports' fields
+    # Version 1.42: Added 'hw_mem_encryption_model' field
+    # Version 1.43: Added 'amd-sev-snp' as an option to hw_mem_encryption_model
+    # Version 1.44: Added 'intel-tdx' as an option to hw_mem_encryption_model
+
+    # NOTE(efried): When bumping this version, the version of
+    # ImageMetaPropsPayload must also be bumped. See its docstring for details.
+    VERSION = '1.44'
+
+    def obj_make_compatible(self, primitive, target_version):  # noqa: C901
+        super(ImageMetaProps, self).obj_make_compatible(primitive,
+                                                        target_version)
+        target_version = versionutils.convert_version_to_tuple(target_version)
+        if target_version < (1, 44):
+            base.raise_on_too_new_values(
+                target_version, primitive,
+                'hw_mem_encryption_model',
+                (fields.MemEncryptionModel.INTEL_TDX,))
+        if target_version < (1, 43):
+            base.raise_on_too_new_values(
+                target_version, primitive,
+                'hw_mem_encryption_model',
+                (fields.MemEncryptionModel.AMD_SEV_SNP,))
+        if target_version < (1, 42):
+            primitive.pop('hw_mem_encryption_model', None)
+        if target_version < (1, 41):
+            primitive.pop('hw_usb_model', None)
+            primitive.pop('hw_redirected_usb_ports', None)
+        if target_version < (1, 40):
+            primitive.pop('hw_sound_model', None)
+        if target_version < (1, 39):
+            base.raise_on_too_new_values(
+                target_version, primitive,
+                'hw_vif_model', (network_model.VIF_MODEL_IGB,))
+        if target_version < (1, 38):
+            primitive.pop('hw_firmware_stateless', None)
+        if target_version < (1, 37):
+            primitive.pop('hw_ephemeral_encryption_secret_uuid', None)
+        if target_version < (1, 36):
+            primitive.pop('hw_maxphysaddr_mode', None)
+            primitive.pop('hw_maxphysaddr_bits', None)
+        if target_version < (1, 35):
+            primitive.pop('hw_virtio_packed_ring', None)
+        if target_version < (1, 34):
+            primitive.pop('hw_viommu_model', None)
+        if target_version < (1, 33):
+            primitive.pop('hw_locked_memory', None)
+        if target_version < (1, 32):
+            primitive.pop('hw_ephemeral_encryption', None)
+            primitive.pop('hw_ephemeral_encryption_format', None)
+        if target_version < (1, 31):
+            primitive.pop('hw_emulation_architecture', None)
+        if target_version < (1, 30):
+            base.raise_on_too_new_values(
+                target_version, primitive,
+                'hw_video_model', (fields.VideoModel.BOCHS,))
+        if target_version < (1, 29):
+            primitive.pop('hw_input_bus', None)
+        if target_version < (1, 28):
+            base.raise_on_too_new_values(
+                target_version, primitive,
+                'hw_pci_numa_affinity_policy',
+                (fields.PCINUMAAffinityPolicy.SOCKET,))
+        if target_version < (1, 27):
+            primitive.pop('hw_tpm_model', None)
+            primitive.pop('hw_tpm_version', None)
+        if target_version < (1, 26):
+            base.raise_on_too_new_values(
+                target_version, primitive,
+                'hw_cpu_policy', (fields.CPUAllocationPolicy.MIXED,))
+        if target_version < (1, 25):
+            primitive.pop('hw_pci_numa_affinity_policy', None)
+        if target_version < (1, 24):
+            primitive.pop('hw_mem_encryption', None)
+        if target_version < (1, 23):
+            primitive.pop('hw_pmu', None)
+        # NOTE(sean-k-mooney): unlike other nova object we version this object
+        # when composed object are updated.
+        if target_version < (1, 22):
+            base.raise_on_too_new_values(
+                target_version, primitive,
+                'hw_video_model',
+                (fields.VideoModel.GOP,
+                 fields.VideoModel.VIRTIO,
+                 fields.VideoModel.NONE))
+        if target_version < (1, 21):
+            primitive.pop('hw_time_hpet', None)
+        if target_version < (1, 20):
+            primitive.pop('traits_required', None)
+        if target_version < (1, 19):
+            primitive.pop('img_hide_hypervisor_id', None)
+        if target_version < (1, 16) and 'hw_watchdog_action' in primitive:
+            # Check to see if hw_watchdog_action was set to 'disabled' and if
+            # so, remove it since not specifying it is the same behavior.
+            if primitive['hw_watchdog_action'] == \
+                    fields.WatchdogAction.DISABLED:
+                primitive.pop('hw_watchdog_action')
+        if target_version < (1, 15):
+            primitive.pop('hw_rescue_bus', None)
+            primitive.pop('hw_rescue_device', None)
+        if target_version < (1, 14):
+            primitive.pop('hw_pointer_model', None)
+        if target_version < (1, 13):
+            primitive.pop('os_secure_boot', None)
+        if target_version < (1, 11):
+            primitive.pop('hw_firmware_type', None)
+        if target_version < (1, 10):
+            primitive.pop('hw_cpu_realtime_mask', None)
+        if target_version < (1, 9):
+            primitive.pop('hw_cpu_thread_policy', None)
+        if target_version < (1, 7):
+            primitive.pop('img_config_drive', None)
+        if target_version < (1, 5):
+            primitive.pop('os_admin_user', None)
+        if target_version < (1, 4):
+            primitive.pop('hw_vif_multiqueue_enabled', None)
+        if target_version < (1, 2):
+            primitive.pop('img_hv_type', None)
+            primitive.pop('img_hv_requested_version', None)
+        if target_version < (1, 1):
+            primitive.pop('os_require_quiesce', None)
+
+        if target_version < (1, 6):
+            base.raise_on_too_new_values(
+                target_version, primitive,
+                'hw_disk_bus', (fields.DiskBus.LXC, fields.DiskBus.UML))
 
     # Maximum number of NUMA nodes permitted for the guest topology
     NUMA_NODES_MAX = 128
@@ -114,10 +337,15 @@ class ImageMetaProps(base.NovaObject):
     # 'hw_' - settings affecting the guest virtual machine hardware
     # 'img_' - settings affecting the use of images by the compute node
     # 'os_' - settings affecting the guest operating system setup
+    # 'traits_required' - The required traits associated with the image
 
     fields = {
         # name of guest hardware architecture eg i686, x86_64, ppc64
         'hw_architecture': fields.ArchitectureField(),
+
+        # hw_architecture field is leveraged for checks against physical nodes
+        # name of desired emulation architecture eg i686, x86_64, ppc64
+        'hw_emulation_architecture': fields.ArchitectureField(),
 
         # used to decide to expand root disk partition and fs to full size of
         # root disk
@@ -144,8 +372,16 @@ class ImageMetaProps(base.NovaObject):
         # maximum number of CPU threads per core
         'hw_cpu_max_threads': fields.IntegerField(),
 
-        # CPU thread allocation policy
+        # CPU allocation policy
         'hw_cpu_policy': fields.CPUAllocationPolicyField(),
+
+        # CPU thread allocation policy
+        'hw_cpu_thread_policy': fields.CPUThreadAllocationPolicyField(),
+
+        # CPU mask indicates which vCPUs will have realtime enable,
+        # example ^0-1 means that all vCPUs except 0 and 1 will have a
+        # realtime policy.
+        'hw_cpu_realtime_mask': fields.StringField(),
 
         # preferred number of CPU threads per core
         'hw_cpu_threads': fields.IntegerField(),
@@ -163,15 +399,36 @@ class ImageMetaProps(base.NovaObject):
         # name of the floppy disk bus to use eg fd, scsi, ide
         'hw_floppy_bus': fields.DiskBusField(),
 
+        # This indicates the guest needs UEFI firmware
+        'hw_firmware_type': fields.FirmwareTypeField(),
+
+        # This indicates the guest needs stateless firmware
+        'hw_firmware_stateless': fields.FlexibleBooleanField(),
+
+        # name of the input bus type to use, e.g. usb, virtio
+        'hw_input_bus': fields.InputBusField(),
+
         # boolean - used to trigger code to inject networking when booting a CD
         # image with a network boot image
         'hw_ipxe_boot': fields.FlexibleBooleanField(),
+
+        # string - make sure ``locked`` element is present in the
+        # ``memoryBacking``.
+        'hw_locked_memory': fields.FlexibleBooleanField(),
 
         # There are sooooooooooo many possible machine types in
         # QEMU - several new ones with each new release - that it
         # is not practical to enumerate them all. So we use a free
         # form string
         'hw_machine_type': fields.StringField(),
+
+        # boolean indicating that the guest needs to be booted with
+        # encrypted memory
+        'hw_mem_encryption': fields.FlexibleBooleanField(),
+
+        # string = used to determine the CPU feature for guest memory
+        # encryption
+        'hw_mem_encryption_model': fields.MemEncryptionModelField(),
 
         # One of the magic strings 'small', 'any', 'large'
         # or an explicit page size in KB (eg 4, 2048, ...)
@@ -188,11 +445,36 @@ class ImageMetaProps(base.NovaObject):
         # list value indicates the memory size of that node.
         'hw_numa_mem': fields.ListOfIntegersField(),
 
+        # Enum field to specify pci device NUMA affinity.
+        'hw_pci_numa_affinity_policy': fields.PCINUMAAffinityPolicyField(),
+
+        # Generic property to specify the pointer model type.
+        'hw_pointer_model': fields.PointerModelField(),
+
+        # boolean 'true' or 'false' to enable virtual performance
+        # monitoring unit (vPMU).
+        'hw_pmu': fields.FlexibleBooleanField(),
+
         # boolean 'yes' or 'no' to enable QEMU guest agent
         'hw_qemu_guest_agent': fields.FlexibleBooleanField(),
 
+        # name of the rescue bus to use with the associated rescue device.
+        'hw_rescue_bus': fields.DiskBusField(),
+
+        # name of rescue device to use.
+        'hw_rescue_device': fields.BlockDeviceTypeField(),
+
         # name of the RNG device type eg virtio
+        # NOTE(kchamart): Although this is currently not used anymore,
+        # we should not remove / deprecate it yet, as we are likely to
+        # extend this field to allow two more values to support "VirtIO
+        # transitional/non-transitional devices" (refer to the note in
+        # RNGModel() class in nova/objects/fields.py), and thus expose
+        # to the user again.
         'hw_rng_model': fields.RNGModelField(),
+
+        # boolean 'true' or 'false' to enable HPET
+        'hw_time_hpet': fields.FlexibleBooleanField(),
 
         # number of serial ports to create
         'hw_serial_port_count': fields.IntegerField(),
@@ -209,12 +491,49 @@ class ImageMetaProps(base.NovaObject):
         # name of a NIC device model eg virtio, e1000, rtl8139
         'hw_vif_model': fields.VIFModelField(),
 
+        # name of IOMMU device model eg virtio, intel, smmuv3, or auto
+        'hw_viommu_model': fields.VIOMMUModelField(),
+
         # "xen" vs "hvm"
         'hw_vm_mode': fields.VMModeField(),
 
         # action to take when watchdog device fires eg reset, poweroff, pause,
         # none
         'hw_watchdog_action': fields.WatchdogActionField(),
+
+        # boolean - If true, this will enable the virtio-multiqueue feature
+        'hw_vif_multiqueue_enabled': fields.FlexibleBooleanField(),
+
+        # name of emulated TPM model to use.
+        'hw_tpm_model': fields.TPMModelField(),
+        # version of emulated TPM to use.
+        'hw_tpm_version': fields.TPMVersionField(),
+
+        # boolean - if true will enable ephemeral encryption for instance
+        'hw_ephemeral_encryption': fields.FlexibleBooleanField(),
+        # encryption format to be used when ephemeral encryption is enabled
+        'hw_ephemeral_encryption_format':
+            fields.BlockDeviceEncryptionFormatTypeField(),
+        # encryption secret uuid string for passphrase in the image
+        'hw_ephemeral_encryption_secret_uuid': fields.UUIDField(),
+
+        # boolean - If true, this will enable the virtio packed ring feature
+        'hw_virtio_packed_ring': fields.FlexibleBooleanField(),
+
+        # Control mode for the physical memory address bit of Libvirt guests.
+        'hw_maxphysaddr_mode': fields.MaxPhysAddrModeField(),
+
+        # Control bits for the physical memory address bit of Libvirt guests.
+        'hw_maxphysaddr_bits': fields.IntegerField(),
+
+        # Name of sound device model to use.
+        'hw_sound_model': fields.SoundModelField(),
+
+        # Name of the USB Controller model to use.
+        'hw_usb_model': fields.USBControllerModelField(),
+
+        # Number of USB redirection ports to add to the guest.
+        'hw_redirected_usb_ports': fields.IntegerField(),
 
         # if true download using bittorrent
         'img_bittorrent': fields.FlexibleBooleanField(),
@@ -242,13 +561,22 @@ class ImageMetaProps(base.NovaObject):
         # Compression level for images. (1-9)
         'img_compression_level': fields.IntegerField(),
 
+        # hypervisor supported version, eg. '>=2.6'
+        'img_hv_requested_version': fields.VersionPredicateField(),
+
+        # type of the hypervisor, eg kvm, ironic, xen
+        'img_hv_type': fields.HVTypeField(),
+
+        # Whether the image needs/expected config drive
+        'img_config_drive': fields.ConfigDrivePolicyField(),
+
         # boolean flag to set space-saving or performance behavior on the
         # Datastore
         'img_linked_clone': fields.FlexibleBooleanField(),
 
         # Image mappings - related to Block device mapping data - mapping
         # of virtual image names to device names. This could be represented
-        # as a formatl data type, but is left as dict for same reason as
+        # as a formal data type, but is left as dict for same reason as
         # img_block_device_mapping field. It would arguably make sense for
         # the two to be combined into a single field and data type in the
         # future.
@@ -266,6 +594,25 @@ class ImageMetaProps(base.NovaObject):
         # integer value 1
         'img_version': fields.IntegerField(),
 
+        # base64 of encoding of image signature
+        'img_signature': fields.StringField(),
+
+        # string indicating hash method used to compute image signature
+        'img_signature_hash_method': fields.ImageSignatureHashTypeField(),
+
+        # string indicating Castellan uuid of certificate
+        # used to compute the image's signature
+        'img_signature_certificate_uuid': fields.UUIDField(),
+
+        # string indicating type of key used to compute image signature
+        'img_signature_key_type': fields.ImageSignatureKeyTypeField(),
+
+        # boolean - hide hypervisor signature on instance
+        'img_hide_hypervisor_id': fields.FlexibleBooleanField(),
+
+        # string of username with admin privileges
+        'os_admin_user': fields.StringField(),
+
         # string of boot time command line arguments for the guest kernel
         'os_command_line': fields.StringField(),
 
@@ -280,6 +627,13 @@ class ImageMetaProps(base.NovaObject):
         # or snapshot operation will be denied
         'os_require_quiesce': fields.FlexibleBooleanField(),
 
+        # Secure Boot feature will be enabled by setting the "os_secure_boot"
+        # image property to "required". Other options can be: "disabled" or
+        # "optional".
+        # "os:secure_boot" flavor extra spec value overrides the image property
+        # value.
+        'os_secure_boot': fields.SecureBootField(),
+
         # boolean - if using agent don't inject files, assume someone else is
         # doing that (cloud-init)
         'os_skip_agent_inject_files_at_boot': fields.FlexibleBooleanField(),
@@ -292,6 +646,13 @@ class ImageMetaProps(base.NovaObject):
         # is a fairly generic type. For a detailed type consider os_distro
         # instead
         'os_type': fields.OSTypeField(),
+
+        # The required traits associated with the image. Traits are expected to
+        # be defined as starting with `trait:` like below:
+        # trait:HW_CPU_X86_AVX2=required
+        # for trait in image_meta.traits_required:
+        # will yield trait strings such as 'HW_CPU_X86_AVX2'
+        'traits_required': fields.ListOfStringsField(),
     }
 
     # The keys are the legacy property names and
@@ -318,6 +679,8 @@ class ImageMetaProps(base.NovaObject):
         'block_device_mapping': 'img_block_device_mapping',
         'bdm_v2': 'img_bdm_v2',
         'root_device_name': 'img_root_device_name',
+        'hypervisor_version_requires': 'img_hv_requested_version',
+        'hypervisor_type': 'img_hv_type',
     }
 
     # TODO(berrange): Need to run this from a data migration
@@ -334,7 +697,7 @@ class ImageMetaProps(base.NovaObject):
         vmware_adaptertype = image_props.get("vmware_adaptertype")
         if vmware_adaptertype == "ide":
             setattr(self, "hw_disk_bus", "ide")
-        elif vmware_adaptertype is not None:
+        elif vmware_adaptertype:
             setattr(self, "hw_disk_bus", "scsi")
             setattr(self, "hw_scsi_model", vmware_adaptertype)
 
@@ -376,16 +739,26 @@ class ImageMetaProps(base.NovaObject):
             elif key == "hw_numa_cpus":
                 self._set_numa_cpus(image_props)
             else:
-                if key not in image_props:
+                # traits_required will be populated by
+                # _set_attr_from_trait_names
+                if key not in image_props or key == "traits_required":
                     continue
 
                 setattr(self, key, image_props[key])
+
+    def _set_attr_from_trait_names(self, image_props):
+        for trait in [str(k[6:]) for k, v in image_props.items()
+                      if str(k).startswith("trait:") and
+                      str(v) == 'required']:
+            if 'traits_required' not in self:
+                self.traits_required = []
+            self.traits_required.append(trait)
 
     @classmethod
     def from_dict(cls, image_props):
         """Create instance from image properties dict
 
-        :param image_props: dictionary of image metdata properties
+        :param image_props: dictionary of image metadata properties
 
         Creates a new object instance, initializing from a
         dictionary of image metadata properties
@@ -400,7 +773,13 @@ class ImageMetaProps(base.NovaObject):
         # associated with the current name takes priority
         obj._set_attr_from_legacy_names(image_props)
         obj._set_attr_from_current_names(image_props)
+        obj._set_attr_from_trait_names(image_props)
+
         return obj
+
+    def to_dict(self):
+        """Returns a dictionary of image properties that are set."""
+        return base.obj_to_primitive(self)
 
     def get(self, name, defvalue=None):
         """Get the value of an attribute

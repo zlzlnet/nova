@@ -12,9 +12,14 @@
 
 from oslo_serialization import jsonutils
 
-from nova import db
+from nova.db.main import api as db
 from nova.objects import base
 from nova.objects import fields
+
+__all__ = [
+    'VirtCPUFeature',
+    'VirtCPUModel',
+]
 
 
 @base.NovaObjectRegistry.register
@@ -34,11 +39,6 @@ class VirtCPUModel(base.NovaObject):
         'match': fields.CPUMatchField(nullable=True),
     }
 
-    obj_relationships = {
-        'topology': [('1.0', '1.0')],
-        'features': [('1.0', '1.0')],
-    }
-
     def obj_load_attr(self, attrname):
         setattr(self, attrname, None)
 
@@ -49,7 +49,8 @@ class VirtCPUModel(base.NovaObject):
     def from_json(cls, jsonstr):
         return cls.obj_from_primitive(jsonutils.loads(jsonstr))
 
-    @base.remotable_classmethod
+    @classmethod
+    @base.remotable
     def get_by_instance_uuid(cls, context, instance_uuid):
         db_extra = db.instance_extra_get_by_instance_uuid(
                 context, instance_uuid, columns=['vcpu_model'])
@@ -60,7 +61,7 @@ class VirtCPUModel(base.NovaObject):
 
 @base.NovaObjectRegistry.register
 class VirtCPUFeature(base.NovaObject):
-    VERSION = VirtCPUModel.VERSION
+    VERSION = '1.0'
 
     fields = {
         'policy': fields.CPUFeaturePolicyField(nullable=True),

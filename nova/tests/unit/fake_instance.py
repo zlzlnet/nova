@@ -13,9 +13,9 @@
 #    under the License.
 
 import datetime
-import uuid
 
 from oslo_serialization import jsonutils
+from oslo_utils import uuidutils
 
 from nova import objects
 from nova.objects import fields
@@ -43,11 +43,11 @@ def fake_db_secgroups(instance, names):
 
 
 def fake_db_instance(**updates):
-    if 'instance_type' in updates:
-        if isinstance(updates['instance_type'], objects.Flavor):
-            flavor = updates['instance_type']
+    if 'flavor' in updates:
+        if isinstance(updates['flavor'], objects.Flavor):
+            flavor = updates['flavor']
         else:
-            flavor = objects.Flavor(**updates['instance_type'])
+            flavor = objects.Flavor(**updates['flavor'])
         flavorinfo = jsonutils.dumps({
             'cur': flavor.obj_to_primitive(),
             'old': None,
@@ -58,7 +58,7 @@ def fake_db_instance(**updates):
     db_instance = {
         'id': 1,
         'deleted': False,
-        'uuid': str(uuid.uuid4()),
+        'uuid': uuidutils.generate_uuid(),
         'user_id': 'fake-user',
         'project_id': 'fake-project',
         'host': 'fake-host',
@@ -73,8 +73,12 @@ def fake_db_instance(**updates):
                   'flavor': flavorinfo,
                   'numa_topology': None,
                   'vcpu_model': None,
+                  'device_metadata': None,
+                  'trusted_certs': None,
+                  'resources': None,
                  },
-        'tags': []
+        'tags': [],
+        'services': []
         }
 
     for name, field in objects.Instance.fields.items():
@@ -84,7 +88,7 @@ def fake_db_instance(**updates):
             db_instance[name] = None
         elif field.default != fields.UnspecifiedDefault:
             db_instance[name] = field.default
-        elif name in ['flavor', 'ec2_ids']:
+        elif name in ['flavor', 'ec2_ids', 'keypairs']:
             pass
         else:
             raise Exception('fake_db_instance needs help with %s' % name)
@@ -99,7 +103,9 @@ def fake_db_instance(**updates):
     return db_instance
 
 
-def fake_instance_obj(context, **updates):
+def fake_instance_obj(context, obj_instance_class=None, **updates):
+    if obj_instance_class is None:
+        obj_instance_class = objects.Instance
     expected_attrs = updates.pop('expected_attrs', None)
     flavor = updates.pop('flavor', None)
     if not flavor:
@@ -113,15 +119,28 @@ def fake_instance_obj(context, **updates):
                                 is_public=True,
                                 extra_specs={},
                                 projects=[])
-        flavor.obj_reset_changes()
-    inst = objects.Instance._from_db_object(context,
-               objects.Instance(), fake_db_instance(**updates),
+    inst = obj_instance_class._from_db_object(context,
+               obj_instance_class(), fake_db_instance(**updates),
                expected_attrs=expected_attrs)
+    inst.keypairs = objects.KeyPairList(objects=[])
+    inst.tags = objects.TagList()
     if flavor:
         inst.flavor = flavor
+        # This is needed for instance quota counting until we have the
+        # ability to count allocations in placement.
+        if 'vcpus' in flavor and 'vcpus' not in updates:
+            inst.vcpus = flavor.vcpus
+        if 'memory_mb' in flavor and 'memory_mb' not in updates:
+            inst.memory_mb = flavor.memory_mb
+        if ('instance_type_id' not in inst or
+                inst.instance_type_id is None and
+                'id' in flavor):
+            inst.instance_type_id = flavor.id
     inst.old_flavor = None
     inst.new_flavor = None
-    inst.obj_reset_changes()
+    inst.resources = None
+    inst.migration_context = None
+    inst.obj_reset_changes(recursive=True)
     return inst
 
 

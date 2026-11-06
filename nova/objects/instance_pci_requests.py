@@ -11,51 +11,79 @@
 #    under the License.
 
 from oslo_serialization import jsonutils
+from oslo_utils import versionutils
 
-from nova import db
+from nova.db.main import api as db
 from nova.objects import base
 from nova.objects import fields
-from nova import utils
+
+__all__ = [
+    'InstancePCIRequest',
+    'InstancePCIRequests',
+]
 
 
-# TODO(berrange): Remove NovaObjectDictCompat
 @base.NovaObjectRegistry.register
-class InstancePCIRequest(base.NovaObject,
-                         base.NovaObjectDictCompat):
+class InstancePCIRequest(base.NovaObject):
     # Version 1.0: Initial version
-    # Version 1.1: Add request_id
-    VERSION = '1.1'
+    # Version 1.1: Added request_id field
+    # Version 1.2: Added numa_policy field
+    # Version 1.3: Added requester_id field
+    # Version 1.4: Added 'socket' to numa_policy field
+    VERSION = '1.4'
+
+    # Possible sources for a PCI request:
+    # FLAVOR_ALIAS : Request originated from a flavor alias.
+    # NEUTRON_PORT : Request originated from a neutron port.
+    FLAVOR_ALIAS = 0
+    NEUTRON_PORT = 1
 
     fields = {
         'count': fields.IntegerField(),
         'spec': fields.ListOfDictOfNullableStringsField(),
         'alias_name': fields.StringField(nullable=True),
-        # A stashed request related to a resize, not current
+        # Note(moshele): is_new is deprecated and should be removed
+        # on major version bump
         'is_new': fields.BooleanField(default=False),
         'request_id': fields.UUIDField(nullable=True),
+        'requester_id': fields.StringField(nullable=True),
+        'numa_policy': fields.PCINUMAAffinityPolicyField(nullable=True),
     }
+
+    @property
+    def source(self):
+        # PCI requests originate from two sources: instance flavor alias and
+        # neutron SR-IOV ports.
+        # SR-IOV ports pci_request don't have an alias_name.
+        return (InstancePCIRequest.NEUTRON_PORT if self.alias_name is None
+                else InstancePCIRequest.FLAVOR_ALIAS)
 
     def obj_load_attr(self, attr):
         setattr(self, attr, None)
 
-    # NOTE(danms): The dict that this object replaces uses a key of 'new'
-    # so we translate it here to our more appropropriately-named 'is_new'.
-    # This is not something that affects the obect version, so we could
-    # remove this later when all dependent code is fixed.
-    @property
-    def new(self):
-        return self.is_new
-
     def obj_make_compatible(self, primitive, target_version):
-        target_version = utils.convert_version_to_tuple(target_version)
+        super(InstancePCIRequest, self).obj_make_compatible(primitive,
+                                                            target_version)
+        target_version = versionutils.convert_version_to_tuple(target_version)
+        if target_version < (1, 3) and 'requester_id' in primitive:
+            del primitive['requester_id']
+        if target_version < (1, 2) and 'numa_policy' in primitive:
+            del primitive['numa_policy']
         if target_version < (1, 1) and 'request_id' in primitive:
             del primitive['request_id']
 
+    def is_live_migratable(self):
+        return (
+            "spec" in self and
+            self.spec is not None and
+            all(
+                spec.get("live_migratable") == "true" for spec in self.spec
+            )
+        )
 
-# TODO(berrange): Remove NovaObjectDictCompat
+
 @base.NovaObjectRegistry.register
-class InstancePCIRequests(base.NovaObject,
-                          base.NovaObjectDictCompat):
+class InstancePCIRequests(base.NovaObject):
     # Version 1.0: Initial version
     # Version 1.1: InstancePCIRequest 1.1
     VERSION = '1.1'
@@ -64,18 +92,6 @@ class InstancePCIRequests(base.NovaObject,
         'instance_uuid': fields.UUIDField(),
         'requests': fields.ListOfObjectsField('InstancePCIRequest'),
     }
-
-    obj_relationships = {
-        'requests': [('1.0', '1.0'), ('1.1', '1.1')],
-    }
-
-    def obj_make_compatible(self, primitive, target_version):
-        target_version = utils.convert_version_to_tuple(target_version)
-        if target_version < (1, 1) and 'requests' in primitive:
-            for index, request in enumerate(self.requests):
-                request.obj_make_compatible(
-                    primitive['requests'][index]['nova_object.data'], '1.0')
-                primitive['requests'][index]['nova_object.version'] = '1.0'
 
     @classmethod
     def obj_from_db(cls, context, instance_uuid, db_requests):
@@ -86,29 +102,28 @@ class InstancePCIRequests(base.NovaObject,
         else:
             requests = []
         for request in requests:
+            # Note(moshele): is_new is deprecated and therefore we load it
+            # with default value of False
             request_obj = InstancePCIRequest(
                 count=request['count'], spec=request['spec'],
-                alias_name=request['alias_name'], is_new=request['is_new'],
-                request_id=request['request_id'])
+                alias_name=request['alias_name'], is_new=False,
+                numa_policy=request.get('numa_policy',
+                                        fields.PCINUMAAffinityPolicy.LEGACY),
+                request_id=request['request_id'],
+                requester_id=request.get('requester_id'))
             request_obj.obj_reset_changes()
             self.requests.append(request_obj)
         self.obj_reset_changes()
         return self
 
-    @base.remotable_classmethod
+    @classmethod
+    @base.remotable
     def get_by_instance_uuid(cls, context, instance_uuid):
         db_pci_requests = db.instance_extra_get_by_instance_uuid(
                 context, instance_uuid, columns=['pci_requests'])
         if db_pci_requests is not None:
             db_pci_requests = db_pci_requests['pci_requests']
         return cls.obj_from_db(context, instance_uuid, db_pci_requests)
-
-    @classmethod
-    def get_by_instance_uuid_and_newness(cls, context, instance_uuid, is_new):
-        requests = cls.get_by_instance_uuid(context, instance_uuid)
-        requests.requests = [x for x in requests.requests
-                             if x.new == is_new]
-        return requests
 
     @staticmethod
     def _load_legacy_requests(sysmeta_value, is_new=False):
@@ -147,17 +162,16 @@ class InstancePCIRequests(base.NovaObject,
                  'spec': x.spec,
                  'alias_name': x.alias_name,
                  'is_new': x.is_new,
-                 'request_id': x.request_id} for x in self.requests]
+                 'numa_policy': x.numa_policy,
+                 'request_id': x.request_id,
+                 'requester_id': x.requester_id} for x in self.requests]
         return jsonutils.dumps(blob)
 
-    @base.remotable
-    def save(self):
-        blob = self.to_json()
-        db.instance_extra_update_by_uuid(self._context, self.instance_uuid,
-                                         {'pci_requests': blob})
-
-    @classmethod
-    def from_request_spec_instance_props(cls, pci_requests):
-        objs = [InstancePCIRequest(**request)
-            for request in pci_requests['requests']]
-        return cls(requests=objs, instance_uuid=pci_requests['instance_uuid'])
+    def neutron_requests(self):
+        return all(
+            [
+                req
+                for req in self.requests
+                if req.source == InstancePCIRequest.NEUTRON_PORT
+            ]
+        )

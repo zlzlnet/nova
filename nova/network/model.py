@@ -15,45 +15,61 @@
 
 import functools
 
-import eventlet
 import netaddr
 from oslo_serialization import jsonutils
-import six
 
 from nova import exception
 from nova.i18n import _
+from nova import thread_pool_factory
 
-
-def ensure_string_keys(d):
-    # http://bugs.python.org/issue4978
-    return {str(k): v for k, v in six.iteritems(d)}
 
 # Constants for the 'vif_type' field in VIF class
 VIF_TYPE_OVS = 'ovs'
 VIF_TYPE_IVS = 'ivs'
 VIF_TYPE_DVS = 'dvs'
 VIF_TYPE_IOVISOR = 'iovisor'
+# NOTE: No longer supported by Nova libvirt driver
 VIF_TYPE_BRIDGE = 'bridge'
 VIF_TYPE_802_QBG = '802.1qbg'
 VIF_TYPE_802_QBH = '802.1qbh'
 VIF_TYPE_HW_VEB = 'hw_veb'
-VIF_TYPE_MLNX_DIRECT = 'mlnx_direct'
+VIF_TYPE_HYPERV = 'hyperv'
+VIF_TYPE_HOSTDEV = 'hostdev_physical'
+VIF_TYPE_IB_HOSTDEV = 'ib_hostdev'
 VIF_TYPE_MIDONET = 'midonet'
 VIF_TYPE_VHOSTUSER = 'vhostuser'
 VIF_TYPE_VROUTER = 'vrouter'
 VIF_TYPE_OTHER = 'other'
+VIF_TYPE_TAP = 'tap'
+VIF_TYPE_MACVTAP = 'macvtap'
+VIF_TYPE_AGILIO_OVS = 'agilio_ovs'
+VIF_TYPE_BINDING_FAILED = 'binding_failed'
+VIF_TYPE_VIF = 'vif'
+VIF_TYPE_UNBOUND = 'unbound'
+
 
 # Constants for dictionary keys in the 'vif_details' field in the VIF
 # class
 VIF_DETAILS_PORT_FILTER = 'port_filter'
 VIF_DETAILS_OVS_HYBRID_PLUG = 'ovs_hybrid_plug'
 VIF_DETAILS_PHYSICAL_NETWORK = 'physical_network'
+VIF_DETAILS_BRIDGE_NAME = 'bridge_name'
+VIF_DETAILS_OVS_DATAPATH_TYPE = 'datapath_type'
 
-# The following two constants define the SR-IOV related fields in the
-# 'vif_details'. 'profileid' should be used for VIF_TYPE_802_QBH,
-# 'vlan' for VIF_TYPE_HW_VEB
+# The following constant defines an SR-IOV related parameter in the
+# 'vif_details'. 'profileid' should be used for VIF_TYPE_802_QBH
 VIF_DETAILS_PROFILEID = 'profileid'
+
+# The following constant defines an SR-IOV and macvtap related parameter in
+# the 'vif_details'. 'vlan' should be used for VIF_TYPE_HW_VEB or
+# VIF_TYPE_MACVTAP
 VIF_DETAILS_VLAN = 'vlan'
+
+# The following three constants define the macvtap related fields in
+# the 'vif_details'.
+VIF_DETAILS_MACVTAP_SOURCE = 'macvtap_source'
+VIF_DETAILS_MACVTAP_MODE = 'macvtap_mode'
+VIF_DETAILS_PHYS_INTERFACE = 'physical_interface'
 
 # Constants for vhost-user related fields in 'vif_details'.
 # Sets mode on vhost-user socket, valid values are 'client'
@@ -64,12 +80,69 @@ VIF_DETAILS_VHOSTUSER_SOCKET = 'vhostuser_socket'
 # Specifies whether vhost-user socket should be plugged
 # into ovs bridge. Valid values are True and False
 VIF_DETAILS_VHOSTUSER_OVS_PLUG = 'vhostuser_ovs_plug'
+# Specifies whether vhost-user socket should be used to
+# create a fp netdevice interface.
+VIF_DETAILS_VHOSTUSER_FP_PLUG = 'vhostuser_fp_plug'
+# Specifies whether vhost-user socket should be used to
+# create a vrouter netdevice interface
+# TODO(mhenkel): Consider renaming this to be contrail-specific.
+VIF_DETAILS_VHOSTUSER_VROUTER_PLUG = 'vhostuser_vrouter_plug'
+
+# Constants for dictionary keys in the 'vif_details' field that are
+# valid for VIF_TYPE_TAP.
+VIF_DETAILS_TAP_MAC_ADDRESS = 'mac_address'
+
+# Open vSwitch datapath types.
+VIF_DETAILS_OVS_DATAPATH_SYSTEM = 'system'
+VIF_DETAILS_OVS_DATAPATH_NETDEV = 'netdev'
+
+# Specifies whether os-vif should create the TAP device. When True, os-vif
+# will pre-create the TAP device before adding it to OVS, reducing live
+# migration downtime. See bug #2069718.
+VIF_DETAILS_OVS_CREATE_TAP = 'ovs_create_tap'
 
 # Define supported virtual NIC types. VNIC_TYPE_DIRECT and VNIC_TYPE_MACVTAP
 # are used for SR-IOV ports
 VNIC_TYPE_NORMAL = 'normal'
 VNIC_TYPE_DIRECT = 'direct'
 VNIC_TYPE_MACVTAP = 'macvtap'
+VNIC_TYPE_DIRECT_PHYSICAL = 'direct-physical'
+VNIC_TYPE_BAREMETAL = 'baremetal'
+VNIC_TYPE_VIRTIO_FORWARDER = 'virtio-forwarder'
+VNIC_TYPE_VDPA = 'vdpa'
+VNIC_TYPE_ACCELERATOR_DIRECT = 'accelerator-direct'
+VNIC_TYPE_ACCELERATOR_DIRECT_PHYSICAL = 'accelerator-direct-physical'
+VNIC_TYPE_REMOTE_MANAGED = "remote-managed"
+
+# Define list of ports which needs pci request.
+# Note: The macvtap port needs a PCI request as it is a tap interface
+# with VF as the lower physical interface.
+# Note: Currently, VNIC_TYPE_VIRTIO_FORWARDER assumes a 1:1
+# relationship with a VF. This is expected to change in the future.
+# Note:
+# VNIC_TYPE_ACCELERATOR_DIRECT and VNIC_TYPE_ACCELERATOR_DIRECT_PHYSICAL
+# does not need a PCI request, these devices are not tracked by the pci
+# tracker in nova but tracked by cyborg. The scheduling will use the
+# cyborg provided resource request to find a compute with such devices,
+# and the device claiming will be done via binding the cyborg arqs to the
+# selected compute node.
+VNIC_TYPES_SRIOV = (
+    VNIC_TYPE_DIRECT, VNIC_TYPE_MACVTAP, VNIC_TYPE_DIRECT_PHYSICAL,
+    VNIC_TYPE_VIRTIO_FORWARDER, VNIC_TYPE_VDPA, VNIC_TYPE_REMOTE_MANAGED
+)
+
+# Define list of ports which are passthrough to the guest
+# and need a special treatment on snapshot and suspend/resume
+VNIC_TYPES_DIRECT_PASSTHROUGH = (
+    VNIC_TYPE_DIRECT, VNIC_TYPE_DIRECT_PHYSICAL,
+    VNIC_TYPE_ACCELERATOR_DIRECT, VNIC_TYPE_ACCELERATOR_DIRECT_PHYSICAL,
+    VNIC_TYPE_REMOTE_MANAGED, VNIC_TYPE_VDPA
+)
+
+# Define list of ports which contains devices managed by cyborg.
+VNIC_TYPES_ACCELERATOR = (
+    VNIC_TYPE_ACCELERATOR_DIRECT, VNIC_TYPE_ACCELERATOR_DIRECT_PHYSICAL
+)
 
 # Constants for the 'vif_model' values
 VIF_MODEL_VIRTIO = 'virtio'
@@ -80,6 +153,8 @@ VIF_MODEL_E1000 = 'e1000'
 VIF_MODEL_E1000E = 'e1000e'
 VIF_MODEL_NETFRONT = 'netfront'
 VIF_MODEL_SPAPR_VLAN = 'spapr-vlan'
+VIF_MODEL_LAN9118 = 'lan9118'
+VIF_MODEL_IGB = 'igb'
 
 VIF_MODEL_SRIOV = 'sriov'
 VIF_MODEL_VMXNET = 'vmxnet'
@@ -94,9 +169,23 @@ VIF_MODEL_ALL = (
     VIF_MODEL_E1000E,
     VIF_MODEL_NETFRONT,
     VIF_MODEL_SPAPR_VLAN,
+    VIF_MODEL_LAN9118,
     VIF_MODEL_SRIOV,
     VIF_MODEL_VMXNET,
     VIF_MODEL_VMXNET3,
+    VIF_MODEL_IGB,
+)
+
+# these types have been leaked to guests in network_data.json
+LEGACY_EXPOSED_VIF_TYPES = (
+    VIF_TYPE_BRIDGE,
+    VIF_TYPE_DVS,
+    VIF_TYPE_HW_VEB,
+    VIF_TYPE_HYPERV,
+    VIF_TYPE_OVS,
+    VIF_TYPE_TAP,
+    VIF_TYPE_VHOSTUSER,
+    VIF_TYPE_VIF,
 )
 
 # Constant for max length of network interface names
@@ -107,8 +196,9 @@ NIC_NAME_LEN = 14
 
 class Model(dict):
     """Defines some necessary structures for most of the network models."""
+
     def __repr__(self):
-        return self.__class__.__name__ + '(' + dict.__repr__(self) + ')'
+        return jsonutils.dumps(self)
 
     def _set_meta(self, kwargs):
         # pull meta out of kwargs if it's there
@@ -123,6 +213,7 @@ class Model(dict):
 
 class IP(Model):
     """Represents an IP address in Nova."""
+
     def __init__(self, address=None, type=None, **kwargs):
         super(IP, self).__init__()
 
@@ -157,12 +248,13 @@ class IP(Model):
     @classmethod
     def hydrate(cls, ip):
         if ip:
-            return cls(**ensure_string_keys(ip))
+            return cls(**ip)
         return None
 
 
 class FixedIP(IP):
     """Represents a Fixed IP address in Nova."""
+
     def __init__(self, floating_ips=None, **kwargs):
         super(FixedIP, self).__init__(**kwargs)
         self['floating_ips'] = floating_ips or []
@@ -179,7 +271,7 @@ class FixedIP(IP):
 
     @staticmethod
     def hydrate(fixed_ip):
-        fixed_ip = FixedIP(**ensure_string_keys(fixed_ip))
+        fixed_ip = FixedIP(**fixed_ip)
         fixed_ip['floating_ips'] = [IP.hydrate(floating_ip)
                                    for floating_ip in fixed_ip['floating_ips']]
         return fixed_ip
@@ -194,24 +286,27 @@ class FixedIP(IP):
 
 class Route(Model):
     """Represents an IP Route in Nova."""
+
     def __init__(self, cidr=None, gateway=None, interface=None, **kwargs):
         super(Route, self).__init__()
 
         self['cidr'] = cidr
         self['gateway'] = gateway
+        # FIXME(mriedem): Is this actually used? It's never set.
         self['interface'] = interface
 
         self._set_meta(kwargs)
 
     @classmethod
     def hydrate(cls, route):
-        route = cls(**ensure_string_keys(route))
+        route = cls(**route)
         route['gateway'] = IP.hydrate(route['gateway'])
         return route
 
 
 class Subnet(Model):
     """Represents a Subnet in Nova."""
+
     def __init__(self, cidr=None, dns=None, gateway=None, ips=None,
                  routes=None, **kwargs):
         super(Subnet, self).__init__()
@@ -248,12 +343,12 @@ class Subnet(Model):
             self['ips'].append(ip)
 
     def as_netaddr(self):
-        """Convience function to get cidr as a netaddr object."""
+        """Convenient function to get cidr as a netaddr object."""
         return netaddr.IPNetwork(self['cidr'])
 
     @classmethod
     def hydrate(cls, subnet):
-        subnet = cls(**ensure_string_keys(subnet))
+        subnet = cls(**subnet)
         subnet['dns'] = [IP.hydrate(dns) for dns in subnet['dns']]
         subnet['ips'] = [FixedIP.hydrate(ip) for ip in subnet['ips']]
         subnet['routes'] = [Route.hydrate(route) for route in subnet['routes']]
@@ -263,6 +358,7 @@ class Subnet(Model):
 
 class Network(Model):
     """Represents a Network in Nova."""
+
     def __init__(self, id=None, bridge=None, label=None,
                  subnets=None, **kwargs):
         super(Network, self).__init__()
@@ -281,7 +377,7 @@ class Network(Model):
     @classmethod
     def hydrate(cls, network):
         if network:
-            network = cls(**ensure_string_keys(network))
+            network = cls(**network)
             network['subnets'] = [Subnet.hydrate(subnet)
                                   for subnet in network['subnets']]
         return network
@@ -298,6 +394,8 @@ class VIF8021QbgParams(Model):
     """Represents the parameters for a 802.1qbg VIF."""
 
     def __init__(self, managerid, typeid, typeidversion, instanceid):
+        super(VIF8021QbgParams, self).__init__()
+
         self['managerid'] = managerid
         self['typeid'] = typeid
         self['typeidversion'] = typeidversion
@@ -308,16 +406,20 @@ class VIF8021QbhParams(Model):
     """Represents the parameters for a 802.1qbh VIF."""
 
     def __init__(self, profileid):
+        super(VIF8021QbhParams, self).__init__()
+
         self['profileid'] = profileid
 
 
 class VIF(Model):
     """Represents a Virtual Interface in Nova."""
+
     def __init__(self, id=None, address=None, network=None, type=None,
                  details=None, devname=None, ovs_interfaceid=None,
                  qbh_params=None, qbg_params=None, active=False,
                  vnic_type=VNIC_TYPE_NORMAL, profile=None,
-                 preserve_on_delete=False, **kwargs):
+                 preserve_on_delete=False, delegate_create=False,
+                 **kwargs):
         super(VIF, self).__init__()
 
         self['id'] = id
@@ -334,6 +436,7 @@ class VIF(Model):
         self['vnic_type'] = vnic_type
         self['profile'] = profile
         self['preserve_on_delete'] = preserve_on_delete
+        self['delegate_create'] = delegate_create
 
         self._set_meta(kwargs)
 
@@ -341,15 +444,18 @@ class VIF(Model):
         keys = ['id', 'address', 'network', 'vnic_type',
                 'type', 'profile', 'details', 'devname',
                 'ovs_interfaceid', 'qbh_params', 'qbg_params',
-                'active', 'preserve_on_delete']
+                'active', 'preserve_on_delete', 'delegate_create']
         return all(self[k] == other[k] for k in keys)
 
     def __ne__(self, other):
         return not self.__eq__(other)
 
     def fixed_ips(self):
-        return [fixed_ip for subnet in self['network']['subnets']
-                         for fixed_ip in subnet['ips']]
+        if self['network']:
+            return [fixed_ip for subnet in self['network']['subnets']
+                             for fixed_ip in subnet['ips']]
+        else:
+            return []
 
     def floating_ips(self):
         return [floating_ip for fixed_ip in self.fixed_ips()
@@ -377,7 +483,7 @@ class VIF(Model):
         """
         if self['network']:
             # remove unnecessary fields on fixed_ips
-            ips = [IP(**ensure_string_keys(ip)) for ip in self.fixed_ips()]
+            ips = [IP(**ip) for ip in self.fixed_ips()]
             for ip in ips:
                 # remove floating ips from IP, since this is a flat structure
                 # of all IPs
@@ -403,9 +509,12 @@ class VIF(Model):
 
     @classmethod
     def hydrate(cls, vif):
-        vif = cls(**ensure_string_keys(vif))
+        vif = cls(**vif)
         vif['network'] = Network.hydrate(vif['network'])
         return vif
+
+    def has_allocation(self):
+        return self['profile'] and bool(self['profile'].get('allocation'))
 
 
 def get_netmask(ip, subnet):
@@ -430,20 +539,24 @@ class NetworkInfo(list):
 
     @classmethod
     def hydrate(cls, network_info):
-        if isinstance(network_info, six.string_types):
+        if isinstance(network_info, str):
             network_info = jsonutils.loads(network_info)
         return cls([VIF.hydrate(vif) for vif in network_info])
+
+    def wait(self, do_raise=True):
+        """Wait for asynchronous call to finish."""
+        # There is no asynchronous call for this class, so this is a no-op
+        # here, but subclasses may override to provide asynchronous
+        # capabilities. Must be defined here in the parent class so that code
+        # which works with both parent and subclass types can reference this
+        # method.
+        pass
 
     def json(self):
         return jsonutils.dumps(self)
 
-    def wait(self, do_raise=True):
-        """A no-op method.
-
-        This is useful to avoid type checking when NetworkInfo might be
-        subclassed with NetworkInfoAsyncWrapper.
-        """
-        pass
+    def has_port_with_allocation(self):
+        return any(vif.has_allocation() for vif in self)
 
 
 class NetworkInfoAsyncWrapper(NetworkInfo):
@@ -468,7 +581,9 @@ class NetworkInfoAsyncWrapper(NetworkInfo):
     """
 
     def __init__(self, async_method, *args, **kwargs):
-        self._gt = eventlet.spawn(async_method, *args, **kwargs)
+        super(NetworkInfoAsyncWrapper, self).__init__()
+
+        self._future = thread_pool_factory.spawn(async_method, *args, **kwargs)
         methods = ['json', 'fixed_ips', 'floating_ips']
         for method in methods:
             fn = getattr(self, method)
@@ -502,17 +617,17 @@ class NetworkInfoAsyncWrapper(NetworkInfo):
         return self._sync_wrapper(fn, *args, **kwargs)
 
     def wait(self, do_raise=True):
-        """Wait for async call to finish."""
-        if self._gt is not None:
+        """Wait for asynchronous call to finish."""
+        if self._future is not None:
             try:
                 # NOTE(comstud): This looks funky, but this object is
                 # subclassed from list.  In other words, 'self' is really
                 # just a list with a bunch of extra methods.  So this
                 # line just replaces the current list (which should be
                 # empty) with the result.
-                self[:] = self._gt.wait()
+                self[:] = self._future.result()
             except Exception:
                 if do_raise:
                     raise
             finally:
-                self._gt = None
+                self._future = None

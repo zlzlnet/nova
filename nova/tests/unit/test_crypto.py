@@ -16,168 +16,27 @@
 Tests for Crypto module.
 """
 
+import io
 import os
-import StringIO
+from unittest import mock
 
-import mock
-from mox3 import mox
+from castellan.common import exception as castellan_exception
+from cryptography.hazmat import backends
+from cryptography.hazmat.primitives import serialization
+import ddt
 from oslo_concurrency import processutils
+from oslo_utils.fixture import uuidsentinel as uuids
 import paramiko
 
+from nova import context as nova_context
 from nova import crypto
-from nova import db
 from nova import exception
+from nova import objects
 from nova import test
 from nova import utils
 
 
-class X509Test(test.TestCase):
-    def test_can_generate_x509(self):
-        with utils.tempdir() as tmpdir:
-            self.flags(ca_path=tmpdir)
-            crypto.ensure_ca_filesystem()
-            _key, cert_str = crypto.generate_x509_cert('fake', 'fake')
-
-            project_cert = crypto.fetch_ca(project_id='fake')
-
-            signed_cert_file = os.path.join(tmpdir, "signed")
-            with open(signed_cert_file, 'w') as keyfile:
-                keyfile.write(cert_str)
-
-            project_cert_file = os.path.join(tmpdir, "project")
-            with open(project_cert_file, 'w') as keyfile:
-                keyfile.write(project_cert)
-
-            enc, err = utils.execute('openssl', 'verify', '-CAfile',
-                    project_cert_file, '-verbose', signed_cert_file)
-            self.assertFalse(err)
-
-    def test_encrypt_decrypt_x509(self):
-        with utils.tempdir() as tmpdir:
-            self.flags(ca_path=tmpdir)
-            project_id = "fake"
-            crypto.ensure_ca_filesystem()
-            cert = crypto.fetch_ca(project_id)
-            public_key = os.path.join(tmpdir, "public.pem")
-            with open(public_key, 'w') as keyfile:
-                keyfile.write(cert)
-            text = "some @#!%^* test text"
-            enc, _err = utils.execute('openssl',
-                                     'rsautl',
-                                     '-certin',
-                                     '-encrypt',
-                                     '-inkey', '%s' % public_key,
-                                     process_input=text)
-            dec = crypto.decrypt_text(project_id, enc)
-            self.assertEqual(text, dec)
-
-    @mock.patch.object(utils, 'execute',
-                       side_effect=processutils.ProcessExecutionError)
-    def test_ensure_ca_filesystem_chdir(self, *args, **kargs):
-        with utils.tempdir() as tmpdir:
-            self.flags(ca_path=tmpdir)
-            start = os.getcwd()
-            self.assertRaises(processutils.ProcessExecutionError,
-                              crypto.ensure_ca_filesystem)
-            self.assertEqual(start, os.getcwd())
-
-
-class RevokeCertsTest(test.TestCase):
-
-    def test_revoke_certs_by_user_and_project(self):
-        user_id = 'test_user'
-        project_id = 2
-        file_name = 'test_file'
-
-        def mock_certificate_get_all_by_user_and_project(context,
-                                                         user_id,
-                                                         project_id):
-
-            return [{"user_id": user_id, "project_id": project_id,
-                                          "file_name": file_name}]
-
-        self.stubs.Set(db, 'certificate_get_all_by_user_and_project',
-                           mock_certificate_get_all_by_user_and_project)
-
-        self.mox.StubOutWithMock(crypto, 'revoke_cert')
-        crypto.revoke_cert(project_id, file_name)
-
-        self.mox.ReplayAll()
-
-        crypto.revoke_certs_by_user_and_project(user_id, project_id)
-
-    def test_revoke_certs_by_user(self):
-        user_id = 'test_user'
-        project_id = 2
-        file_name = 'test_file'
-
-        def mock_certificate_get_all_by_user(context, user_id):
-
-            return [{"user_id": user_id, "project_id": project_id,
-                                          "file_name": file_name}]
-
-        self.stubs.Set(db, 'certificate_get_all_by_user',
-                                    mock_certificate_get_all_by_user)
-
-        self.mox.StubOutWithMock(crypto, 'revoke_cert')
-        crypto.revoke_cert(project_id, mox.IgnoreArg())
-
-        self.mox.ReplayAll()
-
-        crypto.revoke_certs_by_user(user_id)
-
-    def test_revoke_certs_by_project(self):
-        user_id = 'test_user'
-        project_id = 2
-        file_name = 'test_file'
-
-        def mock_certificate_get_all_by_project(context, project_id):
-
-            return [{"user_id": user_id, "project_id": project_id,
-                                          "file_name": file_name}]
-
-        self.stubs.Set(db, 'certificate_get_all_by_project',
-                                    mock_certificate_get_all_by_project)
-
-        self.mox.StubOutWithMock(crypto, 'revoke_cert')
-        crypto.revoke_cert(project_id, mox.IgnoreArg())
-
-        self.mox.ReplayAll()
-
-        crypto.revoke_certs_by_project(project_id)
-
-    @mock.patch.object(utils, 'execute',
-                       side_effect=processutils.ProcessExecutionError)
-    @mock.patch.object(os, 'chdir', return_value=None)
-    def test_revoke_cert_process_execution_error(self, *args, **kargs):
-        self.assertRaises(exception.RevokeCertFailure, crypto.revoke_cert,
-                          2, 'test_file')
-
-    @mock.patch.object(os, 'chdir', mock.Mock(side_effect=OSError))
-    def test_revoke_cert_project_not_found_chdir_fails(self, *args, **kargs):
-        self.assertRaises(exception.ProjectNotFound, crypto.revoke_cert,
-                          2, 'test_file')
-
-
-class CertExceptionTests(test.TestCase):
-    def test_fetch_ca_file_not_found(self):
-        with utils.tempdir() as tmpdir:
-            self.flags(ca_path=tmpdir)
-            self.flags(use_project_ca=True)
-
-            self.assertRaises(exception.CryptoCAFileNotFound, crypto.fetch_ca,
-                              project_id='fake')
-
-    def test_fetch_crl_file_not_found(self):
-        with utils.tempdir() as tmpdir:
-            self.flags(ca_path=tmpdir)
-            self.flags(use_project_ca=True)
-
-            self.assertRaises(exception.CryptoCRLFileNotFound,
-                              crypto.fetch_crl, project_id='fake')
-
-
-class EncryptionTests(test.TestCase):
+class EncryptionTests(test.NoDBTestCase):
     pubkey = ("ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDArtgrfBu/g2o28o+H2ng/crv"
               "zgES91i/NNPPFTOutXelrJ9QiPTPTm+B8yspLsXifmbsmXztNOlBQgQXs6usxb4"
               "fnJKNUZ84Vkp5esbqK/L7eyRqwPvqo7btKBMoAMVX/kUyojMpxb7Ssh6M6Y8cpi"
@@ -220,19 +79,30 @@ e6fCXWECgYEAqgpGvva5kJ1ISgNwnJbwiNw0sOT9BMOsdNZBElf0kJIIy6FMPvap
             with open(sshkey, 'w') as f:
                 f.write(ssh_private_key)
             try:
-                dec, _err = utils.execute('openssl',
-                                          'rsautl',
-                                          '-decrypt',
-                                          '-inkey', sshkey,
-                                          process_input=text)
+                dec, _err = processutils.execute('openssl',
+                                                 'rsautl',
+                                                 '-decrypt',
+                                                 '-inkey', sshkey,
+                                                 process_input=text,
+                                                 binary=True)
                 return dec
             except processutils.ProcessExecutionError as exc:
                 raise exception.DecryptionFailure(reason=exc.stderr)
 
     def test_ssh_encrypt_decrypt_text(self):
+        self._test_ssh_encrypt_decrypt_text(self.pubkey)
+        key_with_spaces_in_comment = self.pubkey.replace('test@test',
+                                                         'Generated by Nova')
+        self._test_ssh_encrypt_decrypt_text(key_with_spaces_in_comment)
+
+    def _test_ssh_encrypt_decrypt_text(self, key):
         enc = crypto.ssh_encrypt_text(self.pubkey, self.text)
-        self.assertNotEqual(enc, self.text)
+        self.assertIsInstance(enc, bytes)
+        # Comparison between bytes and str raises a TypeError
+        # when using python3 -bb
         result = self._ssh_decrypt_text(self.prikey, enc)
+        self.assertIsInstance(result, bytes)
+        result = result.decode('utf-8')
         self.assertEqual(result, self.text)
 
     def test_ssh_encrypt_failure(self):
@@ -240,35 +110,7 @@ e6fCXWECgYEAqgpGvva5kJ1ISgNwnJbwiNw0sOT9BMOsdNZBElf0kJIIy6FMPvap
                           crypto.ssh_encrypt_text, '', self.text)
 
 
-class ConversionTests(test.TestCase):
-    k1 = ("ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAQEA4CqmrxfU7x4sJrubpMNxeglul+d"
-          "ByrsicnvQcHDEjPzdvoz+BaoAG9bjCA5mCeTBIISsVTVXz/hxNeiuBV6LH/UR/c"
-          "27yl53ypN+821ImoexQZcKItdnjJ3gVZlDob1f9+1qDVy63NJ1c+TstkrCTRVeo"
-          "9VyE7RpdSS4UCiBe8Xwk3RkedioFxePrI0Ktc2uASw2G0G2Rl7RN7KZOJbCivfF"
-          "LQMAOu6e+7fYvuE1gxGHHj7dxaBY/ioGOm1W4JmQ1V7AKt19zTBlZKduN8FQMSF"
-          "r35CDlvoWs0+OP8nwlebKNCi/5sdL8qiSLrAcPB4LqdkAf/blNSVA2Yl83/c4lQ"
-          "== test@test")
-
-    k2 = ("-----BEGIN PUBLIC KEY-----\n"
-          "MIIBIDANBgkqhkiG9w0BAQEFAAOCAQ0AMIIBCAKCAQEA4CqmrxfU7x4sJrubpMNx\n"
-          "eglul+dByrsicnvQcHDEjPzdvoz+BaoAG9bjCA5mCeTBIISsVTVXz/hxNeiuBV6L\n"
-          "H/UR/c27yl53ypN+821ImoexQZcKItdnjJ3gVZlDob1f9+1qDVy63NJ1c+TstkrC\n"
-          "TRVeo9VyE7RpdSS4UCiBe8Xwk3RkedioFxePrI0Ktc2uASw2G0G2Rl7RN7KZOJbC\n"
-          "ivfFLQMAOu6e+7fYvuE1gxGHHj7dxaBY/ioGOm1W4JmQ1V7AKt19zTBlZKduN8FQ\n"
-          "MSFr35CDlvoWs0+OP8nwlebKNCi/5sdL8qiSLrAcPB4LqdkAf/blNSVA2Yl83/c4\n"
-          "lQIBIw==\n"
-          "-----END PUBLIC KEY-----\n")
-
-    def test_convert_keys(self):
-        result = crypto.convert_from_sshrsa_to_pkcs8(self.k1)
-        self.assertEqual(result, self.k2)
-
-    def test_convert_failure(self):
-        self.assertRaises(exception.EncryptionFailure,
-                          crypto.convert_from_sshrsa_to_pkcs8, '')
-
-
-class KeyPairTest(test.TestCase):
+class KeyPairTest(test.NoDBTestCase):
     rsa_prv = (
         "-----BEGIN RSA PRIVATE KEY-----\n"
         "MIIEowIBAAKCAQEA5G44D6lEgMj6cRwCPydsMl1VRN2B9DVyV5lmwssGeJClywZM\n"
@@ -332,6 +174,12 @@ class KeyPairTest(test.TestCase):
         "uYREz7iLRCP7BwUt8R+ZWzFZDeOLIWU= Generated-by-Nova"
     )
 
+    ecdsa_pub_with_spaces = (
+        "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAy"
+        "NTYAAABBBG1r4wzPTIjSo78POCq+u/czb8gYK0KvqlmCvcRPrnDWxgLw7y6BX51t"
+        "uYREz7iLRCP7BwUt8R+ZWzFZDeOLIWU= Generated by Nova"
+    )
+
     ecdsa_fp = "16:6a:c9:ec:80:4d:17:3e:d5:3b:6f:c0:d7:15:04:40"
 
     def test_generate_fingerprint(self):
@@ -344,21 +192,26 @@ class KeyPairTest(test.TestCase):
         fingerprint = crypto.generate_fingerprint(self.ecdsa_pub)
         self.assertEqual(self.ecdsa_fp, fingerprint)
 
+        fingerprint = crypto.generate_fingerprint(self.ecdsa_pub_with_spaces)
+        self.assertEqual(self.ecdsa_fp, fingerprint)
+
     def test_generate_key_pair_2048_bits(self):
         (private_key, public_key, fingerprint) = crypto.generate_key_pair()
-        raw_pub = public_key.split(' ')[1].decode('base64')
-        pkey = paramiko.rsakey.RSAKey(None, raw_pub)
-        self.assertEqual(2048, pkey.get_bits())
+        pub_bytes = public_key.encode('utf-8')
+        pkey = serialization.load_ssh_public_key(
+            pub_bytes, backends.default_backend())
+        self.assertEqual(2048, pkey.key_size)
 
     def test_generate_key_pair_1024_bits(self):
         bits = 1024
         (private_key, public_key, fingerprint) = crypto.generate_key_pair(bits)
-        raw_pub = public_key.split(' ')[1].decode('base64')
-        pkey = paramiko.rsakey.RSAKey(None, raw_pub)
-        self.assertEqual(bits, pkey.get_bits())
+        pub_bytes = public_key.encode('utf-8')
+        pkey = serialization.load_ssh_public_key(
+            pub_bytes, backends.default_backend())
+        self.assertEqual(bits, pkey.key_size)
 
     def test_generate_key_pair_mocked_private_key(self):
-        keyin = StringIO.StringIO()
+        keyin = io.StringIO()
         keyin.write(self.rsa_prv)
         keyin.seek(0)
         key = paramiko.RSAKey.from_private_key(keyin)
@@ -368,3 +221,254 @@ class KeyPairTest(test.TestCase):
             (private_key, public_key, fingerprint) = crypto.generate_key_pair()
             self.assertEqual(self.rsa_pub, public_key)
             self.assertEqual(self.rsa_fp, fingerprint)
+
+
+class FakePassphrase:
+    """A fake castellan ManagedObject."""
+
+    def __init__(self):
+        self.id = 1
+
+    def get_encoded(self):
+        return b'foo'
+
+
+@ddt.ddt
+class VTPMTest(test.NoDBTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.ctxt = nova_context.get_admin_context()
+
+    @mock.patch.object(crypto, '_get_key_manager')
+    def test_ensure_vtpm_secret(self, mock_get_manager):
+        """Check behavior when instance already has an associated secret.
+
+        We should attempt to retrieve the details via castellan.
+        """
+        instance = objects.Instance()
+        instance.system_metadata = {'vtpm_secret_uuid': uuids.vtpm}
+        passphrase = FakePassphrase()
+        mock_get_manager.return_value.get.return_value = passphrase
+
+        s_id, s_encoded = crypto.ensure_vtpm_secret(self.ctxt, instance)
+
+        mock_get_manager.return_value.get.assert_called_once_with(
+            self.ctxt, uuids.vtpm)
+        self.assertEqual(passphrase.id, s_id)
+        self.assertEqual(passphrase.get_encoded(), s_encoded)
+
+    @mock.patch.object(crypto, '_get_key_manager')
+    def test_ensure_vtpm_secret_error(self, mock_get_manager):
+        """Check behavior when we fail to retrieve a secret via castellan.
+
+        We should bubble up the error.
+        """
+        instance = objects.Instance()
+        instance.system_metadata = {'vtpm_secret_uuid': uuids.vtpm}
+        mock_get_manager.return_value.get.side_effect = (
+            castellan_exception.ManagedObjectNotFoundError(uuid=uuids.vtpm))
+
+        self.assertRaises(
+            castellan_exception.ManagedObjectNotFoundError,
+            crypto.ensure_vtpm_secret,
+            self.ctxt, instance)
+
+    @mock.patch('castellan.common.objects.passphrase.Passphrase')
+    @mock.patch.object(crypto, '_get_key_manager')
+    def test_ensure_vtpm_secret_no_secret(self, mock_get_manager, mock_pass):
+        """Check behavior when instance has no associated vTPM secret.
+
+        We should create a new one.
+        """
+        instance = objects.Instance(flavor=objects.Flavor(),
+                                    image_ref=uuids.image)
+        instance.uuid = uuids.instance
+        instance.system_metadata = {}
+        mock_get_manager.return_value.store.return_value = uuids.secret
+        passphrase = FakePassphrase()
+        mock_pass.return_value = passphrase
+
+        with mock.patch.object(instance, 'save') as mock_save:
+            secret_uuid, _ = crypto.ensure_vtpm_secret(self.ctxt, instance)
+
+        mock_pass.assert_called_once_with(mock.ANY, name=mock.ANY)
+        mock_get_manager.return_value.store.assert_called_once_with(
+            self.ctxt, passphrase)
+        mock_save.assert_called_once()
+        self.assertEqual(uuids.secret, secret_uuid)
+
+    @mock.patch.object(crypto, '_get_key_manager')
+    def test_delete_vtpm_secret(self, mock_get_manager):
+        """Check behavior when instance has an associated vTPM secret.
+
+        We should delete it.
+        """
+        instance = objects.Instance()
+        instance.system_metadata = {'vtpm_secret_uuid': uuids.vtpm}
+
+        with mock.patch.object(instance, 'save') as mock_save:
+            crypto.delete_vtpm_secret(self.ctxt, instance)
+
+        self.assertNotIn('vtpm_secret_uuid', instance.system_metadata)
+        mock_save.assert_called_once()
+        mock_get_manager.assert_called_once()
+        mock_get_manager.return_value.delete.assert_called_once_with(
+            self.ctxt, uuids.vtpm,
+        )
+
+    @mock.patch.object(crypto, '_get_key_manager')
+    def test_ensure_vtpm_secret_create_forbidden(self, mock_get_manager):
+        """Check when we fail access to create a secret via castellan.
+
+        We should bubble up the error.
+        """
+        instance = objects.Instance(uuid=uuids.instance)
+        instance.system_metadata = {}
+        mock_get_manager.return_value.store.side_effect = (
+            castellan_exception.KeyManagerError(
+                'Forbidden: Secret payload retrieval attempt not allowed'))
+
+        self.assertRaises(
+            exception.VTPMSecretForbidden,
+            crypto.ensure_vtpm_secret,
+            self.ctxt, instance)
+
+    @mock.patch.object(crypto, '_get_key_manager')
+    def test_ensure_vtpm_secret_get_forbidden(self, mock_get_manager):
+        """Check when we fail access to retrieve a secret via castellan.
+
+        We should bubble up the error.
+        """
+        instance = objects.Instance()
+        instance.system_metadata = {'vtpm_secret_uuid': uuids.vtpm}
+        mock_get_manager.return_value.get.side_effect = (
+            castellan_exception.KeyManagerError(
+                'Forbidden: Secret payload retrieval attempt not allowed'))
+
+        self.assertRaises(
+            exception.VTPMSecretForbidden,
+            crypto.ensure_vtpm_secret,
+            self.ctxt, instance)
+
+    @mock.patch.object(crypto, '_get_key_manager')
+    def test_delete_vtpm_secret_get_forbidden(self, mock_get_manager):
+        """Check when we fail access to retrieve a secret via castellan.
+
+        We should bubble up the error.
+        """
+        instance = objects.Instance(uuid=uuids.instance)
+        instance.system_metadata = {'vtpm_secret_uuid': uuids.vtpm}
+        mock_get_manager.return_value.delete.side_effect = (
+            castellan_exception.KeyManagerError(
+                'Forbidden: Secret payload retrieval attempt not allowed'))
+
+        self.assertRaises(
+            exception.VTPMSecretForbidden,
+            crypto.delete_vtpm_secret,
+            self.ctxt, instance)
+
+    @mock.patch.object(crypto, '_get_key_manager')
+    @ddt.data('store', 'get')
+    def test_ensure_vtpm_secret_other_keymanager_error(self, method,
+                                                       mock_get_manager):
+        """Check when we fail for any other key manager error via castellan.
+
+        We should bubble up the error.
+        """
+        instance = objects.Instance(uuid=uuids.instance, system_metadata={})
+        if method == 'get':
+            instance.system_metadata['vtpm_secret_uuid'] = uuids.vtpm
+        getattr(mock_get_manager.return_value, method).side_effect = (
+            castellan_exception.KeyManagerError('Something else'))
+
+        self.assertRaises(
+            castellan_exception.KeyManagerError, crypto.ensure_vtpm_secret,
+            self.ctxt, instance)
+
+    @mock.patch.object(crypto, '_get_key_manager')
+    def test_delete_vtpm_secret_other_keymanager_error(self, mock_get_manager):
+        """Check when we fail for any other key manager error via castellan.
+
+        We should bubble up the error.
+        """
+        instance = objects.Instance(uuid=uuids.instance)
+        instance.system_metadata = {'vtpm_secret_uuid': uuids.vtpm}
+        mock_get_manager.return_value.delete.side_effect = (
+            castellan_exception.KeyManagerError('Something else'))
+
+        self.assertRaises(
+            castellan_exception.KeyManagerError, crypto.delete_vtpm_secret,
+            self.ctxt, instance)
+
+
+class EncryptionSecretTest(test.NoDBTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.ctxt = nova_context.get_admin_context()
+
+    @mock.patch('oslo_serialization.base64.encode_as_text')
+    @mock.patch('castellan.common.objects.passphrase.Passphrase')
+    @mock.patch.object(crypto, '_get_key_manager')
+    def _test_create_encryption_secret(
+            self, mock_get_manager, mock_pass, mock_text, for_detail=None):
+
+        instance = objects.Instance(uuid=uuids.instance)
+        driver_bdm = {'uuid': uuids.driver_bdm}
+        passphrase = mock.Mock()
+        mock_pass.return_value = passphrase
+        if for_detail is None:
+            for_detail = f'instance {instance.uuid} BDM {driver_bdm["uuid"]}'
+        secret_name = f'Ephemeral encryption secret for {for_detail}'
+
+        secret_uuid, secret = crypto.create_encryption_secret(
+            self.ctxt, instance, driver_bdm, for_detail=for_detail)
+
+        self.assertEqual(
+            mock_get_manager.return_value.store.return_value, secret_uuid)
+        self.assertEqual(secret, mock_text.return_value)
+        mock_pass.assert_called_once_with(
+            mock_text.return_value, name=secret_name)
+        mock_get_manager.return_value.store.assert_called_once_with(
+            self.ctxt, passphrase)
+
+    def test_create_encryption_secret(self):
+        self._test_create_encryption_secret()
+
+    def test_create_encryption_secret_for_image(self):
+        self._test_create_encryption_secret(for_detail='image fake-image')
+
+    @mock.patch.object(crypto, '_get_key_manager')
+    def test_get_encryption_secret(self, mock_get_manager):
+        passphrase = FakePassphrase()
+        mock_get_manager.return_value.get.return_value = passphrase
+        secret = crypto.get_encryption_secret(self.ctxt, uuids.secret)
+        self.assertEqual(passphrase.get_encoded(), secret)
+        mock_get_manager.return_value.get.assert_called_once_with(
+            self.ctxt, uuids.secret)
+
+    @mock.patch.object(crypto, '_get_key_manager')
+    def test_get_encryption_secret_not_found(self, mock_get_manager):
+        mock_get_manager.return_value.get.side_effect = (
+            castellan_exception.ManagedObjectNotFoundError())
+        secret = crypto.get_encryption_secret(self.ctxt, uuids.secret)
+        self.assertIsNone(secret)
+        mock_get_manager.return_value.get.assert_called_once_with(
+            self.ctxt, uuids.secret)
+
+    @mock.patch.object(crypto, '_get_key_manager')
+    def test_delete_encryption_secret(self, mock_get_manager):
+        instance = objects.Instance(uuid=uuids.instance)
+        crypto.delete_encryption_secret(self.ctxt, instance.uuid, uuids.secret)
+        mock_get_manager.return_value.delete.assert_called_once_with(
+            self.ctxt, uuids.secret)
+
+    @mock.patch.object(crypto, '_get_key_manager')
+    def test_delete_encryption_secret_not_found(self, mock_get_manager):
+        mock_get_manager.return_value.delete.side_effect = (
+            castellan_exception.ManagedObjectNotFoundError())
+        instance = objects.Instance(uuid=uuids.instance)
+        crypto.delete_encryption_secret(self.ctxt, instance.uuid, uuids.secret)
+        mock_get_manager.return_value.delete.assert_called_once_with(
+            self.ctxt, uuids.secret)

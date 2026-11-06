@@ -1,61 +1,69 @@
-OpenStack Nova README
-=====================
+==============
+OpenStack Nova
+==============
 
-OpenStack Nova provides a cloud computing fabric controller,
-supporting a wide variety of virtualization technologies,
-including KVM, Xen, LXC, VMware, and more. In addition to
-its native API, it includes compatibility with the commonly
-encountered Amazon EC2 and S3 APIs.
+OpenStack Nova provides a cloud computing fabric controller, supporting a wide
+variety of compute technologies, including: libvirt (KVM, Xen, LXC and more),
+VMware and OpenStack Ironic.
 
-OpenStack Nova is distributed under the terms of the Apache
-License, Version 2.0. The full terms and conditions of this
-license are detailed in the LICENSE file.
+Use the following resources to learn more.
 
-Nova primarily consists of a set of Python daemons, though
-it requires and integrates with a number of native system
-components for databases, messaging and virtualization
-capabilities.
+API
+---
 
-To keep updated with new developments in the OpenStack project
-follow `@openstack <http://twitter.com/openstack>`_ on Twitter.
+To learn how to use Nova's API, consult the documentation available online at:
 
-To learn how to deploy OpenStack Nova, consult the documentation
+- `Compute API Guide <https://docs.openstack.org/api-guide/compute/>`__
+- `Compute API Reference <https://docs.openstack.org/api-ref/compute/>`__
+
+For more information on OpenStack APIs, SDKs and CLIs in general, refer to:
+
+- `OpenStack for App Developers <https://www.openstack.org/appdev/>`__
+- `Development resources for OpenStack clouds
+  <https://developer.openstack.org/>`__
+
+Operators
+---------
+
+To learn how to deploy and configure OpenStack Nova, consult the documentation
 available online at:
 
-   http://docs.openstack.org
+- `OpenStack Nova <https://docs.openstack.org/nova/>`__
 
-For information about the different compute (hypervisor) drivers
-supported by Nova, read this page on the wiki:
-
-   https://wiki.openstack.org/wiki/HypervisorSupportMatrix
-
-In the unfortunate event that bugs are discovered, they should
-be reported to the appropriate bug tracker. If you obtained
-the software from a 3rd party operating system vendor, it is
-often wise to use their own bug tracker for reporting problems.
-In all other cases use the master OpenStack bug tracker,
+In the unfortunate event that bugs are discovered, they should be reported to
+the appropriate bug tracker. If you obtained the software from a 3rd party
+operating system vendor, it is often wise to use their own bug tracker for
+reporting problems. In all other cases use the master OpenStack bug tracker,
 available at:
 
-   http://bugs.launchpad.net/nova
+- `Bug Tracker <https://bugs.launchpad.net/nova>`__
 
-Developers wishing to work on the OpenStack Nova project should
-always base their work on the latest Nova code, available from
-the master GIT repository at:
+Developers
+----------
 
-   https://git.openstack.org/cgit/openstack/nova
+For information on how to contribute to Nova, please see the contents of the
+CONTRIBUTING.rst.
 
-Developers should also join the discussion on the mailing list,
-at:
+Any new code must follow the development guidelines detailed in the HACKING.rst
+file, and pass all unit tests.
 
-   http://lists.openstack.org/cgi-bin/mailman/listinfo/openstack-dev
+To understand better the processes that the team is using, please refer to the
+`Process document <https://docs.openstack.org/nova/latest/contributor/process.html>`__.
 
-Any new code must follow the development guidelines detailed
-in the HACKING.rst file, and pass all unit tests. Further
-developer focused documentation is available at:
+Further developer focused documentation is available at:
 
-   http://docs.openstack.org/developer/nova/
+- `Official Nova Documentation <https://docs.openstack.org/nova/>`__
+- `Official Client Documentation
+  <https://docs.openstack.org/python-novaclient/>`__
 
-For information on how to contribute to Nova, please see the
-contents of the CONTRIBUTING.rst file.
+Other Information
+-----------------
 
--- End of broadcast
+During each `Summit`_ and `Project Team Gathering`_, we agree on what the whole
+community wants to focus on for the upcoming release. The plans for nova can
+be found at:
+
+- `Nova Specs <http://specs.openstack.org/openstack/nova-specs/>`__
+
+.. _Summit: https://www.openstack.org/summit/
+.. _Project Team Gathering: https://www.openstack.org/ptg/

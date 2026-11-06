@@ -13,80 +13,50 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import webob
 from webob import exc
 
+from nova.api.openstack.compute.schemas import consoles as schema
 from nova.api.openstack import wsgi
-from nova.console import api as console_api
-from nova import exception
+from nova.api import validation
+
+_removal_reason = """\
+This API only works with the Xen virt driver, which was deprecated in the
+20.0.0 (Train) release.
+It was removed in the 21.0.0 (Ussuri) release.
+"""
 
 
-def _translate_keys(cons):
-    """Coerces a console instance into proper dictionary format."""
-    pool = cons['pool']
-    info = {'id': cons['id'],
-            'console_type': pool['console_type']}
-    return dict(console=info)
+@validation.validated
+class ConsolesController(wsgi.Controller):
+    """(Removed) The Consoles controller for the OpenStack API.
 
-
-def _translate_detail_keys(cons):
-    """Coerces a console instance into proper dictionary format with
-    correctly mapped attributes.
+    This was removed during the Ussuri release along with the nova-console
+    service.
     """
-    pool = cons['pool']
-    info = {'id': cons['id'],
-            'console_type': pool['console_type'],
-            'password': cons['password'],
-            'instance_name': cons['instance_name'],
-            'port': cons['port'],
-            'host': pool['public_hostname']}
-    return dict(console=info)
 
-
-class Controller(object):
-    """The Consoles controller for the OpenStack API."""
-
-    def __init__(self):
-        self.console_api = console_api.API()
-
+    @wsgi.expected_errors(410)
+    @wsgi.removed('21.0.0', _removal_reason)
+    @validation.query_schema(schema.index_query)
+    @validation.response_body_schema(schema.index_response)
     def index(self, req, server_id):
-        """Returns a list of consoles for this instance."""
-        consoles = self.console_api.get_consoles(
-                                    req.environ['nova.context'],
-                                    server_id)
-        return dict(consoles=[_translate_keys(console)
-                              for console in consoles])
+        raise exc.HTTPGone()
 
+    @wsgi.expected_errors(410)
+    @wsgi.removed('21.0.0', _removal_reason)
+    @validation.schema(schema.create)
+    @validation.response_body_schema(schema.create_response)
     def create(self, req, server_id, body):
-        """Creates a new console."""
-        try:
-            self.console_api.create_console(
-                                req.environ['nova.context'],
-                                server_id)
-        except exception.InstanceNotFound as e:
-            raise exc.HTTPNotFound(explanation=e.format_message())
+        raise exc.HTTPGone()
 
+    @wsgi.expected_errors(410)
+    @wsgi.removed('21.0.0', _removal_reason)
+    @validation.query_schema(schema.show_query)
+    @validation.response_body_schema(schema.show_response)
     def show(self, req, server_id, id):
-        """Shows in-depth information on a specific console."""
-        try:
-            console = self.console_api.get_console(
-                                        req.environ['nova.context'],
-                                        server_id,
-                                        int(id))
-        except exception.NotFound as e:
-            raise exc.HTTPNotFound(explanation=e.format_message())
-        return _translate_detail_keys(console)
+        raise exc.HTTPGone()
 
+    @wsgi.expected_errors(410)
+    @wsgi.removed('21.0.0', _removal_reason)
+    @validation.response_body_schema(schema.delete_response)
     def delete(self, req, server_id, id):
-        """Deletes a console."""
-        try:
-            self.console_api.delete_console(req.environ['nova.context'],
-                                            server_id,
-                                            int(id))
-        except exception.NotFound as e:
-            raise exc.HTTPNotFound(explanation=e.format_message())
-        return webob.Response(status_int=202)
-
-
-def create_resource():
-    return wsgi.Resource(Controller())
+        raise exc.HTTPGone()

@@ -15,7 +15,6 @@
 
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
-import six
 
 from nova.scheduler import filters
 from nova.scheduler.filters import extra_specs_ops
@@ -30,11 +29,13 @@ class ComputeCapabilitiesFilter(filters.BaseHostFilter):
     # Instance type and host capabilities do not change within a request
     run_filter_once_per_request = True
 
+    RUN_ON_REBUILD = False
+
     def _get_capabilities(self, host_state, scope):
         cap = host_state
         for index in range(0, len(scope)):
             try:
-                if isinstance(cap, six.string_types):
+                if isinstance(cap, str):
                     try:
                         cap = jsonutils.loads(cap)
                     except ValueError as e:
@@ -64,17 +65,37 @@ class ComputeCapabilitiesFilter(filters.BaseHostFilter):
                 return None
         return cap
 
-    def _satisfies_extra_specs(self, host_state, instance_type):
+    def _satisfies_extra_specs(self, host_state, flavor):
         """Check that the host_state provided by the compute service
-        satisfy the extra specs associated with the instance type.
+        satisfies the extra specs associated with the instance type.
         """
-        if 'extra_specs' not in instance_type:
+        if 'extra_specs' not in flavor:
             return True
 
-        for key, req in six.iteritems(instance_type['extra_specs']):
+        especs = flavor.extra_specs.copy()
+
+        # Replace it with a capabilities filter specially.
+        bits = especs.get('hw:maxphysaddr_bits')
+        if bits is not None:
+            especs['capabilities:cpu_info:maxphysaddr:bits'] = '>= ' + bits
+            del especs['hw:maxphysaddr_bits']
+
+        for key, req in especs.items():
             # Either not scope format, or in capabilities scope
             scope = key.split(':')
-            if len(scope) > 1:
+            # If key does not have a namespace, the scope's size is 1, check
+            # whether host_state contains the key as an attribute. If not,
+            # ignore it. If it contains, deal with it in the same way as
+            # 'capabilities:key'. This is for backward-compatible.
+            # If the key has a namespace, the scope's size will be bigger than
+            # 1, check that whether the namespace is 'capabilities'. If not,
+            # ignore it.
+            if len(scope) == 1:
+                stats = getattr(host_state, 'stats', {})
+                has_attr = hasattr(host_state, key) or key in stats
+                if not has_attr:
+                    continue
+            else:
                 if scope[0] != "capabilities":
                     continue
                 else:
@@ -92,12 +113,11 @@ class ComputeCapabilitiesFilter(filters.BaseHostFilter):
                 return False
         return True
 
-    def host_passes(self, host_state, filter_properties):
-        """Return a list of hosts that can create instance_type."""
-        instance_type = filter_properties.get('instance_type')
-        if not self._satisfies_extra_specs(host_state,
-                instance_type):
-            LOG.debug("%(host_state)s fails instance_type extra_specs "
-                      "requirements", {'host_state': host_state})
+    def host_passes(self, host_state, spec_obj):
+        """Return a list of hosts that can create flavor."""
+        if not self._satisfies_extra_specs(host_state, spec_obj.flavor):
+            LOG.debug(
+                "%(host_state)s fails flavor extra_specs requirements",
+                {'host_state': host_state})
             return False
         return True

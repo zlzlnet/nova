@@ -12,14 +12,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import urllib
+from urllib import parse
 
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
 import requests
-import six
-
-from nova.tests.unit.image import fake
 
 
 LOG = logging.getLogger(__name__)
@@ -60,7 +57,17 @@ class APIResponse(object):
         self.status = response.status_code
         self.content = response.content
         if self.content:
-            self.body = jsonutils.loads(self.content)
+            # The Compute API and Placement API handle error responses a bit
+            # differently so we need to check the content-type header to
+            # figure out what to do.
+            content_type = response.headers.get('content-type')
+            if 'application/json' in content_type:
+                self.body = response.json()
+            elif 'text/html' in content_type:
+                self.body = response.text
+            else:
+                raise ValueError('Unexpected response content-type: %s' %
+                                 content_type)
         self.headers = response.headers
 
     def __str__(self):
@@ -116,16 +123,21 @@ class TestOpenStackClient(object):
     This is a really basic OpenStack API client that is under our control,
     so we can make changes / insert hooks for testing
 
+    By default, no roles are implied and must be passed like
+    roles=['reader', 'member'] in order for the user to have
+    privileges on the project, just like in a real deployment.
     """
 
-    def __init__(self, auth_user, auth_key, auth_uri):
+    def __init__(self, auth_user, base_url, project_id=None, roles=None):
         super(TestOpenStackClient, self).__init__()
-        self.auth_result = None
         self.auth_user = auth_user
-        self.auth_key = auth_key
-        self.auth_uri = auth_uri
-        # default project_id
-        self.project_id = 'openstack'
+        self.base_url = base_url
+        if project_id is None:
+            self.project_id = "6f70656e737461636b20342065766572"
+        else:
+            self.project_id = project_id
+        self.microversion = None
+        self.roles = roles or []
 
     def request(self, url, method='GET', body=None, headers=None):
         _headers = {'Content-Type': 'application/json'}
@@ -134,41 +146,34 @@ class TestOpenStackClient(object):
         response = requests.request(method, url, data=body, headers=_headers)
         return response
 
-    def _authenticate(self):
-        if self.auth_result:
-            return self.auth_result
-
-        auth_uri = self.auth_uri
-        headers = {'X-Auth-User': self.auth_user,
-                   'X-Auth-Key': self.auth_key,
-                   'X-Auth-Project-Id': self.project_id}
-        response = self.request(auth_uri,
-                                headers=headers)
-
-        http_status = response.status_code
-        LOG.debug("%(auth_uri)s => code %(http_status)s",
-                  {'auth_uri': auth_uri, 'http_status': http_status})
-
-        if http_status == 401:
-            raise OpenStackApiAuthenticationException(response=response)
-
-        self.auth_result = response.headers
-        return self.auth_result
-
     def api_request(self, relative_uri, check_response_status=None,
                     strip_version=False, **kwargs):
-        auth_result = self._authenticate()
-
-        # NOTE(justinsb): httplib 'helpfully' converts headers to lower case
-        base_uri = auth_result['x-server-management-url']
+        base_uri = self.base_url
         if strip_version:
-            # NOTE(vish): cut out version number and tenant_id
-            base_uri = '/'.join(base_uri.split('/', 3)[:-1])
+            # The base_uri is either http://%(host)s:%(port)s/%(api_version)s
+            # or http://%(host)s:%(port)s/%(api_version)s/%(project_id)s
+            # NOTE(efried): Using urlparse was not easier :)
+            chunked = base_uri.split('/')
+            base_uri = '/'.join(chunked[:3])
+            # Restore the project ID if present
+            if len(chunked) == 5:
+                base_uri += '/' + chunked[-1]
 
         full_uri = '%s/%s' % (base_uri, relative_uri)
 
         headers = kwargs.setdefault('headers', {})
-        headers['X-Auth-Token'] = auth_result['x-auth-token']
+        if ('X-OpenStack-Nova-API-Version' in headers or
+                'OpenStack-API-Version' in headers):
+            raise Exception('Microversion should be set via '
+                            'microversion attribute in API client.')
+        elif self.microversion:
+            headers['X-OpenStack-Nova-API-Version'] = self.microversion
+            headers['OpenStack-API-Version'] = 'compute %s' % self.microversion
+
+        headers.setdefault('X-Auth-User', self.auth_user)
+        headers.setdefault('X-User-Id', self.auth_user)
+        headers.setdefault('X-Auth-Project-Id', self.project_id)
+        headers.setdefault('X-Roles', ','.join(self.roles))
 
         response = self.request(full_uri, **kwargs)
 
@@ -184,7 +189,7 @@ class TestOpenStackClient(object):
                     raise OpenStackApiAuthorizationException(response=response)
                 else:
                     raise OpenStackApiException(
-                        message="Unexpected status code",
+                        message="Unexpected status code: %s" % response.text,
                         response=response)
 
         return response
@@ -206,7 +211,7 @@ class TestOpenStackClient(object):
             headers['Content-Type'] = 'application/json'
             kwargs['body'] = jsonutils.dumps(body)
 
-        kwargs.setdefault('check_response_status', [200, 202])
+        kwargs.setdefault('check_response_status', [200, 201, 202, 204])
         return APIResponse(self.api_request(relative_uri, **kwargs))
 
     def api_put(self, relative_uri, body, **kwargs):
@@ -247,10 +252,10 @@ class TestOpenStackClient(object):
 
         if search_opts is not None:
             qparams = {}
-            for opt, val in six.iteritems(search_opts):
+            for opt, val in search_opts.items():
                 qparams[opt] = val
             if qparams:
-                query_string = "?%s" % urllib.urlencode(qparams)
+                query_string = "?%s" % parse.urlencode(qparams)
                 rel_url += query_string
         return self.api_get(rel_url).body['servers']
 
@@ -264,11 +269,20 @@ class TestOpenStackClient(object):
     def put_server(self, server_id, server):
         return self.api_put('/servers/%s' % server_id, server).body
 
-    def post_server_action(self, server_id, data):
-        return self.api_post('/servers/%s/action' % server_id, data).body
+    def post_server_action(self, server_id, data, **kwargs):
+        return self.api_post(
+            '/servers/%s/action' % server_id, data, **kwargs).body
 
     def delete_server(self, server_id):
         return self.api_delete('/servers/%s' % server_id)
+
+    def force_down_service(self, host, binary, forced_down):
+        req = {
+            "host": host,
+            "binary": binary,
+            "forced_down": forced_down
+        }
+        return self.api_put('/os-services/force-down', req).body['service']
 
     def get_image(self, image_id):
         return self.api_get('/images/%s' % image_id).body['image']
@@ -283,6 +297,16 @@ class TestOpenStackClient(object):
     def delete_image(self, image_id):
         return self.api_delete('/images/%s' % image_id)
 
+    def put_image_meta_key(self, image_id, key, value):
+        """Creates or updates a given image metadata key/value pair."""
+        req_body = {
+            'meta': {
+                key: value
+            }
+        }
+        return self.api_put('/images/%s/metadata/%s' % (image_id, key),
+                            req_body)
+
     def get_flavor(self, flavor_id):
         return self.api_get('/flavors/%s' % flavor_id).body['flavor']
 
@@ -296,26 +320,61 @@ class TestOpenStackClient(object):
     def delete_flavor(self, flavor_id):
         return self.api_delete('/flavors/%s' % flavor_id)
 
-    def post_extra_spec(self, flavor_id, spec):
-        return self.api_post('/flavors/%s/os-extra_specs' %
-                             flavor_id, spec)
+    def get_extra_specs(self, flavor_id):
+        return self.api_get(
+            '/flavors/%s/os-extra_specs' % flavor_id
+        ).body['extra_specs']
+
+    def get_extra_spec(self, flavor_id, spec_id):
+        return self.api_get(
+            '/flavors/%s/os-extra_specs/%s' % (flavor_id, spec_id),
+        ).body
+
+    def post_extra_spec(self, flavor_id, body, **_params):
+        url = '/flavors/%s/os-extra_specs' % flavor_id
+        if _params:
+            query_string = '?%s' % parse.urlencode(list(_params.items()))
+            url += query_string
+
+        return self.api_post(url, body)
+
+    def put_extra_spec(self, flavor_id, spec_id, body, **_params):
+        url = '/flavors/%s/os-extra_specs/%s' % (flavor_id, spec_id)
+        if _params:
+            query_string = '?%s' % parse.urlencode(list(_params.items()))
+            url += query_string
+
+        return self.api_put(url, body)
 
     def get_volume(self, volume_id):
-        return self.api_get('/volumes/%s' % volume_id).body['volume']
+        return self.api_get('/os-volumes/%s' % volume_id).body['volume']
 
     def get_volumes(self, detail=True):
-        rel_url = '/volumes/detail' if detail else '/volumes'
+        rel_url = '/os-volumes/detail' if detail else '/os-volumes'
         return self.api_get(rel_url).body['volumes']
 
     def post_volume(self, volume):
-        return self.api_post('/volumes', volume).body['volume']
+        return self.api_post('/os-volumes', volume).body['volume']
 
     def delete_volume(self, volume_id):
-        return self.api_delete('/volumes/%s' % volume_id)
+        return self.api_delete('/os-volumes/%s' % volume_id)
 
-    def get_server_volume(self, server_id, attachment_id):
+    def get_snapshot(self, snap_id):
+        return self.api_get('/os-snapshots/%s' % snap_id).body['snapshot']
+
+    def get_snapshots(self, detail=True):
+        rel_url = '/os-snapshots/detail' if detail else '/os-snapshots'
+        return self.api_get(rel_url).body['snapshots']
+
+    def post_snapshot(self, snapshot):
+        return self.api_post('/os-snapshots', snapshot).body['snapshot']
+
+    def delete_snapshot(self, snap_id):
+        return self.api_delete('/os-snapshots/%s' % snap_id)
+
+    def get_server_volume(self, server_id, volume_id):
         return self.api_get('/servers/%s/os-volume_attachments/%s' %
-                            (server_id, attachment_id)
+                            (server_id, volume_id)
                         ).body['volumeAttachment']
 
     def get_server_volumes(self, server_id):
@@ -325,39 +384,199 @@ class TestOpenStackClient(object):
     def post_server_volume(self, server_id, volume_attachment):
         return self.api_post('/servers/%s/os-volume_attachments' %
                              (server_id), volume_attachment
-                            ).body['volumeAttachment']
+                            )
 
-    def delete_server_volume(self, server_id, attachment_id):
+    def put_server_volume(self, server_id, original_volume_id, volume_id):
+        return self.api_put('/servers/%s/os-volume_attachments/%s' %
+                            (server_id, original_volume_id),
+                            {"volumeAttachment": {"volumeId": volume_id}})
+
+    def delete_server_volume(self, server_id, volume_id):
         return self.api_delete('/servers/%s/os-volume_attachments/%s' %
-                            (server_id, attachment_id))
+                            (server_id, volume_id))
 
+    def get_server_shares(self, server_id):
+        return self.api_get('/servers/%s/shares' %
+                            (server_id)).body['share']
 
-class TestOpenStackClientV3(TestOpenStackClient):
-    """Simple OpenStack v3 API Client.
+    def get_server_share(self, server_id, share_id):
+        return self.api_get('/servers/%s/shares/%s' %
+                            (server_id, share_id)
+                        ).body['share']
 
-    This is a really basic OpenStack API client that is under our control,
-    so we can make changes / insert hooks for testing.
+    def post_server_share(self, server_id, share_attachment):
+        return self.api_post('/servers/%s/shares' %
+                             (server_id), share_attachment
+                            ).body['share']
 
-    Note that the V3 API does not have an image API and so it is
-    not possible to query the api for the image information.
-    So instead we just access the fake image service used by the unittests
-    directly.
+    def delete_server_share(self, server_id, share_id):
+        return self.api_delete('/servers/%s/shares/%s' %
+                            (server_id, share_id))
 
-    """
+    def post_server_metadata(self, server_id, metadata):
+        post_body = {'metadata': {}}
+        post_body['metadata'].update(metadata)
+        return self.api_post('/servers/%s/metadata' % server_id,
+                             post_body).body['metadata']
 
-    def get_image(self, image_id):
-        return fake._fakeImageService.show(None, image_id)
+    def delete_server_metadata(self, server_id, key):
+        return self.api_delete('/servers/%s/metadata/%s' %
+                               (server_id, key))
 
-    def get_images(self, detail=True):
-        return fake._fakeImageService.detail(None)
+    def get_server_groups(self, all_projects=None):
+        if all_projects:
+            return self.api_get(
+                '/os-server-groups?all_projects').body['server_groups']
+        else:
+            return self.api_get('/os-server-groups').body['server_groups']
 
-    def post_image(self, image):
-        raise NotImplementedError
+    def get_server_group(self, group_id):
+        return self.api_get('/os-server-groups/%s' %
+                            group_id).body['server_group']
 
-    def delete_image(self, image_id):
-        return fake._fakeImageService.delete(None, image_id)
+    def post_server_groups(self, group):
+        response = self.api_post('/os-server-groups', {"server_group": group})
+        return response.body['server_group']
 
+    def delete_server_group(self, group_id):
+        self.api_delete('/os-server-groups/%s' % group_id)
 
-class TestOpenStackClientV3Mixin(object):
-    def _get_test_client(self):
-        return TestOpenStackClientV3('fake', 'fake', self.auth_url)
+    def create_server_external_events(self, events):
+        body = {'events': events}
+        return self.api_post('/os-server-external-events', body).body['events']
+
+    def get_instance_actions(self, server_id):
+        return self.api_get('/servers/%s/os-instance-actions' %
+                            (server_id)).body['instanceActions']
+
+    def get_instance_action_details(self, server_id, request_id):
+        return self.api_get('/servers/%s/os-instance-actions/%s' %
+                            (server_id, request_id)).body['instanceAction']
+
+    def post_aggregate(self, aggregate):
+        return self.api_post('/os-aggregates', aggregate).body['aggregate']
+
+    def delete_aggregate(self, aggregate_id):
+        self.api_delete('/os-aggregates/%s' % aggregate_id)
+
+    def add_host_to_aggregate(self, aggregate_id, host):
+        return self.api_post('/os-aggregates/%s/action' % aggregate_id,
+                             {'add_host': {'host': host}})
+
+    def remove_host_from_aggregate(self, aggregate_id, host):
+        return self.api_post('/os-aggregates/%s/action' % aggregate_id,
+                             {'remove_host': {'host': host}})
+
+    def get_limits(self):
+        return self.api_get('/limits').body['limits']
+
+    def get_server_tags(self, server_id):
+        """Get the tags on the given server.
+
+        :param server_id: The server uuid
+        :return: The list of tags from the response
+        """
+        return self.api_get('/servers/%s/tags' % server_id).body['tags']
+
+    def put_server_tags(self, server_id, tags):
+        """Put (or replace) a list of tags on the given server.
+
+        Returns the list of tags from the response.
+        """
+        return self.api_put('/servers/%s/tags' % server_id,
+                            {'tags': tags}).body['tags']
+
+    def get_port_interfaces(self, server_id):
+        return self.api_get('/servers/%s/os-interface' %
+                            (server_id)).body['interfaceAttachments']
+
+    def attach_interface(self, server_id, post):
+        return self.api_post('/servers/%s/os-interface' % server_id, post)
+
+    def detach_interface(self, server_id, port_id):
+        return self.api_delete('/servers/%s/os-interface/%s' %
+                               (server_id, port_id))
+
+    def get_services(self, binary=None, host=None):
+        url = '/os-services?'
+        if binary:
+            url += 'binary=%s&' % binary
+        if host:
+            url += 'host=%s&' % host
+        return self.api_get(url).body['services']
+
+    def put_service(self, service_id, req):
+        return self.api_put(
+            '/os-services/%s' % service_id, req).body['service']
+
+    def post_keypair(self, keypair):
+        return self.api_post('/os-keypairs', keypair).body['keypair']
+
+    def delete_keypair(self, keypair_name):
+        self.api_delete('/os-keypairs/%s' % keypair_name)
+
+    def post_aggregate_action(self, aggregate_id, body):
+        return self.api_post(
+            '/os-aggregates/%s/action' % aggregate_id, body).body['aggregate']
+
+    def get_active_migrations(self, server_id):
+        return self.api_get('/servers/%s/migrations' %
+                            server_id).body['migrations']
+
+    def get_migrations(self, user_id=None, project_id=None):
+        url = '/os-migrations?'
+        if user_id:
+            url += 'user_id=%s&' % user_id
+        if project_id:
+            url += 'project_id=%s&' % project_id
+        return self.api_get(url).body['migrations']
+
+    def force_complete_migration(self, server_id, migration_id):
+        return self.api_post(
+            '/servers/%s/migrations/%s/action' % (server_id, migration_id),
+            {'force_complete': None})
+
+    def delete_migration(self, server_id, migration_id):
+        return self.api_delete(
+            '/servers/%s/migrations/%s' % (server_id, migration_id))
+
+    def put_aggregate(self, aggregate_id, body):
+        return self.api_put(
+            '/os-aggregates/%s' % aggregate_id, body).body['aggregate']
+
+    def get_hypervisor_stats(self):
+        return self.api_get(
+            '/os-hypervisors/statistics').body['hypervisor_statistics']
+
+    def get_service_id(self, binary_name):
+        for service in self.get_services():
+            if service['binary'] == binary_name:
+                return service['id']
+        raise OpenStackApiNotFoundException('Service cannot be found.')
+
+    def put_service_force_down(self, service_id, forced_down):
+        req = {
+            'forced_down': forced_down
+        }
+        return self.api_put('os-services/%s' % service_id, req).body['service']
+
+    def get_server_diagnostics(self, server_id):
+        return self.api_get('/servers/%s/diagnostics' % server_id).body
+
+    def get_quota_detail(self, project_id=None, user_id=None):
+        if not project_id:
+            project_id = self.project_id
+        url = '/os-quota-sets/%s/detail'
+        if user_id:
+            url += '?user_id=%s' % user_id
+        return self.api_get(url % project_id).body['quota_set']
+
+    def update_quota(self, quotas, project_id=None, user_id=None):
+        if not project_id:
+            project_id = self.project_id
+        url = '/os-quota-sets/%s'
+        if user_id:
+            url += '?user_id=%s' % user_id
+        body = {'quota_set': {}}
+        body['quota_set'].update(quotas)
+        return self.api_put(url % project_id, body).body['quota_set']

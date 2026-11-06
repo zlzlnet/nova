@@ -27,19 +27,16 @@ import os
 import random
 import tempfile
 
-if os.name != 'nt':
-    import crypt
-
 from oslo_concurrency import processutils
-from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
+from oslo_utils import secretutils
 
+import nova.conf
 from nova import exception
 from nova.i18n import _
-from nova.i18n import _LE
-from nova.i18n import _LW
-from nova import utils
+import nova.privsep.fs
+import nova.privsep.libvirt
 from nova.virt.disk.mount import api as mount
 from nova.virt.disk.vfs import api as vfs
 from nova.virt.image import model as imgmodel
@@ -48,119 +45,54 @@ from nova.virt import images
 
 LOG = logging.getLogger(__name__)
 
-disk_opts = [
-    # NOTE(yamahata): ListOpt won't work because the command may include a
-    #                 comma. For example:
-    #
-    #                 mkfs.ext4 -O dir_index,extent -E stride=8,stripe-width=16
-    #                           --label %(fs_label)s %(target)s
-    #
-    #                 list arguments are comma separated and there is no way to
-    #                 escape such commas.
-    #
-    cfg.MultiStrOpt('virt_mkfs',
-                    default=[],
-                    help='Name of the mkfs commands for ephemeral device. '
-                         'The format is <os_type>=<mkfs command>'),
+CONF = nova.conf.CONF
 
-    cfg.BoolOpt('resize_fs_using_block_device',
-                default=False,
-                help='Attempt to resize the filesystem by accessing the '
-                     'image over a block device. This is done by the host '
-                     'and may not be necessary if the image contains a recent '
-                     'version of cloud-init. Possible mechanisms require '
-                     'the nbd driver (for qcow and raw), or loop (for raw).'),
-    ]
 
-CONF = cfg.CONF
-CONF.register_opts(disk_opts)
-CONF.import_opt('default_ephemeral_format', 'nova.virt.driver')
+# NOTE(mikal): Here as a transition step
+SUPPORTED_FS_TO_EXTEND = nova.privsep.fs.SUPPORTED_FS_TO_EXTEND
 
-_MKFS_COMMAND = {}
-_DEFAULT_MKFS_COMMAND = None
-
-FS_FORMAT_EXT2 = "ext2"
-FS_FORMAT_EXT3 = "ext3"
-FS_FORMAT_EXT4 = "ext4"
-FS_FORMAT_XFS = "xfs"
-FS_FORMAT_NTFS = "ntfs"
-FS_FORMAT_VFAT = "vfat"
-
-SUPPORTED_FS_TO_EXTEND = (
-    FS_FORMAT_EXT2,
-    FS_FORMAT_EXT3,
-    FS_FORMAT_EXT4)
-
-_DEFAULT_FILE_SYSTEM = FS_FORMAT_VFAT
-_DEFAULT_FS_BY_OSTYPE = {'linux': FS_FORMAT_EXT4,
-                         'windows': FS_FORMAT_NTFS}
 
 for s in CONF.virt_mkfs:
     # NOTE(yamahata): mkfs command may includes '=' for its options.
     #                 So item.partition('=') doesn't work here
     os_type, mkfs_command = s.split('=', 1)
     if os_type:
-        _MKFS_COMMAND[os_type] = mkfs_command
-    if os_type == 'default':
-        _DEFAULT_MKFS_COMMAND = mkfs_command
-
-
-def get_fs_type_for_os_type(os_type):
-    return os_type if _MKFS_COMMAND.get(os_type) else 'default'
-
-
-def get_file_extension_for_os_type(os_type, specified_fs=None):
-    mkfs_command = _MKFS_COMMAND.get(os_type, _DEFAULT_MKFS_COMMAND)
-    if mkfs_command:
-        extension = mkfs_command
-    else:
-        if not specified_fs:
-            specified_fs = CONF.default_ephemeral_format
-            if not specified_fs:
-                specified_fs = _DEFAULT_FS_BY_OSTYPE.get(os_type,
-                                                         _DEFAULT_FILE_SYSTEM)
-        extension = specified_fs
-    return utils.get_hash_str(extension)[:7]
+        nova.privsep.fs.load_mkfs_command(os_type, mkfs_command)
 
 
 def mkfs(os_type, fs_label, target, run_as_root=True, specified_fs=None):
-    """Format a file or block device using
-       a user provided command for each os type.
-       If user has not provided any configuration,
-       format type will be used according to a
-       default_ephemeral_format configuration
-       or a system defaults.
-    """
-
-    mkfs_command = (_MKFS_COMMAND.get(os_type, _DEFAULT_MKFS_COMMAND) or
-                    '') % {'fs_label': fs_label, 'target': target}
-    if mkfs_command:
-        utils.execute(*mkfs_command.split(), run_as_root=run_as_root)
-    else:
-        if not specified_fs:
-            specified_fs = CONF.default_ephemeral_format
-            if not specified_fs:
-                specified_fs = _DEFAULT_FS_BY_OSTYPE.get(os_type,
-                                                         _DEFAULT_FILE_SYSTEM)
-
-        utils.mkfs(specified_fs, target, fs_label, run_as_root=run_as_root)
+    nova.privsep.fs.configurable_mkfs(
+        os_type, fs_label, target, run_as_root,
+        CONF.default_ephemeral_format, specified_fs)
 
 
 def resize2fs(image, check_exit_code=False, run_as_root=False):
+    # NOTE(mikal): note that the check_exit_code kwarg here only refers to
+    # resize2fs, not the precursor e2fsck. Yes, I agree it's confusing.
     try:
-        utils.execute('e2fsck',
-                      '-fp',
-                      image,
-                      check_exit_code=[0, 1, 2],
-                      run_as_root=run_as_root)
+        if run_as_root:
+            nova.privsep.fs.e2fsck(image)
+        else:
+            nova.privsep.fs.unprivileged_e2fsck(image)
+
     except processutils.ProcessExecutionError as exc:
         LOG.debug("Checking the file system with e2fsck has failed, "
                   "the resize will be aborted. (%s)", exc)
+
     else:
-        utils.execute('resize2fs',
-                      image,
-                      check_exit_code=check_exit_code,
-                      run_as_root=run_as_root)
+        if run_as_root:
+            nova.privsep.fs.resize2fs(image, check_exit_code)
+        else:
+            nova.privsep.fs.unprivileged_resize2fs(image, check_exit_code)
+
+
+def get_disk_info(path):
+    """Get QEMU info of a disk image
+
+    :param path: Path to the disk image
+    :returns: oslo_utils.imageutils.QemuImgInfo object for the image.
+    """
+    return images.qemu_img_info(path)
 
 
 def get_disk_size(path):
@@ -187,7 +119,25 @@ def extend(image, size):
     if not can_resize_image(image.path, size):
         return
 
-    utils.execute('qemu-img', 'resize', image.path, size)
+    if (image.format == imgmodel.FORMAT_PLOOP):
+        nova.privsep.libvirt.ploop_resize(image.path, size)
+        return
+
+    # NOTE(danms): We should not call qemu-img without a format, and
+    # only qcow2 and raw are supported. So check which one we're being
+    # told this is supposed to be and pass that to qemu-img. Also note
+    # that we need to pass the qemu format string to this command, which
+    # may or may not be the same as the FORMAT_* constant, so be
+    # explicit here.
+    if image.format == imgmodel.FORMAT_RAW:
+        format = 'raw'
+    elif image.format == imgmodel.FORMAT_QCOW2:
+        format = 'qcow2'
+    else:
+        LOG.warning('Attempting to resize image %s with format %s, '
+        'which is not supported', image.path, image.format)
+        raise exception.InvalidDiskFormat(disk_format=image.format)
+    processutils.execute('qemu-img', 'resize', '-f', format, image.path, size)
 
     if (image.format != imgmodel.FORMAT_RAW and
         not CONF.resize_fs_using_block_device):
@@ -258,8 +208,8 @@ def is_image_extendable(image):
             # provides a bad configuration for libguestfs reported in
             # the bug lp#1413142. When resolved we should remove this
             # except to let the error to be propagated.
-            LOG.warning(_LW('Unable to mount image %(image)s with '
-                            'error %(error)s. Cannot resize.'),
+            LOG.warning('Unable to mount image %(image)s with '
+                        'error %(error)s. Cannot resize.',
                         {'image': image, 'error': e})
         finally:
             if fs is not None:
@@ -269,7 +219,7 @@ def is_image_extendable(image):
     else:
         # For raw, we can directly inspect the file system
         try:
-            utils.execute('e2label', image.file)
+            processutils.execute('e2label', image.path)
         except processutils.ProcessExecutionError as e:
             LOG.debug('Unable to determine label for image %(image)s with '
                       'error %(error)s. Cannot resize.',
@@ -307,6 +257,8 @@ class _DiskImage(object):
             device = self._device_for_path(mount_dir)
             if device:
                 self._reset(device)
+            else:
+                LOG.debug('No device found for path: %s', mount_dir)
 
     @staticmethod
     def _device_for_path(path):
@@ -405,11 +357,11 @@ def inject_data(image, key=None, net=None, metadata=None, admin_password=None,
     Returns True if all requested operations completed without issue.
     Raises an exception if a mandatory item can't be injected.
     """
+    items = {'image': image, 'key': key, 'net': net, 'metadata': metadata,
+             'files': files, 'partition': partition}
     LOG.debug("Inject data image=%(image)s key=%(key)s net=%(net)s "
               "metadata=%(metadata)s admin_password=<SANITIZED> "
-              "files=%(files)s partition=%(partition)s",
-              {'image': image, 'key': key, 'net': net, 'metadata': metadata,
-               'files': files, 'partition': partition})
+              "files=%(files)s partition=%(partition)s", items)
     try:
         fs = vfs.VFS.instance_for_image(image, partition)
         fs.setup()
@@ -417,11 +369,11 @@ def inject_data(image, key=None, net=None, metadata=None, admin_password=None,
         # If a mandatory item is passed to this function,
         # then reraise the exception to indicate the error.
         for inject in mandatory:
-            inject_val = locals()[inject]
+            inject_val = items[inject]
             if inject_val:
                 raise
-        LOG.warning(_LW('Ignoring error injecting data into image %(image)s '
-                        '(%(e)s)'), {'image': image, 'e': e})
+        LOG.warning('Ignoring error injecting data into image %(image)s '
+                    '(%(e)s)', {'image': image, 'e': e})
         return False
 
     try:
@@ -445,8 +397,8 @@ def setup_container(image, container_dir):
     img = _DiskImage(image=image, mount_dir=container_dir)
     dev = img.mount()
     if dev is None:
-        LOG.error(_LE("Failed to mount container filesystem '%(image)s' "
-                    "on '%(target)s': %(errors)s"),
+        LOG.error("Failed to mount container filesystem '%(image)s' "
+                  "on '%(target)s': %(errors)s",
                   {"image": img, "target": container_dir,
                    "errors": img.errors})
         raise exception.NovaException(img.errors)
@@ -468,14 +420,15 @@ def teardown_container(container_dir, container_root_device=None):
         if container_root_device:
             if 'loop' in container_root_device:
                 LOG.debug("Release loop device %s", container_root_device)
-                utils.execute('losetup', '--detach', container_root_device,
-                              run_as_root=True, attempts=3)
-            else:
+                nova.privsep.fs.loopremove(container_root_device)
+            elif 'nbd' in container_root_device:
                 LOG.debug('Release nbd device %s', container_root_device)
-                utils.execute('qemu-nbd', '-d', container_root_device,
-                              run_as_root=True)
+                nova.privsep.fs.nbd_disconnect(container_root_device)
+            else:
+                LOG.debug('No release necessary for block device %s',
+                          container_root_device)
     except Exception:
-        LOG.exception(_LE('Failed to teardown container filesystem'))
+        LOG.exception('Failed to teardown container filesystem')
 
 
 def clean_lxc_namespace(container_dir):
@@ -488,7 +441,7 @@ def clean_lxc_namespace(container_dir):
         img = _DiskImage(image=None, mount_dir=container_dir)
         img.umount()
     except Exception:
-        LOG.exception(_LE('Failed to umount container filesystem'))
+        LOG.exception('Failed to umount container filesystem')
 
 
 def inject_data_into_fs(fs, key, net, metadata, admin_password, files,
@@ -503,18 +456,26 @@ def inject_data_into_fs(fs, key, net, metadata, admin_password, files,
     Returns True if all requested operations completed without issue.
     Raises an exception if a mandatory item can't be injected.
     """
+    items = {'key': key, 'net': net, 'metadata': metadata,
+             'admin_password': admin_password, 'files': files}
+    functions = {
+        'key': _inject_key_into_fs,
+        'net': _inject_net_into_fs,
+        'metadata': _inject_metadata_into_fs,
+        'admin_password': _inject_admin_password_into_fs,
+        'files': _inject_files_into_fs,
+    }
     status = True
-    for inject in ('key', 'net', 'metadata', 'admin_password', 'files'):
-        inject_val = locals()[inject]
-        inject_func = globals()['_inject_%s_into_fs' % inject]
+    for inject, inject_val in items.items():
         if inject_val:
             try:
+                inject_func = functions[inject]
                 inject_func(inject_val, fs)
             except Exception as e:
                 if inject in mandatory:
                     raise
-                LOG.warning(_LW('Ignoring error injecting %(inject)s into '
-                                'image (%(e)s)'), {'inject': inject, 'e': e})
+                LOG.warning('Ignoring error injecting %(inject)s into '
+                            'image (%(e)s)', {'inject': inject, 'e': e})
                 status = False
     return status
 
@@ -523,8 +484,8 @@ def _inject_files_into_fs(files, fs):
     for (path, contents) in files:
         # NOTE(wangpan): Ensure the parent dir of injecting file exists
         parent_dir = os.path.dirname(path)
-        if (len(parent_dir) > 0 and parent_dir != "/"
-                and not fs.has_file(parent_dir)):
+        if (len(parent_dir) > 0 and parent_dir != "/" and
+                not fs.has_file(parent_dir)):
             fs.make_path(parent_dir)
             fs.set_ownership(parent_dir, "root", "root")
             fs.set_permissions(parent_dir, 0o744)
@@ -666,15 +627,12 @@ def _set_passwd(username, admin_passwd, passwd_data, shadow_data):
 
     :param username: the username
     :param admin_passwd: the admin password
-    :param passwd_data: path to the passwd file
-    :param shadow_data: path to the shadow password file
+    :param passwd_data: Data from the passwd file decoded as a string
+    :param shadow_data: Data from the shadow file decoded as a string
     :returns: nothing
     :raises: exception.NovaException(), IOError()
 
     """
-    if os.name == 'nt':
-        raise exception.NovaException(_('Not implemented on Windows'))
-
     # encryption algo - id pairs for crypt()
     algos = {'SHA-512': '$6$', 'SHA-256': '$5$', 'MD5': '$1$', 'DES': ''}
 
@@ -687,9 +645,13 @@ def _set_passwd(username, admin_passwd, passwd_data, shadow_data):
     # md5 is the default because it's widely supported. Although the
     # local crypt() might support stronger SHA, the target instance
     # might not.
-    encrypted_passwd = crypt.crypt(admin_passwd, algos['MD5'] + salt)
+    encrypted_passwd = secretutils.crypt_password(
+        admin_passwd, algos['MD5'] + salt
+    )
     if len(encrypted_passwd) == 13:
-        encrypted_passwd = crypt.crypt(admin_passwd, algos['DES'] + salt)
+        encrypted_passwd = secretutils.crypt_password(
+            admin_passwd, algos['DES'] + salt
+        )
 
     p_file = passwd_data.split("\n")
     s_file = shadow_data.split("\n")
@@ -701,10 +663,10 @@ def _set_passwd(username, admin_passwd, passwd_data, shadow_data):
             break
     else:
         msg = _('User %(username)s not found in password file.')
-        raise exception.NovaException(msg % username)
+        raise exception.NovaException(msg % {'username': username})
 
-    # update password in the shadow file.It's an error if the
-    # the user doesn't exist.
+    # update password in the shadow file. It's an error if the
+    # user doesn't exist.
     new_shadow = list()
     found = False
     for entry in s_file:
@@ -717,6 +679,6 @@ def _set_passwd(username, admin_passwd, passwd_data, shadow_data):
 
     if not found:
         msg = _('User %(username)s not found in shadow file.')
-        raise exception.NovaException(msg % username)
+        raise exception.NovaException(msg % {'username': username})
 
     return "\n".join(new_shadow)

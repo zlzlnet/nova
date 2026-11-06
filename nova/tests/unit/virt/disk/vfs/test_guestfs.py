@@ -12,14 +12,21 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import collections
+from unittest import mock
+
 import fixtures
-import mock
 
 from nova import exception
 from nova import test
 from nova.tests.unit.virt.disk.vfs import fakeguestfs
+from nova import utils
 from nova.virt.disk.vfs import guestfs as vfsimpl
 from nova.virt.image import model as imgmodel
+
+os_uname = collections.namedtuple(
+    'uname_result', ['sysname', 'nodename', 'release', 'version', 'machine'],
+)
 
 
 class VirtDiskVFSGuestFSTest(test.NoDBTestCase):
@@ -51,7 +58,7 @@ class VirtDiskVFSGuestFSTest(test.NoDBTestCase):
         vfs.setup()
 
         if forcetcg:
-            self.assertEqual("force_tcg", vfs.handle.backend_settings)
+            self.assertEqual(["force_tcg"], vfs.handle.backend_settings)
             vfsimpl.force_tcg(False)
         else:
             self.assertIsNone(vfs.handle.backend_settings)
@@ -110,12 +117,10 @@ class VirtDiskVFSGuestFSTest(test.NoDBTestCase):
         vfs.setup()
 
         self.assertIsNone(vfs.handle.backend_settings)
-
-        def fake_inspect_os():
-            return []
-
-        self.stubs.Set(vfs.handle, 'inspect_os', fake_inspect_os)
-        self.assertRaises(exception.NovaException, vfs.setup_os_inspect)
+        with mock.patch.object(
+            vfs.handle, 'inspect_os', return_value=[]) as mock_inspect_os:
+            self.assertRaises(exception.NovaException, vfs.setup_os_inspect)
+            mock_inspect_os.assert_called_once_with()
 
     def test_appliance_setup_inspect_multi_boots_raises(self):
         vfs = vfsimpl.VFSGuestFS(self.qcowfile,
@@ -125,11 +130,11 @@ class VirtDiskVFSGuestFSTest(test.NoDBTestCase):
 
         self.assertIsNone(vfs.handle.backend_settings)
 
-        def fake_inspect_os():
-            return ['fake1', 'fake2']
-
-        self.stubs.Set(vfs.handle, 'inspect_os', fake_inspect_os)
-        self.assertRaises(exception.NovaException, vfs.setup_os_inspect)
+        with mock.patch.object(
+            vfs.handle, 'inspect_os',
+            return_value=['fake1', 'fake2']) as mock_inspect_os:
+            self.assertRaises(exception.NovaException, vfs.setup_os_inspect)
+            mock_inspect_os.assert_called_once_with()
 
     def test_appliance_setup_static_nopart(self):
         vfs = vfsimpl.VFSGuestFS(self.qcowfile,
@@ -255,12 +260,27 @@ class VirtDiskVFSGuestFSTest(test.NoDBTestCase):
 
         vfs.teardown()
 
+    def test_set_ownership_not_supported(self):
+        # NOTE(andreaf) Setting ownership relies on /etc/passwd and/or
+        # /etc/group being available in the image, which is not always the
+        # case - e.g. CirrOS image before boot.
+        vfs = vfsimpl.VFSGuestFS(self.qcowfile)
+        vfs.setup()
+        self.stub_out('nova.tests.unit.virt.disk.vfs.fakeguestfs.GuestFS.'
+                      'CAN_SET_OWNERSHIP', False)
+
+        self.assertRaises(exception.NovaException, vfs.set_ownership,
+                          "/some/file", "fred", None)
+        self.assertRaises(exception.NovaException, vfs.set_ownership,
+                          "/some/file", None, "users")
+
     def test_close_on_error(self):
         vfs = vfsimpl.VFSGuestFS(self.qcowfile)
         vfs.setup()
         self.assertFalse(vfs.handle.kwargs['close_on_exit'])
         vfs.teardown()
-        self.stubs.Set(fakeguestfs.GuestFS, 'SUPPORT_CLOSE_ON_EXIT', False)
+        self.stub_out('nova.tests.unit.virt.disk.vfs.fakeguestfs.GuestFS.'
+                      'SUPPORT_CLOSE_ON_EXIT', False)
         vfs = vfsimpl.VFSGuestFS(self.qcowfile)
         vfs.setup()
         self.assertNotIn('close_on_exit', vfs.handle.kwargs)
@@ -271,7 +291,8 @@ class VirtDiskVFSGuestFSTest(test.NoDBTestCase):
         vfs.setup()
         self.assertFalse(vfs.handle.kwargs['python_return_dict'])
         vfs.teardown()
-        self.stubs.Set(fakeguestfs.GuestFS, 'SUPPORT_RETURN_DICT', False)
+        self.stub_out('nova.tests.unit.virt.disk.vfs.fakeguestfs.GuestFS.'
+                      'SUPPORT_RETURN_DICT', False)
         vfs = vfsimpl.VFSGuestFS(self.qcowfile)
         vfs.setup()
         self.assertNotIn('python_return_dict', vfs.handle.kwargs)
@@ -296,7 +317,7 @@ class VirtDiskVFSGuestFSTest(test.NoDBTestCase):
         vfs = vfsimpl.VFSGuestFS(self.rawfile)
         vfs.setup()
         self.assertIsNotNone(vfs.handle)
-        self.assertTrue('ext3', vfs.get_image_fs())
+        self.assertEqual('ext3', vfs.get_image_fs())
         vfs.teardown()
 
     @mock.patch.object(vfsimpl.VFSGuestFS, 'setup_os')
@@ -310,3 +331,42 @@ class VirtDiskVFSGuestFSTest(test.NoDBTestCase):
         vfs = vfsimpl.VFSGuestFS(self.qcowfile)
         vfs.setup(mount=False)
         self.assertFalse(setup_os.called)
+
+    @mock.patch('os.access')
+    @mock.patch('os.uname', return_value=os_uname(
+        'Linux', '', 'kernel_name', '', ''))
+    def test_appliance_setup_inspect_capabilities_fail_with_ubuntu(
+        self, mock_uname, mock_access,
+    ):
+        # In ubuntu os will default host kernel as 600 permission
+        m = mock.MagicMock()
+        m.launch.side_effect = Exception
+        vfs = vfsimpl.VFSGuestFS(self.qcowfile)
+        mock_access.return_value = False
+        self.flags(debug=False, group='guestfs')
+        with mock.patch('nova.utils.tpool_wrap', return_value=m) as target:
+            self.assertRaises(exception.LibguestfsCannotReadKernel,
+                                    vfs.inspect_capabilities)
+            m.add_drive.assert_called_once_with('/dev/null')
+            m.launch.assert_called_once_with()
+            mock_access.assert_called_once_with('/boot/vmlinuz-kernel_name',
+                                                mock.ANY)
+            mock_uname.assert_called_once_with()
+            self.assertEqual(1, target.call_count)
+
+    def test_appliance_setup_inspect_capabilities_debug_mode(self):
+        """Asserts that we do not use an eventlet thread pool when guestfs
+        debug logging is enabled.
+        """
+        if utils.concurrency_mode_threading():
+            self.skipTest(
+                "In native threading mode this case cannot be tested.")
+
+        # We can't actually mock guestfs.GuestFS because it's an optional
+        # native package import. All we really care about here is that
+        # eventlet isn't used.
+        self.flags(debug=True, group='guestfs')
+        vfs = vfsimpl.VFSGuestFS(self.qcowfile)
+        with mock.patch('eventlet.tpool.Proxy',
+                        new_callable=mock.NonCallableMock):
+            vfs.inspect_capabilities()

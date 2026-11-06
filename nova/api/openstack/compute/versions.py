@@ -13,15 +13,12 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo_config import cfg
-
 from nova.api.openstack import api_version_request
+from nova.api.openstack.compute.schemas import versions as schema
 from nova.api.openstack.compute.views import versions as views_versions
 from nova.api.openstack import wsgi
+from nova.api import validation
 
-
-CONF = cfg.CONF
-CONF.import_opt('enabled', 'nova.api.openstack', group='osapi_v3')
 
 LINKS = {
    'v2.0': {
@@ -36,10 +33,10 @@ LINKS = {
 VERSIONS = {
     "v2.0": {
         "id": "v2.0",
-        "status": "SUPPORTED",
+        "status": "DEPRECATED",
         "version": "",
         "min_version": "",
-        "updated": "2011-01-21T11:33:21Z",
+        "updated": "2025-07-04T12:00:00Z",
         "links": [
             {
                 "rel": "describedby",
@@ -77,18 +74,25 @@ VERSIONS = {
 }
 
 
+@validation.validated
 class Versions(wsgi.Resource):
+
+    # The root version API isn't under the microversion control.
+    support_api_request_version = False
+
     def __init__(self):
         super(Versions, self).__init__(None)
-        if not CONF.osapi_v3.enabled:
-            del VERSIONS["v2.1"]
 
+    @validation.query_schema(schema.show_query)
+    @validation.response_body_schema(schema.index_response)
     def index(self, req, body=None):
         """Return all versions."""
         builder = views_versions.get_view_builder(req)
         return builder.build_versions(VERSIONS)
 
     @wsgi.response(300)
+    @validation.query_schema(schema.multi_query)
+    @validation.response_body_schema(schema.multi_response)
     def multi(self, req, body=None):
         """Return multiple choices."""
         builder = views_versions.get_view_builder(req)
@@ -105,11 +109,21 @@ class Versions(wsgi.Resource):
         return args
 
 
-class VersionV2(object):
-    def show(self, req):
+@validation.validated
+class VersionsV2(wsgi.Resource):
+
+    def __init__(self):
+        super(VersionsV2, self).__init__(None)
+
+    # NOTE(stephenfin): Despite being called index, this is actually called as
+    # a show action
+    @validation.query_schema(schema.show_query)
+    @validation.response_body_schema(schema.show_response)
+    def index(self, req, body=None):
         builder = views_versions.get_view_builder(req)
-        return builder.build_version(VERSIONS['v2.0'])
+        ver = 'v2.0' if req.is_legacy_v2() else 'v2.1'
+        return builder.build_version(VERSIONS[ver])
 
-
-def create_resource():
-    return wsgi.Resource(VersionV2())
+    def get_action_args(self, request_environment):
+        """Parse dictionary created by routes library."""
+        return {'action': 'index'}

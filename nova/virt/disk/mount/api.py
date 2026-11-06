@@ -17,16 +17,19 @@ import os
 import time
 
 from oslo_log import log as logging
+from oslo_service import loopingcall
 from oslo_utils import importutils
 
 from nova import exception
-from nova.i18n import _, _LI, _LW
-from nova import utils
+from nova.i18n import _
+import nova.privsep.fs
 from nova.virt.image import model as imgmodel
 
 LOG = logging.getLogger(__name__)
 
 MAX_DEVICE_WAIT = 30
+MAX_FILE_CHECKS = 6
+FILE_CHECK_INTERVAL = 0.25
 
 
 class Mount(object):
@@ -62,12 +65,13 @@ class Mount(object):
                 return importutils.import_object(
                     "nova.virt.disk.mount.nbd.NbdMount",
                     image, mountdir, partition)
+        elif isinstance(image, imgmodel.LocalBlockImage):
+            LOG.debug("Using BlockMount")
+            return importutils.import_object(
+                    "nova.virt.disk.mount.block.BlockMount",
+                    image, mountdir, partition)
         else:
-            # TODO(berrange) we could mount images of
-            # type LocalBlockImage directly without
-            # involving loop or nbd devices
-            #
-            # We could also mount RBDImage directly
+            # TODO(berrange) We could mount RBDImage directly
             # using kernel RBD block dev support.
             #
             # This is left as an enhancement for future
@@ -98,10 +102,15 @@ class Mount(object):
             return importutils.import_object(
                 "nova.virt.disk.mount.loop.LoopMount",
                 image, mountdir, partition, device)
-        else:
+        elif "nbd" in device:
             LOG.debug("Using NbdMount")
             return importutils.import_object(
                 "nova.virt.disk.mount.nbd.NbdMount",
+                image, mountdir, partition, device)
+        else:
+            LOG.debug("Using BlockMount")
+            return importutils.import_object(
+                "nova.virt.disk.mount.block.BlockMount",
                 image, mountdir, partition, device)
 
     def __init__(self, image, mount_dir, partition=None, device=None):
@@ -139,8 +148,9 @@ class Mount(object):
         if os.path.isabs(device) and os.path.exists(device):
             if device.startswith('/dev/mapper/'):
                 device = os.path.basename(device)
-                device, self.partition = device.rsplit('p', 1)
-                self.device = os.path.join('/dev', device)
+                if 'p' in device:
+                    device, self.partition = device.rsplit('p', 1)
+                    self.device = os.path.join('/dev', device)
 
     def get_dev(self):
         """Make the image available as a block device in the file system."""
@@ -157,11 +167,10 @@ class Mount(object):
         start_time = time.time()
         device = self._inner_get_dev()
         while not device:
-            LOG.info(_LI('Device allocation failed. Will retry in 2 seconds.'))
+            LOG.info('Device allocation failed. Will retry in 2 seconds.')
             time.sleep(2)
             if time.time() - start_time > MAX_DEVICE_WAIT:
-                LOG.warning(_LW('Device allocation failed after repeated '
-                                'retries.'))
+                LOG.warning('Device allocation failed after repeated retries.')
                 return False
             device = self._inner_get_dev()
         return True
@@ -175,7 +184,7 @@ class Mount(object):
 
     def map_dev(self):
         """Map partitions of the device to the file system namespace."""
-        assert(os.path.exists(self.device))
+        assert os.path.exists(self.device)
         LOG.debug("Map dev %s", self.device)
         automapped_path = '/dev/%sp%s' % (os.path.basename(self.device),
                                               self.partition)
@@ -185,23 +194,31 @@ class Mount(object):
         elif self.partition and not os.path.exists(automapped_path):
             map_path = '/dev/mapper/%sp%s' % (os.path.basename(self.device),
                                               self.partition)
-            assert(not os.path.exists(map_path))
+            assert not os.path.exists(map_path)
 
             # Note kpartx can output warnings to stderr and succeed
             # Also it can output failures to stderr and "succeed"
             # So we just go on the existence of the mapped device
-            _out, err = utils.trycmd('kpartx', '-a', self.device,
-                                     run_as_root=True, discard_warnings=True)
+            _out, err = nova.privsep.fs.create_device_maps(self.device)
+
+            @loopingcall.RetryDecorator(
+                    max_retry_count=MAX_FILE_CHECKS - 1,
+                    max_sleep_time=FILE_CHECK_INTERVAL,
+                    exceptions=IOError)
+            def recheck_path(map_path):
+                if not os.path.exists(map_path):
+                    raise IOError()
 
             # Note kpartx does nothing when presented with a raw image,
             # so given we only use it when we expect a partitioned image, fail
-            if not os.path.exists(map_path):
+            try:
+                recheck_path(map_path)
+                self.mapped_device = map_path
+                self.mapped = True
+            except IOError:
                 if not err:
                     err = _('partition %s not found') % self.partition
                 self.error = _('Failed to map partitions: %s') % err
-            else:
-                self.mapped_device = map_path
-                self.mapped = True
         elif self.partition and os.path.exists(automapped_path):
             # Note auto mapping can be enabled with the 'max_part' option
             # to the nbd or loop kernel modules. Beware of possible races
@@ -222,7 +239,7 @@ class Mount(object):
             return
         LOG.debug("Unmap dev %s", self.device)
         if self.partition and not self.automapped:
-            utils.execute('kpartx', '-d', self.device, run_as_root=True)
+            nova.privsep.fs.remove_device_maps(self.device)
         self.mapped = False
         self.automapped = False
 
@@ -230,8 +247,8 @@ class Mount(object):
         """Mount the device into the file system."""
         LOG.debug("Mount %(dev)s on %(dir)s",
                   {'dev': self.mapped_device, 'dir': self.mount_dir})
-        _out, err = utils.trycmd('mount', self.mapped_device, self.mount_dir,
-                                 discard_warnings=True, run_as_root=True)
+        out, err = nova.privsep.fs.mount(None, self.mapped_device,
+                                         self.mount_dir, None)
         if err:
             self.error = _('Failed to mount filesystem: %s') % err
             LOG.debug(self.error)
@@ -246,7 +263,7 @@ class Mount(object):
             return
         self.flush_dev()
         LOG.debug("Umount %s", self.mapped_device)
-        utils.execute('umount', self.mapped_device, run_as_root=True)
+        nova.privsep.fs.umount(self.mapped_device)
         self.mounted = False
 
     def flush_dev(self):

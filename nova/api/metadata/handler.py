@@ -19,58 +19,42 @@ import hashlib
 import hmac
 import os
 
-from oslo_config import cfg
 from oslo_log import log as logging
-import six
+from oslo_utils import encodeutils
+from oslo_utils import strutils
 import webob.dec
 import webob.exc
 
 from nova.api.metadata import base
+from nova.api import wsgi
+from nova import cache_utils
+import nova.conf
+from nova import context as nova_context
 from nova import exception
 from nova.i18n import _
-from nova.i18n import _LE
-from nova.i18n import _LW
-from nova.openstack.common import memorycache
-from nova import utils
-from nova import wsgi
+from nova.network import neutron as neutronapi
 
-CONF = cfg.CONF
-CONF.import_opt('use_forwarded_for', 'nova.api.auth')
-
-metadata_proxy_opts = [
-    cfg.BoolOpt(
-        'service_metadata_proxy',
-        default=False,
-        help='Set flag to indicate Neutron will proxy metadata requests and '
-             'resolve instance ids.'),
-     cfg.StrOpt(
-         'metadata_proxy_shared_secret',
-         default='', secret=True,
-         help='Shared secret to validate proxies Neutron metadata requests'),
-]
-
-metadata_opts = [
-    cfg.IntOpt('metadata_cache_expiration',
-               default=15,
-               help='Time in seconds to cache metadata; 0 to disable '
-                    'metadata caching entirely (not recommended). Increasing'
-                    'this should improve response times of the metadata API '
-                    'when under heavy load. Higher values may increase memory'
-                    'usage and result in longer times for host metadata '
-                    'changes to take effect.')
-]
-
-CONF.register_opts(metadata_proxy_opts, 'neutron')
-CONF.register_opts(metadata_opts)
-
+CONF = nova.conf.CONF
 LOG = logging.getLogger(__name__)
+
+# 160 networks is large enough to satisfy most cases.
+# Yet while reaching 182 networks Neutron server will break as URL length
+# exceeds the maximum. Left this at 160 to allow additional parameters when
+# they're needed.
+MAX_QUERY_NETWORKS = 160
 
 
 class MetadataRequestHandler(wsgi.Application):
     """Serve metadata."""
 
     def __init__(self):
-        self._cache = memorycache.get_client()
+        self._cache = cache_utils.get_client(
+                expiration_time=CONF.api.metadata_cache_expiration)
+        if (CONF.neutron.service_metadata_proxy and
+            not CONF.neutron.metadata_proxy_shared_secret):
+            LOG.warning("metadata_proxy_shared_secret is not configured, "
+                        "the metadata information returned by the proxy "
+                        "cannot be trusted")
 
     def get_metadata_by_remote_address(self, address):
         if not address:
@@ -85,10 +69,11 @@ class MetadataRequestHandler(wsgi.Application):
         try:
             data = base.get_metadata_by_address(address)
         except exception.NotFound:
+            LOG.exception('Failed to get metadata for IP %s', address)
             return None
 
-        if CONF.metadata_cache_expiration > 0:
-            self._cache.set(cache_key, data, CONF.metadata_cache_expiration)
+        if CONF.api.metadata_cache_expiration > 0:
+            self._cache.set(cache_key, data)
 
         return data
 
@@ -104,8 +89,8 @@ class MetadataRequestHandler(wsgi.Application):
         except exception.NotFound:
             return None
 
-        if CONF.metadata_cache_expiration > 0:
-            self._cache.set(cache_key, data, CONF.metadata_cache_expiration)
+        if CONF.api.metadata_cache_expiration > 0:
+            self._cache.set(cache_key, data)
 
         return data
 
@@ -113,18 +98,27 @@ class MetadataRequestHandler(wsgi.Application):
     def __call__(self, req):
         if os.path.normpath(req.path_info) == "/":
             resp = base.ec2_md_print(base.VERSIONS + ["latest"])
-            req.response.body = resp
+            req.response.body = encodeutils.to_utf8(resp)
             req.response.content_type = base.MIME_TYPE_TEXT_PLAIN
             return req.response
 
+        # Convert webob.headers.EnvironHeaders to a dict and mask any sensitive
+        # details from the logs.
+        if CONF.debug:
+            headers = {k: req.headers[k] for k in req.headers}
+            LOG.debug('Metadata request headers: %s',
+                      strutils.mask_dict_password(headers))
         if CONF.neutron.service_metadata_proxy:
-            meta_data = self._handle_instance_id_request(req)
+            if req.headers.get('X-Metadata-Provider'):
+                meta_data = self._handle_instance_id_request_from_lb(req)
+            else:
+                meta_data = self._handle_instance_id_request(req)
         else:
             if req.headers.get('X-Instance-ID'):
                 LOG.warning(
-                    _LW("X-Instance-ID present in request headers. The "
-                        "'service_metadata_proxy' option must be "
-                        "enabled to process this header."))
+                    "X-Instance-ID present in request headers. The "
+                    "'service_metadata_proxy' option must be "
+                    "enabled to process this header.")
             meta_data = self._handle_remote_ip_request(req)
 
         if meta_data is None:
@@ -139,31 +133,25 @@ class MetadataRequestHandler(wsgi.Application):
             return data(req, meta_data)
 
         resp = base.ec2_md_print(data)
-        if isinstance(resp, six.text_type):
-            req.response.text = resp
-        else:
-            req.response.body = resp
+        req.response.body = encodeutils.to_utf8(resp)
 
         req.response.content_type = meta_data.get_mimetype()
         return req.response
 
     def _handle_remote_ip_request(self, req):
         remote_address = req.remote_addr
-        if CONF.use_forwarded_for:
-            remote_address = req.headers.get('X-Forwarded-For', remote_address)
 
         try:
             meta_data = self.get_metadata_by_remote_address(remote_address)
         except Exception:
-            LOG.exception(_LE('Failed to get metadata for ip: %s'),
+            LOG.exception('Failed to get metadata for IP %s',
                           remote_address)
             msg = _('An unknown error has occurred. '
                     'Please try your request again.')
-            raise webob.exc.HTTPInternalServerError(
-                                               explanation=six.text_type(msg))
+            raise webob.exc.HTTPInternalServerError(explanation=str(msg))
 
         if meta_data is None:
-            LOG.error(_LE('Failed to get metadata for ip: %s'),
+            LOG.error('Failed to get metadata for IP %s: no metadata',
                       remote_address)
 
         return meta_data
@@ -182,9 +170,9 @@ class MetadataRequestHandler(wsgi.Application):
             msg = _('X-Instance-ID-Signature header is missing from request.')
         elif tenant_id is None:
             msg = _('X-Tenant-ID header is missing from request.')
-        elif not isinstance(instance_id, six.string_types):
+        elif not isinstance(instance_id, str):
             msg = _('Multiple X-Instance-ID headers found within request.')
-        elif not isinstance(tenant_id, six.string_types):
+        elif not isinstance(tenant_id, str):
             msg = _('Multiple X-Tenant-ID headers found within request.')
         else:
             msg = None
@@ -192,43 +180,157 @@ class MetadataRequestHandler(wsgi.Application):
         if msg:
             raise webob.exc.HTTPBadRequest(explanation=msg)
 
+        self._validate_shared_secret(instance_id, signature,
+                                     remote_address)
+
+        return self._get_meta_by_instance_id(instance_id, tenant_id,
+                                             remote_address)
+
+    def _get_instance_id_from_lb(self, provider_id, instance_address):
+        # We use admin context, admin=True to lookup the
+        # inter-Edge network port
+        context = nova_context.get_admin_context()
+        neutron = neutronapi.get_client(context, admin=True)
+
+        # Tenant, instance ids are found in the following method:
+        #  X-Metadata-Provider contains id of the metadata provider, and since
+        #  overlapping networks cannot be connected to the same metadata
+        #  provider, the combo of tenant's instance IP and the metadata
+        #  provider has to be unique.
+        #
+        #  The networks which are connected to the metadata provider are
+        #  retrieved in the 1st call to neutron.list_subnets()
+        #  In the 2nd call we read the ports which belong to any of the
+        #  networks retrieved above, and have the X-Forwarded-For IP address.
+        #  This combination has to be unique as explained above, and we can
+        #  read the instance_id, tenant_id from that port entry.
+
+        # Retrieve networks which are connected to metadata provider
+        md_subnets = neutron.list_subnets(
+            context,
+            advanced_service_providers=[provider_id],
+            fields=['network_id'])
+
+        if not md_subnets or not md_subnets.get('subnets'):
+            msg = _('Could not find any subnets for provider %s') % provider_id
+            LOG.error(msg)
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+        md_networks = [subnet['network_id']
+                       for subnet in md_subnets['subnets']]
+
+        try:
+            # Retrieve the instance data from the instance's port
+            ports = []
+            while md_networks:
+                ports.extend(neutron.list_ports(
+                    context,
+                    fixed_ips='ip_address=' + instance_address,
+                    network_id=md_networks[:MAX_QUERY_NETWORKS],
+                    fields=['device_id', 'tenant_id'])['ports'])
+                md_networks = md_networks[MAX_QUERY_NETWORKS:]
+        except Exception as e:
+            LOG.error('Failed to get instance id for metadata '
+                      'request, provider %(provider)s '
+                      'networks %(networks)s '
+                      'requester %(requester)s. Error: %(error)s',
+                      {'provider': provider_id,
+                       'networks': md_networks,
+                       'requester': instance_address,
+                       'error': e})
+            msg = _('An unknown error has occurred. '
+                    'Please try your request again.')
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+        if len(ports) != 1:
+            msg = _('Expected a single port matching provider %(pr)s '
+                    'and IP %(ip)s. Found %(count)d.') % {
+                        'pr': provider_id,
+                        'ip': instance_address,
+                        'count': len(ports)}
+
+            LOG.error(msg)
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+        instance_data = ports[0]
+        instance_id = instance_data['device_id']
+        tenant_id = instance_data['tenant_id']
+
+        # instance_data is unicode-encoded, while cache_utils doesn't like
+        # that. Therefore we convert to str
+        if isinstance(instance_id, str):
+            instance_id = instance_id.encode('utf-8')
+        return instance_id, tenant_id
+
+    def _handle_instance_id_request_from_lb(self, req):
+        remote_address = req.headers.get('X-Forwarded-For')
+        if remote_address is None:
+            msg = _('X-Forwarded-For is missing from request.')
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+        provider_id = req.headers.get('X-Metadata-Provider')
+        if provider_id is None:
+            msg = _('X-Metadata-Provider is missing from request.')
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+        instance_address = remote_address.split(',')[0]
+
+        # If authentication token is set, authenticate
+        if CONF.neutron.metadata_proxy_shared_secret:
+            signature = req.headers.get('X-Metadata-Provider-Signature')
+            self._validate_shared_secret(provider_id, signature,
+                                         instance_address)
+
+        cache_key = 'provider-%s-%s' % (provider_id, instance_address)
+        data = self._cache.get(cache_key)
+        if data:
+            LOG.debug("Using cached metadata for %s for %s",
+                      provider_id, instance_address)
+            instance_id, tenant_id = data
+        else:
+            instance_id, tenant_id = self._get_instance_id_from_lb(
+                provider_id, instance_address)
+            if CONF.api.metadata_cache_expiration > 0:
+                self._cache.set(cache_key, (instance_id, tenant_id))
+            LOG.debug('Instance %s with address %s matches provider %s',
+                      instance_id, remote_address, provider_id)
+        return self._get_meta_by_instance_id(instance_id, tenant_id,
+                                             instance_address)
+
+    def _validate_shared_secret(self, requestor_id, signature,
+                                requestor_address):
         expected_signature = hmac.new(
-            CONF.neutron.metadata_proxy_shared_secret,
-            instance_id,
+            encodeutils.to_utf8(CONF.neutron.metadata_proxy_shared_secret),
+            encodeutils.to_utf8(requestor_id),
             hashlib.sha256).hexdigest()
-
-        if not utils.constant_time_compare(expected_signature, signature):
-            if instance_id:
-                LOG.warning(_LW('X-Instance-ID-Signature: %(signature)s does '
-                                'not match the expected value: '
-                                '%(expected_signature)s for id: '
-                                '%(instance_id)s. Request From: '
-                                '%(remote_address)s'),
+        if (not signature or
+                not hmac.compare_digest(expected_signature, signature)):
+            if requestor_id:
+                LOG.warning('X-Instance-ID-Signature: %(signature)s does '
+                            'not match the expected signature for id: '
+                            '%(requestor_id)s. Request From: '
+                            '%(requestor_address)s',
                             {'signature': signature,
-                             'expected_signature': expected_signature,
-                             'instance_id': instance_id,
-                             'remote_address': remote_address})
-
+                             'requestor_id': requestor_id,
+                             'requestor_address': requestor_address})
             msg = _('Invalid proxy request signature.')
             raise webob.exc.HTTPForbidden(explanation=msg)
 
+    def _get_meta_by_instance_id(self, instance_id, tenant_id, remote_address):
         try:
             meta_data = self.get_metadata_by_instance_id(instance_id,
                                                          remote_address)
         except Exception:
-            LOG.exception(_LE('Failed to get metadata for instance id: %s'),
+            LOG.exception('Failed to get metadata for instance id: %s',
                           instance_id)
             msg = _('An unknown error has occurred. '
                     'Please try your request again.')
-            raise webob.exc.HTTPInternalServerError(
-                                               explanation=six.text_type(msg))
+            raise webob.exc.HTTPInternalServerError(explanation=str(msg))
 
         if meta_data is None:
-            LOG.error(_LE('Failed to get metadata for instance id: %s'),
+            LOG.error('Failed to get metadata for instance id: %s',
                       instance_id)
         elif meta_data.instance.project_id != tenant_id:
-            LOG.warning(_LW("Tenant_id %(tenant_id)s does not match tenant_id "
-                            "of instance %(instance_id)s."),
+            LOG.warning("Tenant_id %(tenant_id)s does not match tenant_id "
+                        "of instance %(instance_id)s.",
                         {'tenant_id': tenant_id, 'instance_id': instance_id})
             # causes a 404 to be raised
             meta_data = None

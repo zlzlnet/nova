@@ -12,19 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import mock
+from io import StringIO
+from unittest import mock
+
+import fixtures
 from oslo_log import log as logging
+from oslo_reports import guru_meditation_report as gmr
 
 from nova.cmd import baseproxy
 from nova import config
 from nova.console import websocketproxy
-from nova.openstack.common.report import guru_meditation_report as gmr
 from nova import test
 from nova import version
 
 
 @mock.patch.object(config, 'parse_args', new=lambda *args, **kwargs: None)
 class BaseProxyTestCase(test.NoDBTestCase):
+
+    def setUp(self):
+        super(BaseProxyTestCase, self).setUp()
+        self.stderr = StringIO()
+        self.useFixture(fixtures.MonkeyPatch('sys.stderr', self.stderr))
 
     @mock.patch('os.path.exists', return_value=False)
     # NOTE(mriedem): sys.exit raises TestingException so we can actually exit
@@ -35,6 +43,8 @@ class BaseProxyTestCase(test.NoDBTestCase):
         self.assertRaises(test.TestingException, baseproxy.proxy,
                           '0.0.0.0', '6080')
         mock_exit.assert_called_once_with(-1)
+        self.assertEqual(self.stderr.getvalue(),
+                         "SSL only and self.pem not found\n")
 
     @mock.patch('os.path.exists', return_value=False)
     @mock.patch('sys.exit', side_effect=test.TestingException)
@@ -47,18 +57,72 @@ class BaseProxyTestCase(test.NoDBTestCase):
     @mock.patch('os.path.exists', return_value=True)
     @mock.patch.object(logging, 'setup')
     @mock.patch.object(gmr.TextGuruMeditation, 'setup_autorun')
-    @mock.patch.object(websocketproxy.NovaWebSocketProxy, '__init__',
-                       return_value=None)
-    @mock.patch.object(websocketproxy.NovaWebSocketProxy, 'start_server')
-    def test_proxy(self, mock_start, mock_init, mock_gmr, mock_log,
-                   mock_exists):
+    @mock.patch('nova.console.websocketproxy.NovaWebSocketProxy.__init__',
+                return_value=None)
+    @mock.patch('nova.console.websocketproxy.NovaWebSocketProxy.start_server')
+    @mock.patch('websockify.websocketproxy.select_ssl_version',
+                return_value=None)
+    def test_proxy(self, mock_select_ssl_version, mock_start, mock_init,
+                   mock_gmr, mock_log, mock_exists):
         baseproxy.proxy('0.0.0.0', '6080')
         mock_log.assert_called_once_with(baseproxy.CONF, 'nova')
-        mock_gmr.mock_assert_called_once_with(version)
+        mock_gmr.assert_called_once_with(version, conf=baseproxy.CONF)
         mock_init.assert_called_once_with(
             listen_host='0.0.0.0', listen_port='6080', source_is_ipv6=False,
-            verbose=False, cert='self.pem', key=None, ssl_only=False,
-            daemon=False, record=False, traffic=False,
+            cert='self.pem', key=None, ssl_only=False, ssl_ciphers=None,
+            ssl_minimum_version='default', daemon=False, record=None,
+            security_proxy=None, traffic=False,
+            web='/usr/share/spice-html5', file_only=True,
+            RequestHandlerClass=websocketproxy.NovaProxyRequestHandler)
+        mock_start.assert_called_once_with()
+
+    @mock.patch('os.path.exists', return_value=False)
+    @mock.patch('sys.exit', side_effect=test.TestingException)
+    def test_proxy_exit_with_error(self, mock_exit, mock_exists):
+        self.flags(ssl_only=True)
+        self.assertRaises(test.TestingException, baseproxy.proxy,
+                          '0.0.0.0', '6080')
+        self.assertEqual(self.stderr.getvalue(),
+                         "SSL only and self.pem not found\n")
+        mock_exit.assert_called_once_with(-1)
+
+    @mock.patch('os.path.exists', return_value=True)
+    @mock.patch('nova.console.websocketproxy.NovaWebSocketProxy.__init__',
+                return_value=None)
+    @mock.patch('nova.console.websocketproxy.NovaWebSocketProxy.start_server')
+    def test_proxy_ssl_settings(self, mock_start, mock_init, mock_exists):
+        self.flags(ssl_minimum_version='tlsv1_3', group='console')
+        self.flags(ssl_ciphers='ALL:!aNULL', group='console')
+        baseproxy.proxy('0.0.0.0', '6080')
+        mock_init.assert_called_once_with(
+            listen_host='0.0.0.0', listen_port='6080', source_is_ipv6=False,
+            cert='self.pem', key=None, ssl_only=False,
+            ssl_ciphers='ALL:!aNULL', ssl_minimum_version='tlsv1_3',
+            daemon=False, record=None, security_proxy=None, traffic=False,
+            web='/usr/share/spice-html5', file_only=True,
+            RequestHandlerClass=websocketproxy.NovaProxyRequestHandler)
+
+    @mock.patch('os.path.exists', return_value=True)
+    @mock.patch.object(logging, 'setup')
+    @mock.patch.object(gmr.TextGuruMeditation, 'setup_autorun')
+    @mock.patch('nova.console.websocketproxy.NovaWebSocketProxy.__init__',
+                return_value=None)
+    @mock.patch('nova.console.websocketproxy.NovaWebSocketProxy.start_server')
+    @mock.patch('websockify.websocketproxy.select_ssl_version',
+                return_value=None)
+    def test_proxy_with_traffic_logging(
+        self, mock_select_ssl_version, mock_start, mock_init, mock_gmr,
+        mock_log, mock_exists,
+    ):
+        self.flags(debug=True)
+        baseproxy.proxy('0.0.0.0', '6080')
+        mock_log.assert_called_once_with(baseproxy.CONF, 'nova')
+        mock_gmr.assert_called_once_with(version, conf=baseproxy.CONF)
+        mock_init.assert_called_once_with(
+            listen_host='0.0.0.0', listen_port='6080', source_is_ipv6=False,
+            cert='self.pem', key=None, ssl_only=False, ssl_ciphers=None,
+            ssl_minimum_version='default', daemon=False, record=None,
+            security_proxy=None, traffic=True,
             web='/usr/share/spice-html5', file_only=True,
             RequestHandlerClass=websocketproxy.NovaProxyRequestHandler)
         mock_start.assert_called_once_with()

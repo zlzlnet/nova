@@ -10,16 +10,23 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from nova import db
-from nova import objects
+from nova.db.main import api as db
 from nova.objects import base
 from nova.objects import fields
+
+MAX_TAG_LENGTH = 60
+
+__all__ = [
+    'Tag',
+    'TagList',
+]
 
 
 @base.NovaObjectRegistry.register
 class Tag(base.NovaObject):
     # Version 1.0: Initial version
-    VERSION = '1.0'
+    # Version 1.1: Added method exists()
+    VERSION = '1.1'
 
     fields = {
         'resource_id': fields.StringField(),
@@ -39,33 +46,40 @@ class Tag(base.NovaObject):
         db_tag = db.instance_tag_add(self._context, self.resource_id, self.tag)
         self._from_db_object(self._context, self, db_tag)
 
-    @base.remotable_classmethod
+    @classmethod
+    @base.remotable
     def destroy(cls, context, resource_id, name):
         db.instance_tag_delete(context, resource_id, name)
+
+    @classmethod
+    @base.remotable
+    def exists(cls, context, resource_id, name):
+        return db.instance_tag_exists(context, resource_id, name)
 
 
 @base.NovaObjectRegistry.register
 class TagList(base.ObjectListBase, base.NovaObject):
     # Version 1.0: Initial version
-    VERSION = '1.0'
+    # Version 1.1: Tag <= version 1.1
+    VERSION = '1.1'
 
     fields = {
         'objects': fields.ListOfObjectsField('Tag'),
         }
-    child_versions = {
-        '1.0': '1.0',
-        }
 
-    @base.remotable_classmethod
+    @classmethod
+    @base.remotable
     def get_by_resource_id(cls, context, resource_id):
         db_tags = db.instance_tag_get_by_instance_uuid(context, resource_id)
-        return base.obj_make_list(context, cls(), objects.Tag, db_tags)
+        return base.obj_make_list(context, cls(), db_tags)
 
-    @base.remotable_classmethod
+    @classmethod
+    @base.remotable
     def create(cls, context, resource_id, tags):
         db_tags = db.instance_tag_set(context, resource_id, tags)
-        return base.obj_make_list(context, cls(), objects.Tag, db_tags)
+        return base.obj_make_list(context, cls(), db_tags)
 
-    @base.remotable_classmethod
+    @classmethod
+    @base.remotable
     def destroy(cls, context, resource_id):
         db.instance_tag_delete_all(context, resource_id)

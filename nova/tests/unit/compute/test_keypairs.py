@@ -14,23 +14,25 @@
 #    under the License.
 """Tests for keypair API."""
 
+from unittest import mock
+
 from oslo_concurrency import processutils
 from oslo_config import cfg
-import six
+from oslo_limit import fixture as limit_fixture
 
 from nova.compute import api as compute_api
 from nova import context
-from nova import db
 from nova import exception
+from nova.limit import local as local_limit
 from nova.objects import keypair as keypair_obj
 from nova import quota
+from nova.tests import fixtures as nova_fixtures
 from nova.tests.unit.compute import test_compute
 from nova.tests.unit import fake_crypto
-from nova.tests.unit import fake_notifier
 from nova.tests.unit.objects import test_keypair
+from nova.tests.unit import utils as test_utils
 
 CONF = cfg.CONF
-QUOTAS = quota.QUOTAS
 
 
 class KeypairAPITestCase(test_compute.BaseTestCase):
@@ -54,7 +56,7 @@ class KeypairAPITestCase(test_compute.BaseTestCase):
 
     def _keypair_db_call_stubs(self):
 
-        def db_key_pair_get_all_by_user(context, user_id):
+        def db_key_pair_get_all_by_user(context, user_id, limit, marker):
             return [dict(test_keypair.fake_keypair,
                          name=self.existing_key_name,
                          public_key=self.pub_key,
@@ -76,19 +78,18 @@ class KeypairAPITestCase(test_compute.BaseTestCase):
             else:
                 raise exception.KeypairNotFound(user_id=user_id, name=name)
 
-        self.stubs.Set(db, "key_pair_get_all_by_user",
-                       db_key_pair_get_all_by_user)
-        self.stubs.Set(db, "key_pair_create",
-                       db_key_pair_create)
-        self.stubs.Set(db, "key_pair_destroy",
-                       db_key_pair_destroy)
-        self.stubs.Set(db, "key_pair_get",
-                       db_key_pair_get)
+        self.stub_out(
+            'nova.objects.KeyPairList._get_from_db',
+            db_key_pair_get_all_by_user)
+        self.stub_out('nova.objects.KeyPair._create_in_db', db_key_pair_create)
+        self.stub_out(
+            'nova.objects.KeyPair._destroy_in_db', db_key_pair_destroy)
+        self.stub_out('nova.objects.KeyPair._get_from_db', db_key_pair_get)
 
     def _check_notifications(self, action='create', key_name='foo'):
-        self.assertEqual(2, len(fake_notifier.NOTIFICATIONS))
+        self.assertEqual(2, len(self.notifier.notifications))
 
-        n1 = fake_notifier.NOTIFICATIONS[0]
+        n1 = self.notifier.notifications[0]
         self.assertEqual('INFO', n1.priority)
         self.assertEqual('keypair.%s.start' % action, n1.event_type)
         self.assertEqual('api.%s' % CONF.host, n1.publisher_id)
@@ -96,7 +97,7 @@ class KeypairAPITestCase(test_compute.BaseTestCase):
         self.assertEqual('fake', n1.payload['tenant_id'])
         self.assertEqual(key_name, n1.payload['key_name'])
 
-        n2 = fake_notifier.NOTIFICATIONS[1]
+        n2 = self.notifier.notifications[1]
         self.assertEqual('INFO', n2.priority)
         self.assertEqual('keypair.%s.end' % action, n2.event_type)
         self.assertEqual('api.%s' % CONF.host, n2.publisher_id)
@@ -122,55 +123,86 @@ class CreateImportSharedTestMixIn(object):
 
         exc = self.assertRaises(exc_class, func, self.ctxt, self.ctxt.user_id,
                                 name, *args)
-        self.assertEqual(expected_message, six.text_type(exc))
-
-    def assertInvalidKeypair(self, expected_message, name):
-        msg = 'Keypair data is invalid: %s' % expected_message
-        self.assertKeypairRaises(exception.InvalidKeypair, msg, name)
-
-    def test_name_too_short(self):
-        msg = ('Keypair name must be string and between 1 '
-               'and 255 characters long')
-        self.assertInvalidKeypair(msg, '')
-
-    def test_name_too_long(self):
-        msg = ('Keypair name must be string and between 1 '
-               'and 255 characters long')
-        self.assertInvalidKeypair(msg, 'x' * 256)
-
-    def test_invalid_chars(self):
-        msg = "Keypair name contains unsafe characters"
-        self.assertInvalidKeypair(msg, '* BAD CHARACTERS!  *')
+        self.assertIn(expected_message, str(exc))
 
     def test_already_exists(self):
         def db_key_pair_create_duplicate(context, keypair):
             raise exception.KeyPairExists(key_name=keypair.get('name', ''))
 
-        self.stubs.Set(db, "key_pair_create", db_key_pair_create_duplicate)
+        self.stub_out(
+            'nova.objects.KeyPair._create_in_db', db_key_pair_create_duplicate)
 
         msg = ("Key pair '%(key_name)s' already exists." %
                {'key_name': self.existing_key_name})
         self.assertKeypairRaises(exception.KeyPairExists, msg,
                                  self.existing_key_name)
 
-    def test_quota_limit(self):
-        def fake_quotas_count(self, context, resource, *args, **kwargs):
-            return CONF.quota_key_pairs
-
-        self.stubs.Set(QUOTAS, "count", fake_quotas_count)
-
-        msg = "Maximum number of key pairs exceeded"
+    @mock.patch.object(quota.QUOTAS, 'count_as_dict',
+                       return_value={'user': {
+                                         'key_pairs': CONF.quota.key_pairs}})
+    def test_quota_limit(self, mock_count_as_dict):
+        msg = "Quota exceeded, too many key pairs."
         self.assertKeypairRaises(exception.KeypairLimitExceeded, msg, 'foo')
+
+    def _test_quota_during_recheck(self, mock_method, msg):
+        # Skip for import key pair due to bug 1959732.
+        if self.func_name == 'import_key_pair':
+            self.skipTest('bug/1959732: import_key_pair missing quota recheck')
+
+        self.assertKeypairRaises(exception.KeypairLimitExceeded, msg, 'foo')
+        self.assertEqual(2, mock_method.call_count)
+
+    @mock.patch('nova.objects.Quotas.check_deltas')
+    def test_quota_during_recheck(self, mock_check):
+        """Simulate a race where this request initially has enough quota to
+        progress partially through the create path but then fails the quota
+        recheck because a parallel request filled up the quota first.
+        """
+        # First quota check succeeds, second (recheck) fails.
+        mock_check.side_effect = [None,
+                                  exception.OverQuota(overs='key_pairs')]
+        msg = "Quota exceeded, too many key pairs."
+        self._test_quota_during_recheck(mock_check, msg)
+
+    def test_quota_unified_limits(self):
+        self.flags(driver="nova.quota.UnifiedLimitsDriver", group="quota")
+        ul_api = self.useFixture(nova_fixtures.UnifiedLimitsFixture())
+        ul_api.create_registered_limit(
+            resource_name='server_key_pairs', default_limit=0)
+        msg = ("Resource %s is over limit" % local_limit.KEY_PAIRS)
+        self.assertKeypairRaises(exception.KeypairLimitExceeded, msg, 'foo')
+
+    @mock.patch('nova.limit.local.enforce_db_limit')
+    def test_quota_during_recheck_unified_limits(self, mock_enforce):
+        """Simulate a race where this request initially has enough quota to
+        progress partially through the create path but then fails the quota
+        recheck because a parallel request filled up the quota first.
+        """
+        self.flags(driver="nova.quota.UnifiedLimitsDriver", group="quota")
+        ul_api = self.useFixture(nova_fixtures.UnifiedLimitsFixture())
+        ul_api.create_registered_limit(
+            resource_name='server_key_pairs', default_limit=100)
+        # First quota check succeeds, second (recheck) fails.
+        mock_enforce.side_effect = [
+            None, exception.KeypairLimitExceeded('oslo.limit message')]
+        msg = 'oslo.limit message'
+        self._test_quota_during_recheck(mock_enforce, msg)
 
 
 class CreateKeypairTestCase(KeypairAPITestCase, CreateImportSharedTestMixIn):
     func_name = 'create_key_pair'
 
-    def _check_success(self):
+    @mock.patch('nova.compute.utils.notify_about_keypair_action')
+    def _check_success(self, mock_notify):
         keypair, private_key = self.keypair_api.create_key_pair(
             self.ctxt, self.ctxt.user_id, 'foo', key_type=self.keypair_type)
         self.assertEqual('foo', keypair['name'])
         self.assertEqual(self.keypair_type, keypair['type'])
+        mock_notify.assert_has_calls([
+            mock.call(context=self.ctxt, keypair=keypair,
+                      action='create', phase='start'),
+            mock.call(context=self.ctxt, keypair=keypair,
+                      action='create', phase='end')])
         self._check_notifications()
 
     def test_success_ssh(self):
@@ -190,11 +222,33 @@ class CreateKeypairTestCase(KeypairAPITestCase, CreateImportSharedTestMixIn):
         self.assertRaises(processutils.ProcessExecutionError,
                           self._check_success)
 
+    def test_success_unified_limits(self):
+        self.flags(driver="nova.quota.UnifiedLimitsDriver", group="quota")
+        self.useFixture(limit_fixture.LimitFixture(
+            {'server_key_pairs': 1}, {}))
+        self._check_success()
+
+    @mock.patch('nova.objects.Quotas.check_deltas')
+    def test_quota_recheck_disabled(self, mock_check):
+        self.flags(recheck_quota=False, group="quota")
+        self._check_success()
+        self.assertEqual(1, mock_check.call_count)
+
+    @mock.patch('nova.limit.local.enforce_db_limit')
+    def test_quota_recheck_disabled_unified_limits(self, mock_enforce):
+        self.flags(driver="nova.quota.UnifiedLimitsDriver", group="quota")
+        self.flags(recheck_quota=False, group="quota")
+        self.useFixture(limit_fixture.LimitFixture(
+            {'server_key_pairs': 1}, {}))
+        self._check_success()
+        self.assertEqual(1, mock_enforce.call_count)
+
 
 class ImportKeypairTestCase(KeypairAPITestCase, CreateImportSharedTestMixIn):
     func_name = 'import_key_pair'
 
-    def _check_success(self):
+    @mock.patch('nova.compute.utils.notify_about_keypair_action')
+    def _check_success(self, mock_notify):
         keypair = self.keypair_api.import_key_pair(self.ctxt,
                                                    self.ctxt.user_id,
                                                    'foo',
@@ -206,9 +260,20 @@ class ImportKeypairTestCase(KeypairAPITestCase, CreateImportSharedTestMixIn):
         self.assertEqual(self.fingerprint, keypair['fingerprint'])
         self.assertEqual(self.pub_key, keypair['public_key'])
         self.assertEqual(self.keypair_type, keypair['type'])
+        mock_notify.assert_has_calls([
+            mock.call(context=self.ctxt, keypair=keypair,
+                      action='import', phase='start'),
+            mock.call(context=self.ctxt, keypair=keypair,
+                      action='import', phase='end')])
         self._check_notifications(action='import')
 
     def test_success_ssh(self):
+        self._check_success()
+
+    def test_success_ssh_ed25519(self):
+        self.pub_key = ('ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFl6u75BTi8xGtSPm'
+                        '1yVJuLE/oMtCOuEMJJnBSuZEdXz')
+        self.fingerprint = '1a:1d:a7:2c:4c:ff:15:c4:70:13:38:b6:ac:4c:dc:12'
         self._check_success()
 
     def test_success_x509(self):
@@ -224,7 +289,28 @@ class ImportKeypairTestCase(KeypairAPITestCase, CreateImportSharedTestMixIn):
                                 self.ctxt, self.ctxt.user_id, 'foo',
                                 'bad key data')
         msg = u'Keypair data is invalid: failed to generate fingerprint'
-        self.assertEqual(msg, six.text_type(exc))
+        self.assertEqual(msg, str(exc))
+
+    def test_success_unified_limits(self):
+        self.flags(driver="nova.quota.UnifiedLimitsDriver", group="quota")
+        self.useFixture(limit_fixture.LimitFixture(
+            {'server_key_pairs': 1}, {}))
+        self._check_success()
+
+    @mock.patch('nova.objects.Quotas.check_deltas')
+    def test_quota_recheck_disabled(self, mock_check):
+        self.flags(recheck_quota=False, group="quota")
+        self._check_success()
+        self.assertEqual(1, mock_check.call_count)
+
+    @mock.patch('nova.limit.local.enforce_db_limit')
+    def test_quota_recheck_disabled_unified_limits(self, mock_enforce):
+        self.flags(driver="nova.quota.UnifiedLimitsDriver", group="quota")
+        self.flags(recheck_quota=False, group="quota")
+        self.useFixture(limit_fixture.LimitFixture(
+            {'server_key_pairs': 1}, {}))
+        self._check_success()
+        self.assertEqual(1, mock_enforce.call_count)
 
 
 class GetKeypairTestCase(KeypairAPITestCase):
@@ -243,14 +329,23 @@ class GetKeypairsTestCase(KeypairAPITestCase):
 
 
 class DeleteKeypairTestCase(KeypairAPITestCase):
-    def test_success(self):
-        self.keypair_api.get_key_pair(self.ctxt, self.ctxt.user_id,
-                                      self.existing_key_name)
+    @mock.patch('nova.compute.utils.notify_about_keypair_action')
+    def test_success(self, mock_notify):
         self.keypair_api.delete_key_pair(self.ctxt, self.ctxt.user_id,
                 self.existing_key_name)
         self.assertRaises(exception.KeypairNotFound,
                 self.keypair_api.get_key_pair, self.ctxt, self.ctxt.user_id,
                 self.existing_key_name)
 
+        match_by_name = test_utils.CustomMockCallMatcher(
+            lambda keypair: keypair['name'] == self.existing_key_name)
+
+        mock_notify.assert_has_calls([
+            mock.call(context=self.ctxt,
+                      keypair=match_by_name,
+                      action='delete', phase='start'),
+            mock.call(context=self.ctxt,
+                      keypair=match_by_name,
+                      action='delete', phase='end')])
         self._check_notifications(action='delete',
                 key_name=self.existing_key_name)

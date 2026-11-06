@@ -13,139 +13,183 @@
 #    under the License.
 
 from oslo_serialization import jsonutils
+from oslo_utils import versionutils
 
 from nova import exception
 from nova.objects import base
-from nova.objects import fields
+from nova.objects import fields as obj_fields
 from nova.virt import hardware
 
-
-def all_things_equal(obj_a, obj_b):
-    for name in obj_a.fields:
-        set_a = obj_a.obj_attr_is_set(name)
-        set_b = obj_b.obj_attr_is_set(name)
-        if set_a != set_b:
-            return False
-        elif not set_a:
-            continue
-
-        if getattr(obj_a, name) != getattr(obj_b, name):
-                return False
-    return True
+__all__ = [
+    'NUMACell',
+    'NUMAPagesTopology',
+    'NUMATopology',
+    'NUMATopologyLimits',
+]
 
 
-# TODO(berrange): Remove NovaObjectDictCompat
 @base.NovaObjectRegistry.register
-class NUMACell(base.NovaObject,
-               base.NovaObjectDictCompat):
+class NUMACell(base.NovaObject):
     # Version 1.0: Initial version
     # Version 1.1: Added pinned_cpus and siblings fields
     # Version 1.2: Added mempages field
-    VERSION = '1.2'
+    # Version 1.3: Add network_metadata field
+    # Version 1.4: Add pcpuset
+    # Version 1.5: Add socket
+    VERSION = '1.5'
 
     fields = {
-        'id': fields.IntegerField(read_only=True),
-        'cpuset': fields.SetOfIntegersField(),
-        'memory': fields.IntegerField(),
-        'cpu_usage': fields.IntegerField(default=0),
-        'memory_usage': fields.IntegerField(default=0),
-        'pinned_cpus': fields.SetOfIntegersField(),
-        'siblings': fields.ListOfSetsOfIntegersField(),
-        'mempages': fields.ListOfObjectsField('NUMAPagesTopology'),
-        }
-
-    obj_relationships = {
-        'mempages': [('1.2', '1.0')]
+        'id': obj_fields.IntegerField(read_only=True),
+        'cpuset': obj_fields.SetOfIntegersField(),
+        'pcpuset': obj_fields.SetOfIntegersField(),
+        'memory': obj_fields.IntegerField(),
+        'cpu_usage': obj_fields.IntegerField(default=0),
+        'memory_usage': obj_fields.IntegerField(default=0),
+        'pinned_cpus': obj_fields.SetOfIntegersField(),
+        'siblings': obj_fields.ListOfSetsOfIntegersField(),
+        'mempages': obj_fields.ListOfObjectsField('NUMAPagesTopology'),
+        'network_metadata': obj_fields.ObjectField('NetworkMetadata'),
+        'socket': obj_fields.IntegerField(nullable=True),
     }
 
+    def obj_make_compatible(self, primitive, target_version):
+        super(NUMACell, self).obj_make_compatible(primitive, target_version)
+        target_version = versionutils.convert_version_to_tuple(target_version)
+        if target_version < (1, 5):
+            primitive.pop('socket', None)
+        if target_version < (1, 4):
+            primitive.pop('pcpuset', None)
+        if target_version < (1, 3):
+            primitive.pop('network_metadata', None)
+
     def __eq__(self, other):
-        return all_things_equal(self, other)
+        return base.all_things_equal(self, other)
 
     def __ne__(self, other):
         return not (self == other)
 
     @property
-    def free_cpus(self):
-        return self.cpuset - self.pinned_cpus or set()
+    def free_pcpus(self):
+        """Return available dedicated CPUs."""
+        return self.pcpuset - self.pinned_cpus or set()
 
     @property
     def free_siblings(self):
-        return [sibling_set & self.free_cpus
-                for sibling_set in self.siblings]
+        """Return available dedicated CPUs in their sibling set form."""
+        return [sibling_set & self.free_pcpus for sibling_set in self.siblings]
 
     @property
-    def avail_cpus(self):
-        return len(self.free_cpus)
+    def avail_pcpus(self):
+        """Return number of available dedicated CPUs."""
+        return len(self.free_pcpus)
 
     @property
     def avail_memory(self):
         return self.memory - self.memory_usage
 
+    @property
+    def has_threads(self):
+        """Check if SMT threads, a.k.a. HyperThreads, are present."""
+        return any(len(sibling_set) > 1 for sibling_set in self.siblings)
+
     def pin_cpus(self, cpus):
+        if cpus - self.pcpuset:
+            raise exception.CPUPinningUnknown(requested=list(cpus),
+                                              available=list(self.pcpuset))
+
         if self.pinned_cpus & cpus:
+            available = list(self.pcpuset - self.pinned_cpus)
             raise exception.CPUPinningInvalid(requested=list(cpus),
-                                              pinned=list(self.pinned_cpus))
+                                              available=available)
+
         self.pinned_cpus |= cpus
 
     def unpin_cpus(self, cpus):
+        if cpus - self.pcpuset:
+            raise exception.CPUUnpinningUnknown(requested=list(cpus),
+                                                available=list(self.pcpuset))
+
         if (self.pinned_cpus & cpus) != cpus:
-            raise exception.CPUPinningInvalid(requested=list(cpus),
-                                              pinned=list(self.pinned_cpus))
+            raise exception.CPUUnpinningInvalid(requested=list(cpus),
+                                                available=list(
+                                                    self.pinned_cpus))
+
         self.pinned_cpus -= cpus
 
-    def _to_dict(self):
-        return {
-            'id': self.id,
-            'cpus': hardware.format_cpu_spec(
-                self.cpuset, allow_ranges=False),
-            'mem': {
-                'total': self.memory,
-                'used': self.memory_usage},
-            'cpu_usage': self.cpu_usage}
+    def pin_cpus_with_siblings(self, cpus):
+        """Pin (consume) both thread siblings if one of them is requested to
+        be pinned.
 
-    @classmethod
-    def _from_dict(cls, data_dict):
-        cpuset = hardware.parse_cpu_spec(
-            data_dict.get('cpus', ''))
-        cpu_usage = data_dict.get('cpu_usage', 0)
-        memory = data_dict.get('mem', {}).get('total', 0)
-        memory_usage = data_dict.get('mem', {}).get('used', 0)
-        cell_id = data_dict.get('id')
-        return cls(id=cell_id, cpuset=cpuset, memory=memory,
-                   cpu_usage=cpu_usage, memory_usage=memory_usage,
-                   mempages=[], pinned_cpus=set([]), siblings=[])
+        :param cpus: set of CPUs to pin
+        """
+        pin_siblings = set()
+        for sib in self.siblings:
+            if cpus & sib:
+                # NOTE(artom) If the intersection between cpus and sib is not
+                # empty - IOW, the CPU we want to pin has sibligns - pin the
+                # sibling as well. This is because we normally got here because
+                # the `isolate` CPU thread policy is set, so we don't want to
+                # place guest CPUs on host thread siblings.
+                pin_siblings.update(sib)
+        self.pin_cpus(pin_siblings)
 
-    def can_fit_hugepages(self, pagesize, memory):
-        """Returns whether memory can fit into hugepages size
+    def unpin_cpus_with_siblings(self, cpus):
+        """Unpin (free up) both thread siblings if one of them is requested to
+        be freed.
+
+        :param cpus: set of CPUs to unpin.
+        """
+        pin_siblings = set()
+        for sib in self.siblings:
+            if cpus & sib:
+                # NOTE(artom) This is the inverse operation of
+                # pin_cpus_with_siblings() - see the NOTE there. If the CPU
+                # we're unpinning has siblings, unpin the sibling as well.
+                pin_siblings.update(sib)
+        self.unpin_cpus(pin_siblings)
+
+    def can_fit_pagesize(self, pagesize, memory, use_free=True):
+        """Returns whether memory can fit into a given pagesize.
 
         :param pagesize: a page size in KibB
         :param memory: a memory size asked to fit in KiB
+        :param use_free: if true, assess based on free memory rather than total
+            memory. This means overcommit is not allowed, which should be the
+            case for hugepages since these are memlocked by the kernel and
+            can't be swapped out.
 
         :returns: whether memory can fit in hugepages
         :raises: MemoryPageSizeNotSupported if page size not supported
         """
         for pages in self.mempages:
+            avail_kb = pages.free_kb if use_free else pages.total_kb
             if pages.size_kb == pagesize:
-                return (memory <= pages.free_kb and
-                        (memory % pages.size_kb) == 0)
+                return memory <= avail_kb and (memory % pages.size_kb) == 0
         raise exception.MemoryPageSizeNotSupported(pagesize=pagesize)
 
 
-# TODO(berrange): Remove NovaObjectDictCompat
 @base.NovaObjectRegistry.register
-class NUMAPagesTopology(base.NovaObject,
-                        base.NovaObjectDictCompat):
+class NUMAPagesTopology(base.NovaObject):
     # Version 1.0: Initial version
-    VERSION = '1.0'
+    # Version 1.1: Adds reserved field
+    VERSION = '1.1'
 
     fields = {
-        'size_kb': fields.IntegerField(),
-        'total': fields.IntegerField(),
-        'used': fields.IntegerField(default=0),
+        'size_kb': obj_fields.IntegerField(),
+        'total': obj_fields.IntegerField(),
+        'used': obj_fields.IntegerField(default=0),
+        'reserved': obj_fields.IntegerField(default=0),
         }
 
+    def obj_make_compatible(self, primitive, target_version):
+        super(NUMAPagesTopology, self).obj_make_compatible(primitive,
+                                                           target_version)
+        target_version = versionutils.convert_version_to_tuple(target_version)
+        if target_version < (1, 1):
+            primitive.pop('reserved', None)
+
     def __eq__(self, other):
-        return all_things_equal(self, other)
+        return base.all_things_equal(self, other)
 
     def __ne__(self, other):
         return not (self == other)
@@ -153,100 +197,100 @@ class NUMAPagesTopology(base.NovaObject,
     @property
     def free(self):
         """Returns the number of avail pages."""
-        return self.total - self.used
+        if not self.obj_attr_is_set('reserved'):
+            # In case where an old compute node is sharing resource to
+            # an updated node we must ensure that this property is defined.
+            self.reserved = 0
+        return self.total - self.used - self.reserved
 
     @property
     def free_kb(self):
         """Returns the avail memory size in KiB."""
         return self.free * self.size_kb
 
+    @property
+    def total_kb(self):
+        """Returns the total memory size in KiB."""
+        return self.total * self.size_kb
 
-# TODO(berrange): Remove NovaObjectDictCompat
+
 @base.NovaObjectRegistry.register
-class NUMATopology(base.NovaObject,
-                   base.NovaObjectDictCompat):
+class NUMATopology(base.NovaObject):
     # Version 1.0: Initial version
     # Version 1.1: Update NUMACell to 1.1
     # Version 1.2: Update NUMACell to 1.2
     VERSION = '1.2'
 
     fields = {
-        'cells': fields.ListOfObjectsField('NUMACell'),
-        }
-
-    obj_relationships = {
-        'cells': [('1.0', '1.0'), ('1.1', '1.1'), ('1.2', '1.2')]
+        'cells': obj_fields.ListOfObjectsField('NUMACell'),
     }
 
-    @classmethod
-    def obj_from_primitive(cls, primitive):
-        if 'nova_object.name' in primitive:
-            obj_topology = super(NUMATopology, cls).obj_from_primitive(
-                primitive)
-        else:
-            # NOTE(sahid): This compatibility code needs to stay until we can
-            # guarantee that there are no cases of the old format stored in
-            # the database (or forever, if we can never guarantee that).
-            obj_topology = NUMATopology._from_dict(primitive)
-        return obj_topology
+    def __eq__(self, other):
+        return base.all_things_equal(self, other)
+
+    def __ne__(self, other):
+        return not (self == other)
+
+    @property
+    def has_threads(self):
+        """Check if any cell use SMT threads (a.k.a. Hyperthreads)"""
+        return any(cell.has_threads for cell in self.cells)
 
     def _to_json(self):
         return jsonutils.dumps(self.obj_to_primitive())
 
     @classmethod
     def obj_from_db_obj(cls, db_obj):
-        return cls.obj_from_primitive(
-            jsonutils.loads(db_obj))
+        """Convert serialized representation to object.
+
+        Deserialize instances of this object that have been stored as JSON
+        blobs in the database.
+        """
+        return cls.obj_from_primitive(jsonutils.loads(db_obj))
+
+    @classmethod
+    def from_legacy_object(cls, primitive: str):
+        """Convert a pre-Liberty object to a (serialized) real o.vo.
+
+        :param primitive: A serialized representation of the legacy object.
+        :returns: A serialized representation of the updated object.
+        """
+        topology = cls(
+            cells=[
+                NUMACell(
+                    id=cell.get('id'),
+                    cpuset=hardware.parse_cpu_spec(cell.get('cpus', '')),
+                    cpu_usage=cell.get('cpu_usage', 0),
+                    memory=cell.get('mem', {}).get('total', 0),
+                    memory_usage=cell.get('mem', {}).get('used', 0),
+                    mempages=[],
+                    pinned_cpus=set(),
+                    siblings=[],
+                ) for cell in jsonutils.loads(primitive).get('cells', [])
+            ],
+        )
+        return topology._to_json()
 
     def __len__(self):
         """Defined so that boolean testing works the same as for lists."""
         return len(self.cells)
 
-    def _to_dict(self):
-        # TODO(sahid): needs to be removed.
-        return {'cells': [cell._to_dict() for cell in self.cells]}
-
-    @classmethod
-    def _from_dict(cls, data_dict):
-        return cls(cells=[
-            NUMACell._from_dict(cell_dict)
-            for cell_dict in data_dict.get('cells', [])])
-
 
 @base.NovaObjectRegistry.register
 class NUMATopologyLimits(base.NovaObject):
     # Version 1.0: Initial version
-    VERSION = '1.0'
+    # Version 1.1: Add network_metadata field
+    VERSION = '1.1'
 
     fields = {
-        'cpu_allocation_ratio': fields.FloatField(),
-        'ram_allocation_ratio': fields.FloatField(),
-        }
+        'cpu_allocation_ratio': obj_fields.FloatField(),
+        'ram_allocation_ratio': obj_fields.FloatField(),
+        'network_metadata': obj_fields.ObjectField('NetworkMetadata'),
+    }
 
-    def to_dict_legacy(self, host_topology):
-        cells = []
-        for cell in host_topology.cells:
-            cells.append(
-                {'cpus': hardware.format_cpu_spec(
-                    cell.cpuset, allow_ranges=False),
-                 'mem': {'total': cell.memory,
-                         'limit': cell.memory * self.ram_allocation_ratio},
-                 'cpu_limit': len(cell.cpuset) * self.cpu_allocation_ratio,
-                 'id': cell.id})
-        return {'cells': cells}
-
-    @classmethod
-    def obj_from_db_obj(cls, db_obj):
-        if 'nova_object.name' in db_obj:
-            obj_topology = cls.obj_from_primitive(db_obj)
-        else:
-            # NOTE(sahid): This compatibility code needs to stay until we can
-            # guarantee that all compute nodes are using RPC API => 3.40.
-            cell = db_obj['cells'][0]
-            ram_ratio = cell['mem']['limit'] / float(cell['mem']['total'])
-            cpu_ratio = cell['cpu_limit'] / float(len(hardware.parse_cpu_spec(
-                cell['cpus'])))
-            obj_topology = NUMATopologyLimits(
-                cpu_allocation_ratio=cpu_ratio,
-                ram_allocation_ratio=ram_ratio)
-        return obj_topology
+    def obj_make_compatible(self, primitive, target_version):
+        super(NUMATopologyLimits, self).obj_make_compatible(primitive,
+                                                            target_version)
+        target_version = versionutils.convert_version_to_tuple(target_version)
+        if target_version < (1, 1):
+            primitive.pop('network_metadata', None)

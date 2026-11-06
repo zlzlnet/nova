@@ -15,34 +15,50 @@
 #
 
 """Base proxy module used to create compatible consoles
-for Openstack Nova."""
+for OpenStack Nova."""
+# NOTE(ksambor): This module is not an entry point. Each console proxy
+# binary (nova-novncproxy, nova-serialproxy, nova-spicehtml5proxy) monkey
+# patches before importing this module, so patching here would be a second
+# patch() call, which fails when the service runs in native threading mode.
 
+import multiprocessing
 import os
 import sys
 
-from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_reports import guru_meditation_report as gmr
+from oslo_reports import opts as gmr_opts
 
+import nova.conf
+from nova.conf import novnc
 from nova.console import websocketproxy
-from nova.openstack.common.report import guru_meditation_report as gmr
+from nova import objects
 from nova import version
 
 
-CONF = cfg.CONF
-CONF.import_opt('record', 'nova.cmd.novnc')
-CONF.import_opt('daemon', 'nova.cmd.novnc')
-CONF.import_opt('ssl_only', 'nova.cmd.novnc')
-CONF.import_opt('source_is_ipv6', 'nova.cmd.novnc')
-CONF.import_opt('cert', 'nova.cmd.novnc')
-CONF.import_opt('key', 'nova.cmd.novnc')
-CONF.import_opt('web', 'nova.cmd.novnc')
+CONF = nova.conf.CONF
+# NOTE this is required ensure CONF.web
+# is registered properly
+novnc.register_cli_opts(CONF)
+gmr_opts.set_defaults(CONF)
+objects.register_all()
 
 
 def exit_with_error(msg, errno=-1):
-    print(msg) and sys.exit(errno)
+    sys.stderr.write(msg + '\n')
+    sys.exit(errno)
 
 
-def proxy(host, port):
+def proxy(host, port, security_proxy=None):
+    """:param host: local address to listen on
+    :param port: local port to listen on
+    :param security_proxy: instance of
+        nova.console.securityproxy.base.SecurityProxy
+
+    Setup a proxy listening on @host:@port. If the
+    @security_proxy parameter is not None, this instance
+    is used to negotiate security layer with the proxy target
+    """
 
     if CONF.ssl_only and not os.path.exists(CONF.cert):
         exit_with_error("SSL only and %s not found" % CONF.cert)
@@ -53,21 +69,29 @@ def proxy(host, port):
 
     logging.setup(CONF, "nova")
 
-    gmr.TextGuruMeditation.setup_autorun(version)
+    gmr.TextGuruMeditation.setup_autorun(version, conf=CONF)
+
+    # Python 3.14 changed the default multiprocessing start method from
+    # 'fork' to 'forkserver' on Linux (gh-84559). websockify's daemon mode
+    # uses multiprocessing internally, so explicitly restore 'fork' to
+    # preserve the previous behaviour and avoid pickling failures.
+    multiprocessing.set_start_method('fork', force=True)
 
     # Create and start the NovaWebSockets proxy
     websocketproxy.NovaWebSocketProxy(
         listen_host=host,
         listen_port=port,
         source_is_ipv6=CONF.source_is_ipv6,
-        verbose=CONF.verbose,
         cert=CONF.cert,
         key=CONF.key,
         ssl_only=CONF.ssl_only,
+        ssl_ciphers=CONF.console.ssl_ciphers,
+        ssl_minimum_version=CONF.console.ssl_minimum_version,
         daemon=CONF.daemon,
         record=CONF.record,
-        traffic=CONF.verbose and not CONF.daemon,
+        traffic=not CONF.daemon and CONF.debug,
         web=CONF.web,
         file_only=True,
-        RequestHandlerClass=websocketproxy.NovaProxyRequestHandler
+        RequestHandlerClass=websocketproxy.NovaProxyRequestHandler,
+        security_proxy=security_proxy,
     ).start_server()

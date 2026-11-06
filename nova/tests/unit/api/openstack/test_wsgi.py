@@ -10,35 +10,56 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import inspect
+from unittest import mock
 
-import mock
-import six
+from oslo_serialization import jsonutils
+import testscenarios
 import webob
 
 from nova.api.openstack import api_version_request as api_version
-from nova.api.openstack import extensions
 from nova.api.openstack import wsgi
 from nova import exception
-from nova import i18n
 from nova import test
 from nova.tests.unit.api.openstack import fakes
+from nova.tests.unit import matchers
 from nova.tests.unit import utils
-from oslo_serialization import jsonutils
 
 
-class RequestTest(test.NoDBTestCase):
-    header_name = 'X-OpenStack-Nova-API-Version'
+class MicroversionedTest(testscenarios.WithScenarios, test.NoDBTestCase):
+
+    scenarios = [
+        ('legacy-microversion', {
+            'header_name': 'X-OpenStack-Nova-API-Version',
+        }),
+        ('modern-microversion', {
+            'header_name': 'OpenStack-API-Version',
+        })
+    ]
+
+    def _make_microversion_header(self, value):
+        if 'nova' in self.header_name.lower():
+            return {self.header_name: value}
+        else:
+            return {self.header_name: 'compute %s' % value}
+
+
+class RequestTest(MicroversionedTest):
+
+    def setUp(self):
+        super(RequestTest, self).setUp()
+        self.stub_out('nova.i18n.get_available_languages',
+                      lambda *args, **kwargs:
+                      ['en-GB', 'en-AU', 'de', 'zh-CN', 'en-US', 'ja-JP'])
 
     def test_content_type_missing(self):
         request = wsgi.Request.blank('/tests/123', method='POST')
-        request.body = "<body />"
+        request.body = b"<body />"
         self.assertIsNone(request.get_content_type())
 
     def test_content_type_unsupported(self):
         request = wsgi.Request.blank('/tests/123', method='POST')
         request.headers["Content-Type"] = "text/html"
-        request.body = "asdf<br />"
+        request.body = b"asdf<br />"
         self.assertRaises(exception.InvalidContentType,
                           request.get_content_type)
 
@@ -54,103 +75,61 @@ class RequestTest(test.NoDBTestCase):
         result = request.best_match_content_type()
         self.assertEqual(result, "application/json")
 
-    def test_cache_and_retrieve_instances(self):
-        request = wsgi.Request.blank('/foo')
-        instances = []
-        for x in range(3):
-            instances.append({'uuid': 'uuid%s' % x})
-        # Store 2
-        request.cache_db_instances(instances[:2])
-        # Store 1
-        request.cache_db_instance(instances[2])
-        self.assertEqual(request.get_db_instance('uuid0'),
-                instances[0])
-        self.assertEqual(request.get_db_instance('uuid1'),
-                instances[1])
-        self.assertEqual(request.get_db_instance('uuid2'),
-                instances[2])
-        self.assertIsNone(request.get_db_instance('uuid3'))
-        self.assertEqual(request.get_db_instances(),
-                {'uuid0': instances[0],
-                 'uuid1': instances[1],
-                 'uuid2': instances[2]})
-
-    def test_cache_and_retrieve_compute_nodes(self):
-        request = wsgi.Request.blank('/foo')
-        compute_nodes = []
-        for x in range(3):
-            compute_nodes.append({'id': 'id%s' % x})
-        # Store 2
-        request.cache_db_compute_nodes(compute_nodes[:2])
-        # Store 1
-        request.cache_db_compute_node(compute_nodes[2])
-        self.assertEqual(request.get_db_compute_node('id0'),
-                compute_nodes[0])
-        self.assertEqual(request.get_db_compute_node('id1'),
-                compute_nodes[1])
-        self.assertEqual(request.get_db_compute_node('id2'),
-                compute_nodes[2])
-        self.assertIsNone(request.get_db_compute_node('id3'))
-        self.assertEqual(request.get_db_compute_nodes(),
-                {'id0': compute_nodes[0],
-                 'id1': compute_nodes[1],
-                 'id2': compute_nodes[2]})
+    def test_content_type_accept_with_quality_values(self):
+        request = wsgi.Request.blank('/tests/123')
+        request.headers["Accept"] = (
+            "application/json;q=0.4,"
+            "application/vnd.openstack.compute+json;q=0.6")
+        result = request.best_match_content_type()
+        self.assertEqual("application/vnd.openstack.compute+json", result)
 
     def test_from_request(self):
-        self.stubs.Set(i18n, 'get_available_languages',
-                       fakes.fake_get_available_languages)
-
         request = wsgi.Request.blank('/')
-        accepted = 'bogus;q=1.1, en-gb;q=0.7,en-us,en;q=.5,*;q=.7'
+        accepted = 'bogus;q=1, en-gb;q=0.7,en-us,en;q=0.5,*;q=0.7'
         request.headers = {'Accept-Language': accepted}
-        self.assertEqual(request.best_match_language(), 'en_US')
+        self.assertEqual(request.best_match_language(), 'en-US')
 
     def test_asterisk(self):
-        # asterisk should match first available if there
-        # are not any other available matches
-        self.stubs.Set(i18n, 'get_available_languages',
-                       fakes.fake_get_available_languages)
-
+        # In the section 3.4 of RFC4647, it says as follows:
+        # If the language range "*"(asterisk) is the only one
+        # in the language priority list or if no other language range
+        # follows, the default value is computed and returned.
+        #
+        # In this case, the default value 'None' is returned.
         request = wsgi.Request.blank('/')
-        accepted = '*,es;q=.5'
+        accepted = '*;q=0.5'
         request.headers = {'Accept-Language': accepted}
-        self.assertEqual(request.best_match_language(), 'en_GB')
+        self.assertIsNone(request.best_match_language())
 
-    def test_prefix(self):
-        self.stubs.Set(i18n, 'get_available_languages',
-                       fakes.fake_get_available_languages)
-
+    def test_asterisk_followed_by_other_language(self):
         request = wsgi.Request.blank('/')
-        accepted = 'zh'
+        accepted = '*,ja-jp;q=0.5'
         request.headers = {'Accept-Language': accepted}
-        self.assertEqual(request.best_match_language(), 'zh_CN')
+        self.assertEqual('ja-JP', request.best_match_language())
+
+    def test_truncate(self):
+        request = wsgi.Request.blank('/')
+        accepted = 'de-CH'
+        request.headers = {'Accept-Language': accepted}
+        self.assertEqual('de', request.best_match_language())
 
     def test_secondary(self):
-        self.stubs.Set(i18n, 'get_available_languages',
-                       fakes.fake_get_available_languages)
-
         request = wsgi.Request.blank('/')
-        accepted = 'nn,en-gb;q=.5'
+        accepted = 'nn,en-gb;q=0.5'
         request.headers = {'Accept-Language': accepted}
-        self.assertEqual(request.best_match_language(), 'en_GB')
+        self.assertEqual('en-GB', request.best_match_language())
 
     def test_none_found(self):
-        self.stubs.Set(i18n, 'get_available_languages',
-                       fakes.fake_get_available_languages)
-
         request = wsgi.Request.blank('/')
         accepted = 'nb-no'
         request.headers = {'Accept-Language': accepted}
-        self.assertIs(request.best_match_language(), None)
+        self.assertIsNone(request.best_match_language())
 
     def test_no_lang_header(self):
-        self.stubs.Set(i18n, 'get_available_languages',
-                       fakes.fake_get_available_languages)
-
         request = wsgi.Request.blank('/')
         accepted = ''
         request.headers = {'Accept-Language': accepted}
-        self.assertIs(request.best_match_language(), None)
+        self.assertIsNone(request.best_match_language())
 
     def test_api_version_request_header_none(self):
         request = wsgi.Request.blank('/')
@@ -163,7 +142,7 @@ class RequestTest(test.NoDBTestCase):
         mock_maxver.return_value = api_version.APIVersionRequest("2.14")
 
         request = wsgi.Request.blank('/')
-        request.headers = {self.header_name: '2.14'}
+        request.headers = self._make_microversion_header('2.14')
         request.set_api_version_request()
         self.assertEqual(api_version.APIVersionRequest("2.14"),
                          request.api_version_request)
@@ -173,14 +152,14 @@ class RequestTest(test.NoDBTestCase):
         mock_maxver.return_value = api_version.APIVersionRequest("3.5")
 
         request = wsgi.Request.blank('/')
-        request.headers = {self.header_name: 'latest'}
+        request.headers = self._make_microversion_header('latest')
         request.set_api_version_request()
         self.assertEqual(api_version.APIVersionRequest("3.5"),
                          request.api_version_request)
 
     def test_api_version_request_header_invalid(self):
         request = wsgi.Request.blank('/')
-        request.headers = {self.header_name: '2.1.3'}
+        request.headers = self._make_microversion_header('2.1.3')
 
         self.assertRaises(exception.InvalidAPIVersionString,
                           request.set_api_version_request)
@@ -205,12 +184,6 @@ class ActionDispatcherTest(test.NoDBTestCase):
         self.assertEqual(serializer.dispatch({}, action='update'), 'trousers')
 
 
-class DictSerializerTest(test.NoDBTestCase):
-    def test_dispatch_default(self):
-        serializer = wsgi.DictSerializer()
-        self.assertEqual(serializer.serialize({}, 'update'), '')
-
-
 class JSONDictSerializerTest(test.NoDBTestCase):
     def test_json(self):
         input_dict = dict(servers=dict(a=(2, 3)))
@@ -219,12 +192,6 @@ class JSONDictSerializerTest(test.NoDBTestCase):
         result = serializer.serialize(input_dict)
         result = result.replace('\n', '').replace(' ', '')
         self.assertEqual(result, expected_json)
-
-
-class TextDeserializerTest(test.NoDBTestCase):
-    def test_dispatch_default(self):
-        deserializer = wsgi.TextDeserializer()
-        self.assertEqual(deserializer.deserialize({}, 'update'), {})
 
 
 class JSONDeserializerTest(test.NoDBTestCase):
@@ -250,7 +217,7 @@ class JSONDeserializerTest(test.NoDBTestCase):
         self.assertEqual(deserializer.deserialize(data), as_dict)
 
     def test_json_valid_utf8(self):
-        data = """{"server": {"min_count": 1, "flavorRef": "1",
+        data = b"""{"server": {"min_count": 1, "flavorRef": "1",
                 "name": "\xe6\xa6\x82\xe5\xbf\xb5",
                 "imageRef": "10bab10c-1304-47d",
                 "max_count": 1}} """
@@ -269,7 +236,7 @@ class JSONDeserializerTest(test.NoDBTestCase):
 
     def test_json_invalid_utf8(self):
         """Send invalid utf-8 to JSONDeserializer."""
-        data = """{"server": {"min_count": 1, "flavorRef": "1",
+        data = b"""{"server": {"min_count": 1, "flavorRef": "1",
                 "name": "\xf0\x28\x8c\x28",
                 "imageRef": "10bab10c-1304-47d",
                 "max_count": 1}} """
@@ -279,13 +246,12 @@ class JSONDeserializerTest(test.NoDBTestCase):
                           deserializer.deserialize, data)
 
 
-class ResourceTest(test.NoDBTestCase):
-    header_name = 'X-OpenStack-Nova-API-Version'
+class ResourceTest(MicroversionedTest):
 
     def get_req_id_header_name(self, request):
         header_name = 'x-openstack-request-id'
         if utils.get_api_version(request) < 3:
-                header_name = 'x-compute-request-id'
+            header_name = 'x-compute-request-id'
 
         return header_name
 
@@ -298,10 +264,10 @@ class ResourceTest(test.NoDBTestCase):
                     raise webob.exc.HTTPInternalServerError()
                 return 'success'
 
-        app = fakes.TestRouterV21(Controller())
+        app = fakes.TestRouter(Controller())
         req = webob.Request.blank('/tests')
         response = req.get_response(app)
-        self.assertEqual(response.body, 'success')
+        self.assertEqual(b'success', response.body)
         self.assertEqual(response.status_int, 200)
 
     @mock.patch("nova.api.openstack.api_version_request.max_api_version")
@@ -316,11 +282,11 @@ class ResourceTest(test.NoDBTestCase):
                     raise webob.exc.HTTPInternalServerError()
                 return 'success'
 
-        app = fakes.TestRouterV21(Controller())
+        app = fakes.TestRouter(Controller())
         req = webob.Request.blank('/tests')
-        req.headers = {self.header_name: version}
+        req.headers = self._make_microversion_header(version)
         response = req.get_response(app)
-        self.assertEqual(response.body, 'success')
+        self.assertEqual(b'success', response.body)
         self.assertEqual(response.status_int, 200)
 
     def test_resource_receives_api_version_request_invalid(self):
@@ -330,9 +296,9 @@ class ResourceTest(test.NoDBTestCase):
             def index(self, req):
                 return 'success'
 
-        app = fakes.TestRouterV21(Controller())
+        app = fakes.TestRouter(Controller())
         req = webob.Request.blank('/tests')
-        req.headers = {self.header_name: invalid_version}
+        req.headers = self._make_microversion_header(invalid_version)
         response = req.get_response(app)
         self.assertEqual(400, response.status_int)
 
@@ -345,20 +311,20 @@ class ResourceTest(test.NoDBTestCase):
         # the default method is GET
         req = webob.Request.blank('/tests')
         response = req.get_response(app)
-        self.assertEqual(response.body, 'success')
+        self.assertEqual(b'success', response.body)
         self.assertEqual(response.status_int, 200)
-        req.body = '{"body": {"key": "value"}}'
+        req.body = b'{"body": {"key": "value"}}'
         response = req.get_response(app)
-        self.assertEqual(response.body, 'success')
+        self.assertEqual(b'success', response.body)
         self.assertEqual(response.status_int, 200)
         req.content_type = 'application/json'
         response = req.get_response(app)
-        self.assertEqual(response.body, 'success')
+        self.assertEqual(b'success', response.body)
         self.assertEqual(response.status_int, 200)
 
     def test_resource_call_with_method_post(self):
         class Controller(object):
-            @extensions.expected_errors(400)
+            @wsgi.expected_errors(400)
             def create(self, req, body):
                 if expected_body != body:
                     msg = "The request body invalid"
@@ -368,20 +334,20 @@ class ResourceTest(test.NoDBTestCase):
         app = fakes.TestRouter(Controller())
         req = webob.Request.blank('/tests', method="POST",
                                   content_type='application/json')
-        req.body = '{"body": {"key": "value"}}'
+        req.body = b'{"body": {"key": "value"}}'
         expected_body = {'body': {
             "key": "value"
             }
         }
         response = req.get_response(app)
         self.assertEqual(response.status_int, 200)
-        self.assertEqual(response.body, 'success')
+        self.assertEqual(b'success', response.body)
         # verify without body
         expected_body = None
         req.body = None
         response = req.get_response(app)
         self.assertEqual(response.status_int, 200)
-        self.assertEqual(response.body, 'success')
+        self.assertEqual(b'success', response.body)
         # the body is validated in the controller
         expected_body = {'body': None}
         response = req.get_response(app)
@@ -402,25 +368,27 @@ class ResourceTest(test.NoDBTestCase):
         app = fakes.TestRouter(Controller())
         req = webob.Request.blank('/tests/test_id', method="PUT",
                                   content_type='application/json')
-        req.body = '{"body": {"key": "value"}}'
+        req.body = b'{"body": {"key": "value"}}'
         expected_body = {'body': {
             "key": "value"
             }
         }
         response = req.get_response(app)
-        self.assertEqual(response.body, 'success')
+        self.assertEqual(b'success', response.body)
         self.assertEqual(response.status_int, 200)
         req.body = None
         expected_body = None
         response = req.get_response(app)
         self.assertEqual(response.status_int, 200)
         # verify no content_type is contained in the request
-        req.content_type = None
-        req.body = '{"body": {"key": "value"}}'
+        req = webob.Request.blank('/tests/test_id', method="PUT",
+                                  content_type='application/xml')
+        req.content_type = 'application/xml'
+        req.body = b'{"body": {"key": "value"}}'
         response = req.get_response(app)
-        expected_unsupported_type_body = {'badRequest':
-            {'message': 'Unsupported Content-Type', 'code': 400}}
-        self.assertEqual(response.status_int, 400)
+        expected_unsupported_type_body = {'badMediaType':
+            {'message': 'Unsupported Content-Type', 'code': 415}}
+        self.assertEqual(response.status_int, 415)
         self.assertEqual(expected_unsupported_type_body,
                          jsonutils.loads(response.body))
 
@@ -434,14 +402,14 @@ class ResourceTest(test.NoDBTestCase):
         req = webob.Request.blank('/tests/test_id', method="DELETE")
         response = req.get_response(app)
         self.assertEqual(response.status_int, 200)
-        self.assertEqual(response.body, 'success')
+        self.assertEqual(b'success', response.body)
         # ignore the body
-        req.body = '{"body": {"key": "value"}}'
+        req.body = b'{"body": {"key": "value"}}'
         response = req.get_response(app)
         self.assertEqual(response.status_int, 200)
-        self.assertEqual(response.body, 'success')
+        self.assertEqual(b'success', response.body)
 
-    def test_resource_not_authorized(self):
+    def test_resource_forbidden(self):
         class Controller(object):
             def index(self, req):
                 raise exception.Forbidden()
@@ -451,6 +419,16 @@ class ResourceTest(test.NoDBTestCase):
         response = req.get_response(app)
         self.assertEqual(response.status_int, 403)
 
+    def test_resource_not_authorized(self):
+        class Controller(object):
+            def index(self, req):
+                raise exception.Unauthorized()
+
+        req = webob.Request.blank('/tests')
+        app = fakes.TestRouter(Controller())
+        self.assertRaises(
+            exception.Unauthorized, req.get_response, app)
+
     def test_dispatch(self):
         class Controller(object):
             def index(self, req, pants=None):
@@ -458,7 +436,7 @@ class ResourceTest(test.NoDBTestCase):
 
         controller = Controller()
         resource = wsgi.Resource(controller)
-        method, extensions = resource.get_method(None, 'index', None, '')
+        method = resource.get_method(None, 'index', None, '')
         actual = resource.dispatch(method, None, {'pants': 'off'})
         expected = 'off'
         self.assertEqual(actual, expected)
@@ -481,9 +459,9 @@ class ResourceTest(test.NoDBTestCase):
 
         controller = Controller()
         resource = wsgi.Resource(controller)
-        method, extensions = resource.get_method(None, 'action',
-                                                 'application/json',
-                                                 '{"fooAction": true}')
+        method = resource.get_method(None, 'action',
+                                     'application/json',
+                                     '{"fooAction": true}')
         self.assertEqual(controller._action_foo, method)
 
     def test_get_method_action_bad_body(self):
@@ -516,9 +494,9 @@ class ResourceTest(test.NoDBTestCase):
 
         controller = Controller()
         resource = wsgi.Resource(controller)
-        method, extensions = resource.get_method(None, 'action',
-                                                 'application/xml',
-                                                 '<fooAction>true</fooAction')
+        method = resource.get_method(None, 'action',
+                                     'application/xml',
+                                     '<fooAction>true</fooAction')
         self.assertEqual(controller.action, method)
 
     def test_get_action_args(self):
@@ -552,11 +530,10 @@ class ResourceTest(test.NoDBTestCase):
 
         request = wsgi.Request.blank('/', method='POST')
         request.headers['Content-Type'] = 'application/none'
-        request.body = 'foo'
+        request.body = b'foo'
 
-        content_type, body = resource.get_body(request)
-        self.assertIsNone(content_type)
-        self.assertEqual(body, '')
+        self.assertRaises(exception.InvalidContentType,
+                          resource.get_body, request)
 
     def test_get_body_no_content_type(self):
         class Controller(object):
@@ -567,11 +544,11 @@ class ResourceTest(test.NoDBTestCase):
         resource = wsgi.Resource(controller)
 
         request = wsgi.Request.blank('/', method='POST')
-        request.body = 'foo'
+        request.body = b'foo'
 
         content_type, body = resource.get_body(request)
         self.assertIsNone(content_type)
-        self.assertEqual(body, 'foo')
+        self.assertEqual(b'foo', body)
 
     def test_get_body_no_content_body(self):
         class Controller(object):
@@ -583,11 +560,21 @@ class ResourceTest(test.NoDBTestCase):
 
         request = wsgi.Request.blank('/', method='POST')
         request.headers['Content-Type'] = 'application/json'
-        request.body = ''
+        request.body = b''
 
         content_type, body = resource.get_body(request)
         self.assertEqual('application/json', content_type)
-        self.assertEqual(body, '')
+        self.assertEqual(b'', body)
+
+    def test_get_body_content_body_none(self):
+        resource = wsgi.Resource(None)
+        request = wsgi.Request.blank('/', method='PUT')
+        body = None
+
+        contents = resource._get_request_content(body, request)
+
+        self.assertIn('body', contents)
+        self.assertIsNone(contents['body'])
 
     def test_get_body(self):
         class Controller(object):
@@ -599,11 +586,11 @@ class ResourceTest(test.NoDBTestCase):
 
         request = wsgi.Request.blank('/', method='POST')
         request.headers['Content-Type'] = 'application/json'
-        request.body = 'foo'
+        request.body = b'foo'
 
         content_type, body = resource.get_body(request)
         self.assertEqual(content_type, 'application/json')
-        self.assertEqual(body, 'foo')
+        self.assertEqual(b'foo', body)
 
     def test_get_request_id_with_dict_response_body(self):
         class Controller(wsgi.Controller):
@@ -614,7 +601,7 @@ class ResourceTest(test.NoDBTestCase):
         app = fakes.TestRouter(Controller())
         response = req.get_response(app)
         self.assertIn('nova.context', req.environ)
-        self.assertEqual(response.body, '{"foo": "bar"}')
+        self.assertEqual(b'{"foo": "bar"}', response.body)
         self.assertEqual(response.status_int, 200)
 
     def test_no_request_id_with_str_response_body(self):
@@ -630,7 +617,7 @@ class ResourceTest(test.NoDBTestCase):
         # our wsgi setup, ideally it would be there.
         expected_header = self.get_req_id_header_name(req)
         self.assertFalse(hasattr(response.headers, expected_header))
-        self.assertEqual(response.body, 'foo')
+        self.assertEqual(b'foo', response.body)
         self.assertEqual(response.status_int, 200)
 
     def test_get_request_id_no_response_body(self):
@@ -642,34 +629,19 @@ class ResourceTest(test.NoDBTestCase):
         app = fakes.TestRouter(Controller())
         response = req.get_response(app)
         self.assertIn('nova.context', req.environ)
-        self.assertEqual(response.body, '')
+        self.assertEqual(b'', response.body)
         self.assertEqual(response.status_int, 200)
 
-    def test_deserialize_badtype(self):
+    def test_deserialize_default(self):
         class Controller(object):
             def index(self, req, pants=None):
                 return pants
 
         controller = Controller()
         resource = wsgi.Resource(controller)
-        self.assertRaises(exception.InvalidContentType,
-                          resource.deserialize,
-                          controller.index, 'application/none', 'foo')
 
-    def test_deserialize_default(self):
-        class JSONDeserializer(object):
-            def deserialize(self, body):
-                return 'json'
-
-        class Controller(object):
-            def index(self, req, pants=None):
-                return pants
-
-        controller = Controller()
-        resource = wsgi.Resource(controller, json=JSONDeserializer)
-
-        obj = resource.deserialize(controller.index, 'application/json', 'foo')
-        self.assertEqual(obj, 'json')
+        obj = resource.deserialize('["foo"]')
+        self.assertEqual(obj, {'body': ['foo']})
 
     def test_register_actions(self):
         class Controller(object):
@@ -696,50 +668,17 @@ class ResourceTest(test.NoDBTestCase):
                 'barAction': extended._action_bar,
                 }, resource.wsgi_actions)
 
-    def test_register_extensions(self):
+    def test_get_method(self):
         class Controller(object):
             def index(self, req, pants=None):
                 return pants
 
-        class ControllerExtended(wsgi.Controller):
-            @wsgi.extends
-            def index(self, req, resp_obj, pants=None):
-                return None
-
-            @wsgi.extends(action='fooAction')
-            def _action_foo(self, req, resp, id, body):
-                return None
-
         controller = Controller()
         resource = wsgi.Resource(controller)
-        self.assertEqual({}, resource.wsgi_extensions)
-        self.assertEqual({}, resource.wsgi_action_extensions)
-
-        extended = ControllerExtended()
-        resource.register_extensions(extended)
-        self.assertEqual({'index': [extended.index]}, resource.wsgi_extensions)
-        self.assertEqual({'fooAction': [extended._action_foo]},
-                         resource.wsgi_action_extensions)
-
-    def test_get_method_extensions(self):
-        class Controller(object):
-            def index(self, req, pants=None):
-                return pants
-
-        class ControllerExtended(wsgi.Controller):
-            @wsgi.extends
-            def index(self, req, resp_obj, pants=None):
-                return None
-
-        controller = Controller()
-        extended = ControllerExtended()
-        resource = wsgi.Resource(controller)
-        resource.register_extensions(extended)
-        method, extensions = resource.get_method(None, 'index', None, '')
+        method = resource.get_method(None, 'index', None, '')
         self.assertEqual(method, controller.index)
-        self.assertEqual(extensions, [extended.index])
 
-    def test_get_method_action_extensions(self):
+    def test_get_method_action(self):
         class Controller(wsgi.Controller):
             def index(self, req, pants=None):
                 return pants
@@ -748,22 +687,14 @@ class ResourceTest(test.NoDBTestCase):
             def _action_foo(self, req, id, body):
                 return body
 
-        class ControllerExtended(wsgi.Controller):
-            @wsgi.extends(action='fooAction')
-            def _action_foo(self, req, resp_obj, id, body):
-                return None
-
         controller = Controller()
-        extended = ControllerExtended()
         resource = wsgi.Resource(controller)
-        resource.register_extensions(extended)
-        method, extensions = resource.get_method(None, 'action',
-                                                 'application/json',
-                                                 '{"fooAction": true}')
+        method = resource.get_method(None, 'action',
+                                     'application/json',
+                                     '{"fooAction": true}')
         self.assertEqual(method, controller._action_foo)
-        self.assertEqual(extensions, [extended._action_foo])
 
-    def test_get_method_action_whitelist_extensions(self):
+    def test_get_method_action_whitelist(self):
         class Controller(wsgi.Controller):
             def index(self, req, pants=None):
                 return pants
@@ -782,204 +713,13 @@ class ResourceTest(test.NoDBTestCase):
         resource = wsgi.Resource(controller)
         resource.register_actions(extended)
 
-        method, extensions = resource.get_method(None, 'create',
-                                                 'application/json',
-                                                 '{"create": true}')
+        method = resource.get_method(None, 'create',
+                                     'application/json',
+                                     '{"create": true}')
         self.assertEqual(method, extended._create)
-        self.assertEqual(extensions, [])
 
-        method, extensions = resource.get_method(None, 'delete', None, None)
+        method = resource.get_method(None, 'delete', None, None)
         self.assertEqual(method, extended._delete)
-        self.assertEqual(extensions, [])
-
-    def test_pre_process_extensions_regular(self):
-        class Controller(object):
-            def index(self, req, pants=None):
-                return pants
-
-        controller = Controller()
-        resource = wsgi.Resource(controller)
-
-        called = []
-
-        def extension1(req, resp_obj):
-            called.append(1)
-            return None
-
-        def extension2(req, resp_obj):
-            called.append(2)
-            return None
-
-        extensions = [extension1, extension2]
-        response, post = resource.pre_process_extensions(extensions, None, {})
-        self.assertEqual(called, [])
-        self.assertIsNone(response)
-        self.assertEqual(list(post), [extension2, extension1])
-
-    def test_pre_process_extensions_generator(self):
-        class Controller(object):
-            def index(self, req, pants=None):
-                return pants
-
-        controller = Controller()
-        resource = wsgi.Resource(controller)
-
-        called = []
-
-        def extension1(req):
-            called.append('pre1')
-            yield
-            called.append('post1')
-
-        def extension2(req):
-            called.append('pre2')
-            yield
-            called.append('post2')
-
-        extensions = [extension1, extension2]
-        response, post = resource.pre_process_extensions(extensions, None, {})
-        post = list(post)
-        self.assertEqual(called, ['pre1', 'pre2'])
-        self.assertIsNone(response)
-        self.assertEqual(len(post), 2)
-        self.assertTrue(inspect.isgenerator(post[0]))
-        self.assertTrue(inspect.isgenerator(post[1]))
-
-        for gen in post:
-            try:
-                gen.send(None)
-            except StopIteration:
-                continue
-
-        self.assertEqual(called, ['pre1', 'pre2', 'post2', 'post1'])
-
-    def test_pre_process_extensions_generator_response(self):
-        class Controller(object):
-            def index(self, req, pants=None):
-                return pants
-
-        controller = Controller()
-        resource = wsgi.Resource(controller)
-
-        called = []
-
-        def extension1(req):
-            called.append('pre1')
-            yield 'foo'
-
-        def extension2(req):
-            called.append('pre2')
-
-        extensions = [extension1, extension2]
-        response, post = resource.pre_process_extensions(extensions, None, {})
-        self.assertEqual(called, ['pre1'])
-        self.assertEqual(response, 'foo')
-        self.assertEqual(post, [])
-
-    def test_post_process_extensions_regular(self):
-        class Controller(object):
-            def index(self, req, pants=None):
-                return pants
-
-        controller = Controller()
-        resource = wsgi.Resource(controller)
-
-        called = []
-
-        def extension1(req, resp_obj):
-            called.append(1)
-            return None
-
-        def extension2(req, resp_obj):
-            called.append(2)
-            return None
-
-        response = resource.post_process_extensions([extension2, extension1],
-                                                    None, None, {})
-        self.assertEqual(called, [2, 1])
-        self.assertIsNone(response)
-
-    def test_post_process_extensions_regular_response(self):
-        class Controller(object):
-            def index(self, req, pants=None):
-                return pants
-
-        controller = Controller()
-        resource = wsgi.Resource(controller)
-
-        called = []
-
-        def extension1(req, resp_obj):
-            called.append(1)
-            return None
-
-        def extension2(req, resp_obj):
-            called.append(2)
-            return 'foo'
-
-        response = resource.post_process_extensions([extension2, extension1],
-                                                    None, None, {})
-        self.assertEqual(called, [2])
-        self.assertEqual(response, 'foo')
-
-    def test_post_process_extensions_generator(self):
-        class Controller(object):
-            def index(self, req, pants=None):
-                return pants
-
-        controller = Controller()
-        resource = wsgi.Resource(controller)
-
-        called = []
-
-        def extension1(req):
-            yield
-            called.append(1)
-
-        def extension2(req):
-            yield
-            called.append(2)
-
-        ext1 = extension1(None)
-        next(ext1)
-        ext2 = extension2(None)
-        next(ext2)
-
-        response = resource.post_process_extensions([ext2, ext1],
-                                                    None, None, {})
-
-        self.assertEqual(called, [2, 1])
-        self.assertIsNone(response)
-
-    def test_post_process_extensions_generator_response(self):
-        class Controller(object):
-            def index(self, req, pants=None):
-                return pants
-
-        controller = Controller()
-        resource = wsgi.Resource(controller)
-
-        called = []
-
-        def extension1(req):
-            yield
-            called.append(1)
-
-        def extension2(req):
-            yield
-            called.append(2)
-            yield 'foo'
-
-        ext1 = extension1(None)
-        next(ext1)
-        ext2 = extension2(None)
-        next(ext2)
-
-        response = resource.post_process_extensions([ext2, ext1],
-                                                    None, None, {})
-
-        self.assertEqual(called, [2])
-        self.assertEqual(response, 'foo')
 
     def test_resource_exception_handler_type_error(self):
         # A TypeError should be translated to a Fault/HTTP 400.
@@ -1006,14 +746,12 @@ class ResourceTest(test.NoDBTestCase):
         req = webob.Request.blank('/tests')
         app = fakes.TestRouter(Controller())
         response = req.get_response(app)
-
-        for hdr, val in six.iteritems(response.headers):
+        for val in response.headers.values():
             # All headers must be utf8
-            self.assertIsInstance(hdr, str)
-            self.assertIsInstance(val, str)
-        self.assertEqual(response.headers['x-header1'], '1')
-        self.assertEqual(response.headers['x-header2'], 'header2')
-        self.assertEqual(response.headers['x-header3'], 'header3')
+            self.assertThat(val, matchers.EncodedByUTF8())
+        self.assertEqual('1', response.headers['x-header1'])
+        self.assertEqual('header2', response.headers['x-header2'])
+        self.assertEqual('header3', response.headers['x-header3'])
 
     def test_resource_valid_utf8_body(self):
         class Controller(object):
@@ -1021,8 +759,8 @@ class ResourceTest(test.NoDBTestCase):
                 return body
 
         req = webob.Request.blank('/tests/test_id', method="PUT")
-        body = """ {"name": "\xe6\xa6\x82\xe5\xbf\xb5" } """
-        expected_body = '{"name": "\\u6982\\u5ff5"}'
+        body = b""" {"name": "\xe6\xa6\x82\xe5\xbf\xb5" } """
+        expected_body = b'{"name": "\\u6982\\u5ff5"}'
         req.body = body
         req.headers['Content-Type'] = 'application/json'
         app = fakes.TestRouter(Controller())
@@ -1036,7 +774,7 @@ class ResourceTest(test.NoDBTestCase):
                 return body
 
         req = webob.Request.blank('/tests/test_id', method="PUT")
-        body = """ {"name": "\xf0\x28\x8c\x28" } """
+        body = b""" {"name": "\xf0\x28\x8c\x28" } """
         req.body = body
         req.headers['Content-Type'] = 'application/json'
         app = fakes.TestRouter(Controller())
@@ -1085,63 +823,6 @@ class ResponseObjectTest(test.NoDBTestCase):
         hdrs['hEADER'] = 'bar'
         self.assertEqual(robj['hEADER'], 'foo')
 
-    def test_default_serializers(self):
-        robj = wsgi.ResponseObject({})
-        self.assertEqual(robj.serializers, {})
-
-    def test_bind_serializers(self):
-        robj = wsgi.ResponseObject({}, json='foo')
-        robj._bind_method_serializers(dict(xml='bar', json='baz'))
-        self.assertEqual(robj.serializers, dict(xml='bar', json='foo'))
-
-    def test_get_serializer(self):
-        robj = wsgi.ResponseObject({}, json='json', xml='xml', atom='atom')
-        for content_type, mtype in wsgi._MEDIA_TYPE_MAP.items():
-            _mtype, serializer = robj.get_serializer(content_type)
-            self.assertEqual(serializer, mtype)
-
-    def test_get_serializer_defaults(self):
-        robj = wsgi.ResponseObject({})
-        default_serializers = dict(json='json', xml='xml', atom='atom')
-        for content_type, mtype in wsgi._MEDIA_TYPE_MAP.items():
-            self.assertRaises(exception.InvalidContentType,
-                              robj.get_serializer, content_type)
-            _mtype, serializer = robj.get_serializer(content_type,
-                                                     default_serializers)
-            self.assertEqual(serializer, mtype)
-
-    def test_serialize(self):
-        class JSONSerializer(object):
-            def serialize(self, obj):
-                return 'json'
-
-        class AtomSerializer(object):
-            def serialize(self, obj):
-                return 'atom'
-
-        robj = wsgi.ResponseObject({}, code=202,
-                                   json=JSONSerializer,
-                                   atom=AtomSerializer)
-        robj['X-header1'] = 'header1'
-        robj['X-header2'] = 'header2'
-        robj['X-header3'] = 3
-        robj['X-header-unicode'] = u'header-unicode'
-
-        for content_type, mtype in wsgi._MEDIA_TYPE_MAP.items():
-            request = wsgi.Request.blank('/tests/123')
-            response = robj.serialize(request, content_type)
-
-            self.assertEqual(response.headers['Content-Type'], content_type)
-            for hdr, val in six.iteritems(response.headers):
-                # All headers must be utf8
-                self.assertIsInstance(hdr, str)
-                self.assertIsInstance(val, str)
-            self.assertEqual(response.headers['X-header1'], 'header1')
-            self.assertEqual(response.headers['X-header2'], 'header2')
-            self.assertEqual(response.headers['X-header3'], '3')
-            self.assertEqual(response.status_int, 202)
-            self.assertEqual(response.body, mtype)
-
 
 class ValidBodyTest(test.NoDBTestCase):
 
@@ -1170,3 +851,124 @@ class ValidBodyTest(test.NoDBTestCase):
         wsgi.Resource(controller=None)
         body = {'foo': 'bar'}
         self.assertFalse(self.controller.is_valid_body(body, 'foo'))
+
+
+class APIVersionTestCase(test.NoDBTestCase):
+
+    def test_api_version(self):
+        class FakeController(wsgi.Controller):
+            @wsgi.api_version('2.10', '2.19')
+            def fake_func(self, req):
+                return {'resources': []}
+
+        controller = FakeController()
+
+        req = fakes.HTTPRequest.blank('', version='2.10')
+        self.assertEqual({'resources': []}, controller.fake_func(req))
+
+        req = fakes.HTTPRequest.blank('', version='2.19')
+        self.assertEqual({'resources': []}, controller.fake_func(req))
+
+        req = fakes.HTTPRequest.blank('', version='2.9')
+        self.assertRaises(
+            exception.VersionNotFoundForAPIMethod, controller.fake_func, req
+        )
+
+        req = fakes.HTTPRequest.blank('', version='2.20')
+        self.assertRaises(
+            exception.VersionNotFoundForAPIMethod, controller.fake_func, req
+        )
+
+    def test_api_version_legacy(self):
+        class FakeController(wsgi.Controller):
+            @wsgi.api_version('2.0', '2.10')
+            def fake_func(self, req):
+                return {'resources': []}
+
+        controller = FakeController()
+        req = fakes.HTTPRequest.blank('')
+        req.set_legacy_v2()
+        self.assertEqual({'resources': []}, controller.fake_func(req))
+
+
+class ExpectedErrorTestCase(test.NoDBTestCase):
+
+    def test_expected_error(self):
+        class FakeController(wsgi.Controller):
+            @wsgi.expected_errors(404)
+            def fake_func(self, req):
+                raise webob.exc.HTTPNotFound()
+
+        controller = FakeController()
+        req = fakes.HTTPRequest.blank('')
+        self.assertRaises(webob.exc.HTTPNotFound, controller.fake_func, req)
+
+    def test_expected_error_from_list(self):
+        class FakeController(wsgi.Controller):
+            @wsgi.expected_errors((404, 403))
+            def fake_func(self, req):
+                raise webob.exc.HTTPNotFound()
+
+        controller = FakeController()
+        req = fakes.HTTPRequest.blank('')
+        self.assertRaises(webob.exc.HTTPNotFound, controller.fake_func, req)
+
+    def test_expected_error_with_microversion(self):
+        class FakeController(wsgi.Controller):
+            @wsgi.expected_errors(404, '2.1', '2.5')
+            @wsgi.expected_errors((400, 404), '2.6')
+            def fake_func(self, req):
+                raise webob.exc.HTTPBadRequest()
+
+        controller = FakeController()
+        req = fakes.HTTPRequest.blank('', version='2.7')
+        self.assertRaises(webob.exc.HTTPBadRequest, controller.fake_func, req)
+
+    def test_unexpected_error(self):
+        class FakeController(wsgi.Controller):
+            @wsgi.expected_errors(404)
+            def fake_func(self, req):
+                raise webob.exc.HTTPConflict()
+
+        controller = FakeController()
+        req = fakes.HTTPRequest.blank('')
+        self.assertRaises(
+            webob.exc.HTTPInternalServerError, controller.fake_func, req
+        )
+
+    def test_unexpected_error_from_list(self):
+        class FakeController(wsgi.Controller):
+            @wsgi.expected_errors((404, 413))
+            def fake_func(self, req):
+                raise webob.exc.HTTPConflict()
+
+        controller = FakeController()
+        req = fakes.HTTPRequest.blank('')
+        self.assertRaises(
+            webob.exc.HTTPInternalServerError, controller.fake_func, req
+        )
+
+    def test_unexpected_error_with_microversion(self):
+        class FakeController(wsgi.Controller):
+            @wsgi.expected_errors(404, '2.1', '2.5')
+            @wsgi.expected_errors((400, 404), '2.6')
+            def fake_func(self, req):
+                raise webob.exc.HTTPBadRequest()
+
+        controller = FakeController()
+        req = fakes.HTTPRequest.blank('', version='2.5')
+        self.assertRaises(
+            webob.exc.HTTPInternalServerError, controller.fake_func, req
+        )
+
+    def test_unexpected_policy_not_authorized_error(self):
+        class FakeController(wsgi.Controller):
+            @wsgi.expected_errors(404)
+            def fake_func(self, req):
+                raise exception.PolicyNotAuthorized(action="foo")
+
+        controller = FakeController()
+        req = fakes.HTTPRequest.blank('')
+        self.assertRaises(
+            exception.PolicyNotAuthorized, controller.fake_func, req
+        )

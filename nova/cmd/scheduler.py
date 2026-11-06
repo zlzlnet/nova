@@ -15,32 +15,52 @@
 #    under the License.
 
 """Starter script for Nova Scheduler."""
+# autopep8: off
+from nova import monkey_patch; monkey_patch.patch(backend='threading')  # noqa
+# autopep8: on
 
 import sys
 
-from oslo_config import cfg
+from oslo_concurrency import processutils
 from oslo_log import log as logging
+from oslo_reports import guru_meditation_report as gmr
+from oslo_reports import opts as gmr_opts
 
+import nova.conf
 from nova import config
 from nova import objects
-from nova.openstack.common.report import guru_meditation_report as gmr
+from nova.scheduler import rpcapi
 from nova import service
-from nova import utils
+from nova import thread_pool_factory
 from nova import version
 
-CONF = cfg.CONF
-CONF.import_opt('scheduler_topic', 'nova.scheduler.rpcapi')
+CONF = nova.conf.CONF
 
 
 def main():
     config.parse_args(sys.argv)
     logging.setup(CONF, "nova")
-    utils.monkey_patch()
     objects.register_all()
+    gmr_opts.set_defaults(CONF)
+    objects.Service.enable_min_version_cache()
 
-    gmr.TextGuruMeditation.setup_autorun(version)
+    gmr.TextGuruMeditation.setup_autorun(version, conf=CONF)
 
-    server = service.Service.create(binary='nova-scheduler',
-                                    topic=CONF.scheduler_topic)
-    service.serve(server)
+    server = service.Service.create(
+        binary='nova-scheduler', topic=rpcapi.RPC_TOPIC)
+
+    # Determine the number of workers; if not specified in config, default
+    # to number of CPUs
+    workers = CONF.scheduler.workers or processutils.get_worker_count()
+    # NOTE(gibi): The oslo.service backend creates the worker processes
+    # via os.fork. As nova already initialized these executor(s)
+    # in the master process, and os.fork's behavior is to copy the state of
+    # parent to the child process, we destroy the executor in the parent
+    # process before the forking, so that the workers initialize new
+    # executor(s) and therefore avoid working with the wrong internal executor
+    # state (i.e. number of workers idle in the pool). A long term solution
+    # would be to use os.spawn instead of os.fork for the workers.
+    thread_pool_factory.reset_all_executors()
+
+    service.serve(server, workers=workers)
     service.wait()

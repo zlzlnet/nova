@@ -18,14 +18,10 @@ Claim objects for use with resource tracking.
 """
 
 from oslo_log import log as logging
-from oslo_serialization import jsonutils
 
-from nova import context
 from nova import exception
 from nova.i18n import _
-from nova.i18n import _LI
 from nova import objects
-from nova.objects import base as obj_base
 from nova.virt import hardware
 
 
@@ -35,17 +31,9 @@ LOG = logging.getLogger(__name__)
 class NopClaim(object):
     """For use with compute drivers that do not support resource tracking."""
 
-    def __init__(self, migration=None):
-        self.migration = migration
+    def __init__(self, *args, **kwargs):
+        self.migration = kwargs.pop('migration', None)
         self.claimed_numa_topology = None
-
-    @property
-    def disk_gb(self):
-        return 0
-
-    @property
-    def memory_mb(self):
-        return 0
 
     def __enter__(self):
         return self
@@ -56,10 +44,6 @@ class NopClaim(object):
 
     def abort(self):
         pass
-
-    def __str__(self):
-        return "[Claim: %d MB memory, %d GB disk]" % (self.memory_mb,
-                self.disk_gb)
 
 
 class Claim(NopClaim):
@@ -73,240 +57,185 @@ class Claim(NopClaim):
     correct decisions with respect to host selection.
     """
 
-    def __init__(self, context, instance, tracker, resources, overhead=None,
-                 limits=None):
-        super(Claim, self).__init__()
+    def __init__(
+        self, context, instance, nodename, tracker, compute_node, pci_requests,
+        migration=None, limits=None,
+    ):
+        super().__init__(migration=migration)
         # Stash a copy of the instance at the current point of time
-        if isinstance(instance, obj_base.NovaObject):
-            self.instance = instance.obj_clone()
-        else:
-            # This does not use copy.deepcopy() because it could be
-            # a sqlalchemy model, and it's best to make sure we have
-            # the primitive form.
-            self.instance = jsonutils.to_primitive(instance)
-        self._numa_topology_loaded = False
+        self.instance = instance.obj_clone()
+        self.instance_ref = instance
+        self.nodename = nodename
         self.tracker = tracker
-
-        if not overhead:
-            overhead = {'memory_mb': 0}
-
-        self.overhead = overhead
+        self._pci_requests = pci_requests
         self.context = context
 
         # Check claim at constructor to avoid mess code
         # Raise exception ComputeResourcesUnavailable if claim failed
-        self._claim_test(resources, limits)
-
-    @property
-    def disk_gb(self):
-        return self.instance['root_gb'] + self.instance['ephemeral_gb']
-
-    @property
-    def memory_mb(self):
-        return self.instance['memory_mb'] + self.overhead['memory_mb']
+        self._claim_test(compute_node, limits)
 
     @property
     def numa_topology(self):
-        if self._numa_topology_loaded:
-            return self._numa_topology
-        else:
-            if isinstance(self.instance, obj_base.NovaObject):
-                self._numa_topology = self.instance.numa_topology
-            else:
-                try:
-                    self._numa_topology = (
-                        objects.InstanceNUMATopology.get_by_instance_uuid(
-                            context.get_admin_context(), self.instance['uuid'])
-                        )
-                except exception.NumaTopologyNotFound:
-                    self._numa_topology = None
-            self._numa_topology_loaded = True
-            return self._numa_topology
+        return self.instance.numa_topology
 
     def abort(self):
         """Compute operation requiring claimed resources has failed or
         been aborted.
         """
-        LOG.debug("Aborting claim: %s" % self, instance=self.instance)
-        self.tracker.abort_instance_claim(self.context, self.instance)
+        LOG.debug("Aborting claim: %s", self, instance=self.instance)
+        self.tracker.abort_instance_claim(self.context, self.instance_ref,
+                                          self.nodename)
 
-    def _claim_test(self, resources, limits=None):
+    def _claim_test(self, compute_node, limits=None):
         """Test if this claim can be satisfied given available resources and
         optional oversubscription limits
 
         This should be called before the compute node actually consumes the
         resources required to execute the claim.
 
-        :param resources: available local compute node resources
-        :returns: Return true if resources are available to claim.
+        :param compute_node: available local ComputeNode object
+        :param limits: Optional limits to test, either dict or
+            objects.SchedulerLimits
+        :raises: exception.ComputeResourcesUnavailable if any resource claim
+            fails
         """
         if not limits:
             limits = {}
 
+        if isinstance(limits, objects.SchedulerLimits):
+            limits = limits.to_dict()
+
         # If an individual limit is None, the resource will be considered
         # unlimited:
-        memory_mb_limit = limits.get('memory_mb')
-        disk_gb_limit = limits.get('disk_gb')
         numa_topology_limit = limits.get('numa_topology')
 
-        msg = _("Attempting claim: memory %(memory_mb)d MB, disk %(disk_gb)d "
-                "GB")
-        params = {'memory_mb': self.memory_mb, 'disk_gb': self.disk_gb}
-        LOG.info(msg % params, instance=self.instance)
-
-        reasons = [self._test_memory(resources, memory_mb_limit),
-                   self._test_disk(resources, disk_gb_limit),
-                   self._test_numa_topology(resources, numa_topology_limit),
+        reasons = [self._test_numa_topology(compute_node, numa_topology_limit),
                    self._test_pci()]
-        reasons = reasons + self._test_ext_resources(limits)
         reasons = [r for r in reasons if r is not None]
         if len(reasons) > 0:
+            LOG.info('Failed to claim: %s', '; '.join(reasons),
+                     instance=self.instance)
             raise exception.ComputeResourcesUnavailable(reason=
                     "; ".join(reasons))
 
-        LOG.info(_LI('Claim successful'), instance=self.instance)
-
-    def _test_memory(self, resources, limit):
-        type_ = _("memory")
-        unit = "MB"
-        total = resources['memory_mb']
-        used = resources['memory_mb_used']
-        requested = self.memory_mb
-
-        return self._test(type_, unit, total, used, requested, limit)
-
-    def _test_disk(self, resources, limit):
-        type_ = _("disk")
-        unit = "GB"
-        total = resources['local_gb']
-        used = resources['local_gb_used']
-        requested = self.disk_gb
-
-        return self._test(type_, unit, total, used, requested, limit)
+        LOG.info('Claim successful on node %s', self.nodename,
+                 instance=self.instance)
 
     def _test_pci(self):
-        pci_requests = objects.InstancePCIRequests.get_by_instance_uuid(
-            self.context, self.instance['uuid'])
-
+        pci_requests = self._pci_requests
         if pci_requests.requests:
-            can_claim = self.tracker.pci_tracker.stats.support_requests(
-                pci_requests.requests)
-            if not can_claim:
-                return _('Claim pci failed.')
+            stats = self.tracker.pci_tracker.stats
+            if not stats.support_requests(
+                pci_requests.requests,
+                # We explicitly signal that we are _after_ the scheduler made
+                # allocations in placement and therefore pci_requests.requests
+                # carry its own placement provider mapping information
+                provider_mapping=None,
+            ):
+                return _('Claim pci failed')
 
-    def _test_ext_resources(self, limits):
-        return self.tracker.ext_resources_handler.test_resources(
-            self.instance, limits)
-
-    def _test_numa_topology(self, resources, limit):
-        host_topology = resources.get('numa_topology')
+    def _test_numa_topology(self, compute_node, limit):
+        host_topology = (compute_node.numa_topology
+                         if 'numa_topology' in compute_node else None)
         requested_topology = self.numa_topology
         if host_topology:
             host_topology = objects.NUMATopology.obj_from_db_obj(
                     host_topology)
-            pci_requests = objects.InstancePCIRequests.get_by_instance_uuid(
-                                        self.context, self.instance['uuid'])
+            pci_requests = self._pci_requests
+            pci_stats = self.tracker.pci_tracker.stats
 
-            pci_stats = None
-            if pci_requests.requests:
-                pci_stats = self.tracker.pci_tracker.stats
-
-            instance_topology = (
-                    hardware.numa_fit_instance_to_host(
-                        host_topology, requested_topology,
-                        limits=limit,
-                        pci_requests=pci_requests.requests,
-                        pci_stats=pci_stats))
+            instance_topology = hardware.numa_fit_instance_to_host(
+                host_topology,
+                requested_topology,
+                limits=limit,
+                pci_requests=pci_requests.requests,
+                pci_stats=pci_stats,
+                # We explicitly signal that we are _after_ the scheduler made
+                # allocations in placement and therefore pci_requests.requests
+                # carry its own placement provider mapping information
+                provider_mapping=None,
+            )
 
             if requested_topology and not instance_topology:
                 if pci_requests.requests:
-                    return (_("Requested instance NUMA topology together with"
-                              " requested PCI devices cannot fit the given"
-                              " host NUMA topology"))
+                    return (_("Requested instance NUMA topology together with "
+                              "requested PCI devices cannot fit the given "
+                              "host NUMA topology"))
                 else:
                     return (_("Requested instance NUMA topology cannot fit "
-                          "the given host NUMA topology"))
+                              "the given host NUMA topology"))
             elif instance_topology:
                 self.claimed_numa_topology = instance_topology
 
-    def _test(self, type_, unit, total, used, requested, limit):
-        """Test if the given type of resource needed for a claim can be safely
-        allocated.
-        """
-        LOG.info(_LI('Total %(type)s: %(total)d %(unit)s, used: %(used).02f '
-                    '%(unit)s'),
-                  {'type': type_, 'total': total, 'unit': unit, 'used': used},
-                  instance=self.instance)
 
-        if limit is None:
-            # treat resource as unlimited:
-            LOG.info(_LI('%(type)s limit not specified, defaulting to '
-                        'unlimited'), {'type': type_}, instance=self.instance)
-            return
+class MoveClaim(Claim):
+    """Claim used for holding resources for an incoming move operation.
 
-        free = limit - used
-
-        # Oversubscribed resource policy info:
-        LOG.info(_LI('%(type)s limit: %(limit).02f %(unit)s, '
-                     'free: %(free).02f %(unit)s'),
-                  {'type': type_, 'limit': limit, 'free': free, 'unit': unit},
-                  instance=self.instance)
-
-        if requested > free:
-            return (_('Free %(type)s %(free).02f '
-                      '%(unit)s < requested %(requested)d %(unit)s') %
-                      {'type': type_, 'free': free, 'unit': unit,
-                       'requested': requested})
-
-
-class ResizeClaim(Claim):
-    """Claim used for holding resources for an incoming resize/migration
-    operation.
+    Move can be either a migrate/resize, live-migrate or an evacuate operation.
     """
-    def __init__(self, context, instance, instance_type, image_meta, tracker,
-                 resources, overhead=None, limits=None):
+
+    def __init__(
+        self, context, instance, nodename, flavor, image_meta, tracker,
+        compute_node, pci_requests, migration, limits=None,
+    ):
         self.context = context
-        self.instance_type = instance_type
+        self.flavor = flavor
+        if isinstance(image_meta, dict):
+            image_meta = objects.ImageMeta.from_dict(image_meta)
         self.image_meta = image_meta
-        super(ResizeClaim, self).__init__(context, instance, tracker,
-                                          resources, overhead=overhead,
-                                          limits=limits)
-        self.migration = None
 
-    @property
-    def disk_gb(self):
-        return (self.instance_type['root_gb'] +
-                self.instance_type['ephemeral_gb'])
-
-    @property
-    def memory_mb(self):
-        return self.instance_type['memory_mb'] + self.overhead['memory_mb']
+        super().__init__(
+            context, instance, nodename, tracker, compute_node, pci_requests,
+            migration=migration, limits=limits,
+        )
 
     @property
     def numa_topology(self):
-        return hardware.numa_get_constraints(
-            self.instance_type, self.image_meta)
-
-    def _test_pci(self):
-        pci_requests = objects.InstancePCIRequests.\
-                       get_by_instance_uuid_and_newness(
-                           self.context, self.instance['uuid'], True)
-        if pci_requests.requests:
-            claim = self.tracker.pci_tracker.stats.support_requests(
-                pci_requests.requests)
-            if not claim:
-                return _('Claim pci failed.')
-
-    def _test_ext_resources(self, limits):
-        return self.tracker.ext_resources_handler.test_resources(
-            self.instance_type, limits)
+        return hardware.numa_get_constraints(self.flavor, self.image_meta)
 
     def abort(self):
         """Compute operation requiring claimed resources has failed or
         been aborted.
         """
-        LOG.debug("Aborting claim: %s" % self, instance=self.instance)
-        self.tracker.drop_resize_claim(
+        LOG.debug("Aborting claim: %s", self, instance=self.instance)
+        self.tracker.drop_move_claim(
             self.context,
-            self.instance, instance_type=self.instance_type,
-            image_meta=self.image_meta)
+            self.instance, self.nodename,
+            flavor=self.flavor)
+        self.instance.drop_migration_context()
+
+    def _test_live_migration_page_size(self):
+        """Tests that the current page size and the requested page size are the
+        same.
+
+        Must be called after _test_numa_topology() to make sure
+        self.claimed_numa_topology is set.
+
+        This only applies for live migrations when the hw:mem_page_size
+        extra spec has been set to a non-numeric value (like 'large'). That
+        would in theory allow an instance to live migrate from a host with a 1M
+        page size to a host with a 2M page size, for example. This is not
+        something we want to support, so fail the claim if the page sizes are
+        different.
+        """
+        if (self.migration.is_live_migration and
+                self.instance.numa_topology and
+                # NOTE(artom) We only support a single page size across all
+                # cells, checking cell 0 is sufficient.
+                self.claimed_numa_topology.cells[0].pagesize !=
+                self.instance.numa_topology.cells[0].pagesize):
+            return (_('Requested page size is different from current '
+                      'page size.'))
+
+    def _test_numa_topology(self, resources, limit):
+        """Test whether this host can accept the instance's NUMA topology. The
+        _test methods return None on success, and a string-like Message _()
+        object explaining the reason on failure. So we call up to the normal
+        Claim's _test_numa_topology(), and if we get nothing back we test the
+        page size.
+        """
+        numa_test_failure = super(MoveClaim,
+                                  self)._test_numa_topology(resources, limit)
+        if numa_test_failure:
+            return numa_test_failure
+        return self._test_live_migration_page_size()

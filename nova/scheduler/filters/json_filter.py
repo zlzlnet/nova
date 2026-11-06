@@ -17,7 +17,6 @@
 import operator
 
 from oslo_serialization import jsonutils
-import six
 
 from nova.scheduler import filters
 
@@ -26,6 +25,9 @@ class JsonFilter(filters.BaseHostFilter):
     """Host Filter to allow simple JSON-based grammar for
     selecting hosts.
     """
+
+    RUN_ON_REBUILD = False
+
     def _op_compare(self, args, op):
         """Returns True if the specified operator can successfully
         compare the first item in the args with all the rest. Will
@@ -119,21 +121,18 @@ class JsonFilter(filters.BaseHostFilter):
         for arg in query[1:]:
             if isinstance(arg, list):
                 arg = self._process_filter(arg, host_state)
-            elif isinstance(arg, six.string_types):
+            elif isinstance(arg, str):
                 arg = self._parse_string(arg, host_state)
             if arg is not None:
                 cooked_args.append(arg)
         result = method(self, cooked_args)
         return result
 
-    def host_passes(self, host_state, filter_properties):
+    def host_passes(self, host_state, spec_obj):
         """Return a list of hosts that can fulfill the requirements
         specified in the query.
         """
-        try:
-            query = filter_properties['scheduler_hints']['query']
-        except KeyError:
-            query = None
+        query = spec_obj.get_scheduler_hint('query')
         if not query:
             return True
 

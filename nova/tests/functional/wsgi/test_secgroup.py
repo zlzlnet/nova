@@ -17,13 +17,11 @@ import testscenarios
 
 from nova import test
 from nova.tests import fixtures as nova_fixtures
-from nova.tests.functional.v3 import api_paste_fixture
-import nova.tests.unit.image.fake
-from nova.tests.unit import policy_fixture
 
 LOG = logging.getLogger(__name__)
 
 
+# TODO(stephenfin): Add InstanceHelperMixin
 class SecgroupsFullstack(testscenarios.WithScenarios, test.TestCase):
     """Tests for security groups
 
@@ -33,28 +31,23 @@ class SecgroupsFullstack(testscenarios.WithScenarios, test.TestCase):
 
     """
     REQUIRES_LOCKING = True
-    _image_ref_parameter = 'imageRef'
-    _flavor_ref_parameter = 'flavorRef'
 
     # This test uses ``testscenarios`` which matrix multiplies the
-    # test across the scenarios listed below setting the attributres
+    # test across the scenarios listed below setting the attributes
     # in the dictionary on ``self`` for each scenario.
     scenarios = [
-        ('v2', {'_test': 'v2'}),  # regular base scenario, test the v2 api
-        ('v2_1', {'_test': 'v2.1'})  # test v2.1 api on the v2 api endpoint
+        ('v2', {'api_major_version': 'v2'}),
+        # test v2.1 base microversion
+        ('v2_1', {'api_major_version': 'v2.1'}),
     ]
 
     def setUp(self):
         super(SecgroupsFullstack, self).setUp()
-        self.useFixture(policy_fixture.RealPolicyFixture())
-        if self._test == 'v2.1':
-            self.useFixture(api_paste_fixture.ApiPasteFixture())
+        self.useFixture(nova_fixtures.RealPolicyFixture())
+        self.useFixture(nova_fixtures.GlanceFixture(self))
         api_fixture = self.useFixture(nova_fixtures.OSAPIFixture())
 
         self.api = api_fixture.api
-
-        # the image fake backend needed for image discovery
-        nova.tests.unit.image.fake.stub_out_image_service(self.stubs)
 
     # TODO(sdague): refactor this method into the API client, we're
     # going to use it a lot
@@ -62,21 +55,20 @@ class SecgroupsFullstack(testscenarios.WithScenarios, test.TestCase):
         server = {}
 
         image = self.api.get_images()[0]
-        LOG.info("Image: %s" % image)
+        LOG.info("Image: %s", image)
 
-        if self._image_ref_parameter in image:
-            image_href = image[self._image_ref_parameter]
+        if 'imageRef' in image:
+            image_href = image['imageRef']
         else:
             image_href = image['id']
             image_href = 'http://fake.server/%s' % image_href
 
         # We now have a valid imageId
-        server[self._image_ref_parameter] = image_href
+        server['imageRef'] = image_href
 
         # Set a valid flavorId
         flavor = self.api.get_flavors()[1]
-        server[self._flavor_ref_parameter] = ('http://fake.server/%s'
-                                              % flavor['id'])
+        server['flavorRef'] = 'http://fake.server/%s' % flavor['id']
         server['name'] = name
         return server
 

@@ -12,18 +12,24 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import collections
 import datetime
+import os
+from unittest import mock
 
-import iso8601
-import netaddr
-from oslo_utils import timeutils
+from oslo_serialization import jsonutils
 from oslo_versionedobjects import exception as ovo_exc
-import six
 
+from nova import exception
 from nova.network import model as network_model
-from nova.objects import base as obj_base
 from nova.objects import fields
 from nova import test
+from nova.tests.unit import fake_instance
+from nova import utils
+
+os_uname = collections.namedtuple(
+    'uname_result', ['sysname', 'nodename', 'release', 'version', 'machine'],
+)
 
 
 class FakeFieldType(fields.FieldType):
@@ -59,6 +65,14 @@ class FakeEnumAlt(fields.Enum):
     def __init__(self, **kwargs):
         super(FakeEnumAlt, self).__init__(valid_values=FakeEnumAlt.ALL,
                                           **kwargs)
+
+
+class FakeAddress(fields.AddressBase):
+    PATTERN = '[a-z]+[0-9]+'
+
+
+class FakeAddressField(fields.AutoTypedField):
+    AUTO_TYPE = FakeAddress()
 
 
 class FakeEnumField(fields.BaseEnumField):
@@ -109,8 +123,6 @@ class TestString(TestField):
         super(TestString, self).setUp()
         self.field = fields.StringField()
         self.coerce_good_values = [('foo', 'foo'), (1, '1'), (True, 'True')]
-        if six.PY2:
-            self.coerce_good_values.append((long(1), '1'))
         self.coerce_bad_values = [None]
         self.to_primitive_values = self.coerce_good_values[0:1]
         self.from_primitive_values = self.coerce_good_values[0:1]
@@ -150,8 +162,6 @@ class TestEnum(TestField):
         self.field = fields.EnumField(
             valid_values=['foo', 'bar', 1, 1, True])
         self.coerce_good_values = [('foo', 'foo'), (1, '1'), (True, 'True')]
-        if six.PY2:
-            self.coerce_good_values.append((long(1), '1'))
         self.coerce_bad_values = ['boo', 2, False]
         self.to_primitive_values = self.coerce_good_values[0:1]
         self.from_primitive_values = self.coerce_good_values[0:1]
@@ -179,270 +189,146 @@ class TestEnum(TestField):
 
 
 class TestArchitecture(TestField):
-    def setUp(self):
-        super(TestArchitecture, self).setUp()
-        self.field = fields.ArchitectureField()
-        self.coerce_good_values = [('x86_64', 'x86_64'),
-                                   ('amd64', 'x86_64'),
-                                   ('I686', 'i686'),
-                                   ('i386', 'i686')]
-        self.coerce_bad_values = ['x86_99']
-        self.to_primitive_values = self.coerce_good_values[0:1]
-        self.from_primitive_values = self.coerce_good_values[0:1]
+    @mock.patch.object(os, 'uname')
+    def test_host(self, mock_uname):
+        mock_uname.return_value = os_uname(
+            'Linux',
+            'localhost.localdomain',
+            '3.14.8-200.fc20.x86_64',
+            '#1 SMP Mon Jun 16 21:57:53 UTC 2014',
+            'i686'
+        )
 
-    def test_stringify(self):
-        self.assertEqual("'aarch64'", self.field.stringify('aarch64'))
+        self.assertEqual(fields.Architecture.I686,
+                         fields.Architecture.from_host())
 
-    def test_stringify_invalid(self):
-        self.assertRaises(ValueError, self.field.stringify, 'ppc42')
+    def test_valid_string(self):
+        self.assertTrue(fields.Architecture.is_valid('x86_64'))
 
+    def test_valid_constant(self):
+        self.assertTrue(fields.Architecture.is_valid(
+            fields.Architecture.X86_64))
 
-class TestCPUMode(TestField):
-    def setUp(self):
-        super(TestCPUMode, self).setUp()
-        self.field = fields.CPUModeField()
-        self.coerce_good_values = [('host-model', 'host-model'),
-                                   ('host-passthrough', 'host-passthrough'),
-                                   ('custom', 'custom')]
-        self.coerce_bad_values = ['magic']
-        self.to_primitive_values = self.coerce_good_values[0:1]
-        self.from_primitive_values = self.coerce_good_values[0:1]
+    def test_valid_bogus(self):
+        self.assertFalse(fields.Architecture.is_valid('x86_64wibble'))
 
-    def test_stringify(self):
-        self.assertEqual("'custom'", self.field.stringify('custom'))
+    def test_canonicalize_i386(self):
+        self.assertEqual(fields.Architecture.I686,
+                         fields.Architecture.canonicalize('i386'))
 
-    def test_stringify_invalid(self):
-        self.assertRaises(ValueError, self.field.stringify, 'magic')
+    def test_canonicalize_amd64(self):
+        self.assertEqual(fields.Architecture.X86_64,
+                         fields.Architecture.canonicalize('amd64'))
 
+    def test_canonicalize_case(self):
+        self.assertEqual(fields.Architecture.X86_64,
+                         fields.Architecture.canonicalize('X86_64'))
 
-class TestCPUMatch(TestField):
-    def setUp(self):
-        super(TestCPUMatch, self).setUp()
-        self.field = fields.CPUMatchField()
-        self.coerce_good_values = [('exact', 'exact'),
-                                   ('strict', 'strict'),
-                                   ('minimum', 'minimum')]
-        self.coerce_bad_values = ['best']
-        self.to_primitive_values = self.coerce_good_values[0:1]
-        self.from_primitive_values = self.coerce_good_values[0:1]
+    def test_canonicalize_compat_xen1(self):
+        self.assertEqual(fields.Architecture.I686,
+                         fields.Architecture.canonicalize('x86_32'))
 
-    def test_stringify(self):
-        self.assertEqual("'exact'", self.field.stringify('exact'))
+    def test_canonicalize_compat_xen2(self):
+        self.assertEqual(fields.Architecture.I686,
+                         fields.Architecture.canonicalize('x86_32p'))
 
-    def test_stringify_invalid(self):
-        self.assertRaises(ValueError, self.field.stringify, 'best')
-
-
-class TestCPUFeaturePolicy(TestField):
-    def setUp(self):
-        super(TestCPUFeaturePolicy, self).setUp()
-        self.field = fields.CPUFeaturePolicyField()
-        self.coerce_good_values = [('force', 'force'),
-                                   ('require', 'require'),
-                                   ('optional', 'optional'),
-                                   ('disable', 'disable'),
-                                   ('forbid', 'forbid')]
-        self.coerce_bad_values = ['disallow']
-        self.to_primitive_values = self.coerce_good_values[0:1]
-        self.from_primitive_values = self.coerce_good_values[0:1]
-
-    def test_stringify(self):
-        self.assertEqual("'forbid'", self.field.stringify('forbid'))
-
-    def test_stringify_invalid(self):
-        self.assertRaises(ValueError, self.field.stringify, 'disallow')
-
-
-class TestDiskBus(TestField):
-    def setUp(self):
-        super(TestDiskBus, self).setUp()
-        self.field = fields.DiskBusField()
-        self.coerce_good_values = [('fdc', 'fdc'),
-                                   ('ide', 'ide'),
-                                   ('sata', 'sata'),
-                                   ('scsi', 'scsi'),
-                                   ('usb', 'usb'),
-                                   ('virtio', 'virtio'),
-                                   ('xen', 'xen')]
-        self.coerce_bad_values = ['acme']
-        self.to_primitive_values = self.coerce_good_values[0:1]
-        self.from_primitive_values = self.coerce_good_values[0:1]
-
-    def test_stringify(self):
-        self.assertEqual("'ide'", self.field.stringify('ide'))
-
-    def test_stringify_invalid(self):
-        self.assertRaises(ValueError, self.field.stringify, 'acme')
+    def test_canonicalize_invalid(self):
+        self.assertRaises(exception.InvalidArchitectureName,
+                          fields.Architecture.canonicalize,
+                          'x86_64wibble')
 
 
 class TestHVType(TestField):
-    def setUp(self):
-        super(TestHVType, self).setUp()
-        self.field = fields.HVTypeField()
-        self.coerce_good_values = [('baremetal', 'baremetal'),
-                                   ('bhyve', 'bhyve'),
-                                   ('fake', 'fake'),
-                                   ('kvm', 'kvm'),
-                                   ('xapi', 'xen')]
-        self.coerce_bad_values = ['acme']
-        self.to_primitive_values = self.coerce_good_values[0:1]
-        self.from_primitive_values = self.coerce_good_values[0:1]
+    def test_valid_string(self):
+        self.assertTrue(fields.HVType.is_valid('vmware'))
 
-    def test_stringify(self):
-        self.assertEqual("'xen'", self.field.stringify('xen'))
+    def test_valid_constant(self):
+        self.assertTrue(fields.HVType.is_valid(fields.HVType.QEMU))
 
-    def test_stringify_invalid(self):
-        self.assertRaises(ValueError, self.field.stringify, 'acme')
+    def test_valid_docker(self):
+        self.assertTrue(fields.HVType.is_valid('docker'))
 
+    def test_valid_lxd(self):
+        self.assertTrue(fields.HVType.is_valid('lxd'))
 
-class TestOSType(TestField):
-    def setUp(self):
-        super(TestOSType, self).setUp()
-        self.field = fields.OSTypeField()
-        self.coerce_good_values = [('linux', 'linux'),
-                                   ('windows', 'windows'),
-                                   ('WINDOWS', 'windows')]
-        self.coerce_bad_values = ['acme']
-        self.to_primitive_values = self.coerce_good_values[0:1]
-        self.from_primitive_values = self.coerce_good_values[0:1]
+    def test_valid_vz(self):
+        self.assertTrue(fields.HVType.is_valid(
+            fields.HVType.VIRTUOZZO))
 
-    def test_stringify(self):
-        self.assertEqual("'linux'", self.field.stringify('linux'))
+    def test_valid_bogus(self):
+        self.assertFalse(fields.HVType.is_valid('acmehypervisor'))
 
-    def test_stringify_invalid(self):
-        self.assertRaises(ValueError, self.field.stringify, 'acme')
+    def test_canonicalize_none(self):
+        self.assertIsNone(fields.HVType.canonicalize(None))
 
+    def test_canonicalize_case(self):
+        self.assertEqual(fields.HVType.QEMU,
+                         fields.HVType.canonicalize('QeMu'))
 
-class TestRNGModel(TestField):
-    def setUp(self):
-        super(TestRNGModel, self).setUp()
-        self.field = fields.RNGModelField()
-        self.coerce_good_values = [('virtio', 'virtio'), ]
-        self.coerce_bad_values = ['acme']
-        self.to_primitive_values = self.coerce_good_values[0:1]
-        self.from_primitive_values = self.coerce_good_values[0:1]
+    def test_canonicalize_xapi(self):
+        self.assertEqual(fields.HVType.XEN,
+                         fields.HVType.canonicalize('xapi'))
 
-    def test_stringify(self):
-        self.assertEqual("'virtio'", self.field.stringify('virtio'))
-
-    def test_stringify_invalid(self):
-        self.assertRaises(ValueError, self.field.stringify, 'acme')
-
-
-class TestSCSIModel(TestField):
-    def setUp(self):
-        super(TestSCSIModel, self).setUp()
-        self.field = fields.SCSIModelField()
-        self.coerce_good_values = [('buslogic', 'buslogic'),
-                                   ('ibmvscsi', 'ibmvscsi'),
-                                   ('lsilogic', 'lsilogic'),
-                                   ('lsisas1068', 'lsisas1068'),
-                                   ('lsisas1078', 'lsisas1078'),
-                                   ('virtio-scsi', 'virtio-scsi'),
-                                   ('vmpvscsi', 'vmpvscsi'),
-                                   ('lsilogicsas', 'lsisas1068'),
-                                   ('paravirtual', 'vmpvscsi')]
-        self.coerce_bad_values = ['acme']
-        self.to_primitive_values = self.coerce_good_values[0:1]
-        self.from_primitive_values = self.coerce_good_values[0:1]
-
-    def test_stringify(self):
-        self.assertEqual("'vmpvscsi'", self.field.stringify('vmpvscsi'))
-
-    def test_stringify_invalid(self):
-        self.assertRaises(ValueError, self.field.stringify, 'acme')
-
-
-class TestVideoModel(TestField):
-    def setUp(self):
-        super(TestVideoModel, self).setUp()
-        self.field = fields.VideoModelField()
-        self.coerce_good_values = [('cirrus', 'cirrus'),
-                                   ('qxl', 'qxl'),
-                                   ('vga', 'vga'),
-                                   ('vmvga', 'vmvga'),
-                                   ('xen', 'xen')]
-
-        self.coerce_bad_values = ['acme']
-        self.to_primitive_values = self.coerce_good_values[0:1]
-        self.from_primitive_values = self.coerce_good_values[0:1]
-
-    def test_stringify(self):
-        self.assertEqual("'cirrus'", self.field.stringify('cirrus'))
-
-    def test_stringify_invalid(self):
-        self.assertRaises(ValueError, self.field.stringify, 'acme')
-
-
-class TestVIFModel(TestField):
-    def setUp(self):
-        super(TestVIFModel, self).setUp()
-        self.field = fields.VIFModelField()
-        self.coerce_good_values = [('virtio', 'virtio'),
-                                   ('ne2k_pci', 'ne2k_pci'),
-                                   ('pcnet', 'pcnet'),
-                                   ('rtl8139', 'rtl8139'),
-                                   ('e1000', 'e1000'),
-                                   ('e1000e', 'e1000e'),
-                                   ('netfront', 'netfront'),
-                                   ('spapr-vlan', 'spapr-vlan'),
-                                   ('VirtualE1000', 'e1000'),
-                                   ('VirtualE1000e', 'e1000e'),
-                                   ('VirtualPCNet32', 'pcnet'),
-                                   ('VirtualSriovEthernetCard', 'sriov'),
-                                   ('VirtualVmxnet', 'vmxnet'),
-                                   ('VirtualVmxnet3', 'vmxnet3'),
-                                  ]
-        self.coerce_bad_values = ['acme']
-        self.to_primitive_values = self.coerce_good_values[0:1]
-        self.from_primitive_values = self.coerce_good_values[0:1]
-
-    def test_stringify(self):
-        self.assertEqual("'e1000'", self.field.stringify('e1000'))
-
-    def test_stringify_invalid(self):
-        self.assertRaises(ValueError, self.field.stringify, 'acme')
+    def test_canonicalize_invalid(self):
+        self.assertRaises(exception.InvalidHypervisorVirtType,
+                          fields.HVType.canonicalize,
+                          'wibble')
 
 
 class TestVMMode(TestField):
-    def setUp(self):
-        super(TestVMMode, self).setUp()
-        self.field = fields.VMModeField()
-        self.coerce_good_values = [('hvm', 'hvm'),
-                                   ('xen', 'xen'),
-                                   ('uml', 'uml'),
-                                   ('exe', 'exe'),
-                                   ('pv', 'xen'),
-                                   ('hv', 'hvm'),
-                                   ('baremetal', 'hvm')]
-        self.coerce_bad_values = ['acme']
-        self.to_primitive_values = self.coerce_good_values[0:1]
-        self.from_primitive_values = self.coerce_good_values[0:1]
+    def _fake_object(self, updates):
+        return fake_instance.fake_instance_obj(None, **updates)
 
-    def test_stringify(self):
-        self.assertEqual("'hvm'", self.field.stringify('hvm'))
+    def test_case(self):
+        inst = self._fake_object(dict(vm_mode='HVM'))
+        mode = fields.VMMode.get_from_instance(inst)
+        self.assertEqual(mode, 'hvm')
 
-    def test_stringify_invalid(self):
-        self.assertRaises(ValueError, self.field.stringify, 'acme')
+    def test_legacy_pv(self):
+        inst = self._fake_object(dict(vm_mode='pv'))
+        mode = fields.VMMode.get_from_instance(inst)
+        self.assertEqual(mode, 'xen')
 
+    def test_legacy_hv(self):
+        inst = self._fake_object(dict(vm_mode='hv'))
+        mode = fields.VMMode.get_from_instance(inst)
+        self.assertEqual(mode, 'hvm')
 
-class TestWatchdogAction(TestField):
-    def setUp(self):
-        super(TestWatchdogAction, self).setUp()
-        self.field = fields.WatchdogActionField()
-        self.coerce_good_values = [('none', 'none'),
-                                   ('pause', 'pause'),
-                                   ('poweroff', 'poweroff'),
-                                   ('reset', 'reset')]
-        self.coerce_bad_values = ['acme']
-        self.to_primitive_values = self.coerce_good_values[0:1]
-        self.from_primitive_values = self.coerce_good_values[0:1]
+    def test_bogus(self):
+        inst = self._fake_object(dict(vm_mode='wibble'))
+        self.assertRaises(exception.Invalid,
+                          fields.VMMode.get_from_instance,
+                          inst)
 
-    def test_stringify(self):
-        self.assertEqual("'reset'", self.field.stringify('reset'))
+    def test_good(self):
+        inst = self._fake_object(dict(vm_mode='hvm'))
+        mode = fields.VMMode.get_from_instance(inst)
+        self.assertEqual(mode, 'hvm')
 
-    def test_stringify_invalid(self):
-        self.assertRaises(ValueError, self.field.stringify, 'acme')
+    def test_canonicalize_pv_compat(self):
+        mode = fields.VMMode.canonicalize('pv')
+        self.assertEqual(fields.VMMode.XEN, mode)
+
+    def test_canonicalize_hv_compat(self):
+        mode = fields.VMMode.canonicalize('hv')
+        self.assertEqual(fields.VMMode.HVM, mode)
+
+    def test_canonicalize_baremetal_compat(self):
+        mode = fields.VMMode.canonicalize('baremetal')
+        self.assertEqual(fields.VMMode.HVM, mode)
+
+    def test_canonicalize_hvm(self):
+        mode = fields.VMMode.canonicalize('hvm')
+        self.assertEqual(fields.VMMode.HVM, mode)
+
+    def test_canonicalize_none(self):
+        mode = fields.VMMode.canonicalize(None)
+        self.assertIsNone(mode)
+
+    def test_canonicalize_invalid(self):
+        self.assertRaises(exception.InvalidVirtualMachineMode,
+                          fields.VMMode.canonicalize,
+                          'invalid')
 
 
 class TestInteger(TestField):
@@ -455,6 +341,13 @@ class TestInteger(TestField):
         self.from_primitive_values = self.coerce_good_values[0:1]
 
 
+class TestNonNegativeInteger(TestInteger):
+    def setUp(self):
+        super(TestNonNegativeInteger, self).setUp()
+        self.field = fields.NonNegativeIntegerField()
+        self.coerce_bad_values.extend(['-2', '4.2'])
+
+
 class TestFloat(TestField):
     def setUp(self):
         super(TestFloat, self).setUp()
@@ -463,6 +356,13 @@ class TestFloat(TestField):
         self.coerce_bad_values = ['foo', None]
         self.to_primitive_values = self.coerce_good_values[0:1]
         self.from_primitive_values = self.coerce_good_values[0:1]
+
+
+class TestNonNegativeFloat(TestFloat):
+    def setUp(self):
+        super(TestNonNegativeFloat, self).setUp()
+        self.field = fields.NonNegativeFloatField()
+        self.coerce_bad_values.extend(['-4.2'])
 
 
 class TestBoolean(TestField):
@@ -476,83 +376,23 @@ class TestBoolean(TestField):
         self.from_primitive_values = self.coerce_good_values[0:2]
 
 
-class TestFlexibleBoolean(TestField):
-    def setUp(self):
-        super(TestFlexibleBoolean, self).setUp()
-        self.field = fields.FlexibleBooleanField()
-        self.coerce_good_values = [(True, True), (False, False),
-                                   ("true", True), ("false", False),
-                                   ("t", True), ("f", False),
-                                   ("yes", True), ("no", False),
-                                   ("y", True), ("n", False),
-                                   ("on", True), ("off", False),
-                                   (1, True), (0, False),
-                                   ('frog', False), ('', False)]
-        self.coerce_bad_values = []
-        self.to_primitive_values = self.coerce_good_values[0:2]
-        self.from_primitive_values = self.coerce_good_values[0:2]
-
-
 class TestDateTime(TestField):
     def setUp(self):
         super(TestDateTime, self).setUp()
-        self.dt = datetime.datetime(1955, 11, 5, tzinfo=iso8601.iso8601.Utc())
+        self.dt = datetime.datetime(1955, 11, 5, tzinfo=datetime.UTC)
         self.field = fields.DateTimeField()
         self.coerce_good_values = [(self.dt, self.dt),
-                                   (timeutils.isotime(self.dt), self.dt)]
+                                   (utils.isotime(self.dt), self.dt)]
         self.coerce_bad_values = [1, 'foo']
-        self.to_primitive_values = [(self.dt, timeutils.isotime(self.dt))]
-        self.from_primitive_values = [(timeutils.isotime(self.dt), self.dt)]
+        self.to_primitive_values = [(self.dt, utils.isotime(self.dt))]
+        self.from_primitive_values = [(utils.isotime(self.dt), self.dt)]
 
     def test_stringify(self):
         self.assertEqual(
             '1955-11-05T18:00:00Z',
             self.field.stringify(
                 datetime.datetime(1955, 11, 5, 18, 0, 0,
-                                  tzinfo=iso8601.iso8601.Utc())))
-
-
-class TestIPAddress(TestField):
-    def setUp(self):
-        super(TestIPAddress, self).setUp()
-        self.field = fields.IPAddressField()
-        self.coerce_good_values = [('1.2.3.4', netaddr.IPAddress('1.2.3.4')),
-                                   ('::1', netaddr.IPAddress('::1')),
-                                   (netaddr.IPAddress('::1'),
-                                    netaddr.IPAddress('::1'))]
-        self.coerce_bad_values = ['1-2', 'foo']
-        self.to_primitive_values = [(netaddr.IPAddress('1.2.3.4'), '1.2.3.4'),
-                                    (netaddr.IPAddress('::1'), '::1')]
-        self.from_primitive_values = [('1.2.3.4',
-                                       netaddr.IPAddress('1.2.3.4')),
-                                      ('::1',
-                                       netaddr.IPAddress('::1'))]
-
-
-class TestIPAddressV4(TestField):
-    def setUp(self):
-        super(TestIPAddressV4, self).setUp()
-        self.field = fields.IPV4AddressField()
-        self.coerce_good_values = [('1.2.3.4', netaddr.IPAddress('1.2.3.4')),
-                                   (netaddr.IPAddress('1.2.3.4'),
-                                    netaddr.IPAddress('1.2.3.4'))]
-        self.coerce_bad_values = ['1-2', 'foo', '::1']
-        self.to_primitive_values = [(netaddr.IPAddress('1.2.3.4'), '1.2.3.4')]
-        self.from_primitive_values = [('1.2.3.4',
-                                       netaddr.IPAddress('1.2.3.4'))]
-
-
-class TestIPAddressV6(TestField):
-    def setUp(self):
-        super(TestIPAddressV6, self).setUp()
-        self.field = fields.IPV6AddressField()
-        self.coerce_good_values = [('::1', netaddr.IPAddress('::1')),
-                                   (netaddr.IPAddress('::1'),
-                                    netaddr.IPAddress('::1'))]
-        self.coerce_bad_values = ['1.2', 'foo', '1.2.3.4']
-        self.to_primitive_values = [(netaddr.IPAddress('::1'), '::1')]
-        self.from_primitive_values = [('::1',
-                                       netaddr.IPAddress('::1'))]
+                                  tzinfo=datetime.UTC)))
 
 
 class TestDict(TestField):
@@ -706,48 +546,11 @@ class TestListOfSetsOfIntegers(TestField):
         self.assertEqual('[set([1,2])]', self.field.stringify([set([1, 2])]))
 
 
-class TestObject(TestField):
-    def setUp(self):
-        super(TestObject, self).setUp()
-
-        class TestableObject(obj_base.NovaObject):
-            fields = {
-                'uuid': fields.StringField(),
-                }
-
-            def __eq__(self, value):
-                # NOTE(danms): Be rather lax about this equality thing to
-                # satisfy the assertEqual() in test_from_primitive(). We
-                # just want to make sure the right type of object is re-created
-                return value.__class__.__name__ == TestableObject.__name__
-
-        class OtherTestableObject(obj_base.NovaObject):
-            pass
-
-        obj_base.NovaObjectRegistry.register(TestableObject)
-        obj_base.NovaObjectRegistry.register(OtherTestableObject)
-
-        test_inst = TestableObject()
-        self._test_cls = TestableObject
-        self.field = fields.Field(fields.Object('TestableObject'))
-        self.coerce_good_values = [(test_inst, test_inst)]
-        self.coerce_bad_values = [OtherTestableObject(), 1, 'foo']
-        self.to_primitive_values = [(test_inst, test_inst.obj_to_primitive())]
-        self.from_primitive_values = [(test_inst.obj_to_primitive(),
-                                       test_inst),
-                                       (test_inst, test_inst)]
-
-    def test_stringify(self):
-        obj = self._test_cls(uuid='fake-uuid')
-        self.assertEqual('TestableObject(fake-uuid)',
-                         self.field.stringify(obj))
-
-
 class TestNetworkModel(TestField):
     def setUp(self):
         super(TestNetworkModel, self).setUp()
         model = network_model.NetworkInfo()
-        self.field = fields.Field(fields.NetworkModel())
+        self.field = fields.NetworkModelField()
         self.coerce_good_values = [(model, model), (model.json(), model)]
         self.coerce_bad_values = [[], 'foo']
         self.to_primitive_values = [(model, model.json())]
@@ -761,43 +564,181 @@ class TestNetworkModel(TestField):
                          self.field.stringify(networkinfo))
 
 
-class TestIPNetwork(TestField):
+class TestNetworkVIFModel(TestField):
     def setUp(self):
-        super(TestIPNetwork, self).setUp()
-        self.field = fields.Field(fields.IPNetwork())
-        good = ['192.168.1.0/24', '0.0.0.0/0', '::1/128', '::1/64', '::1/0']
-        self.coerce_good_values = [(x, netaddr.IPNetwork(x)) for x in good]
-        self.coerce_bad_values = ['192.168.0.0/f', '192.168.0.0/foo',
-                                  '::1/129', '192.168.0.0/-1']
-        self.to_primitive_values = [(netaddr.IPNetwork(x), x)
-                                    for x in good]
-        self.from_primitive_values = [(x, netaddr.IPNetwork(x))
-                                      for x in good]
+        super(TestNetworkVIFModel, self).setUp()
+        model = network_model.VIF('6c197bc7-820c-40d5-8aff-7116b993e793')
+        primitive = jsonutils.dumps(model)
+        self.field = fields.NetworkVIFModelField()
+        self.coerce_good_values = [(model, model), (primitive, model)]
+        self.coerce_bad_values = [[], 'foo']
+        self.to_primitive_values = [(model, primitive)]
+        self.from_primitive_values = [(primitive, model)]
 
 
-class TestIPV4Network(TestField):
+class TestNotificationPriority(TestField):
     def setUp(self):
-        super(TestIPV4Network, self).setUp()
-        self.field = fields.Field(fields.IPV4Network())
-        good = ['192.168.1.0/24', '0.0.0.0/0']
-        self.coerce_good_values = [(x, netaddr.IPNetwork(x)) for x in good]
-        self.coerce_bad_values = ['192.168.0.0/f', '192.168.0.0/foo',
-                                  '::1/129', '192.168.0.0/-1']
-        self.to_primitive_values = [(netaddr.IPNetwork(x), x)
-                                    for x in good]
-        self.from_primitive_values = [(x, netaddr.IPNetwork(x))
-                                      for x in good]
+        super(TestNotificationPriority, self).setUp()
+        self.field = fields.NotificationPriorityField()
+        self.coerce_good_values = [('audit', 'audit'),
+                                   ('critical', 'critical'),
+                                   ('debug', 'debug'),
+                                   ('error', 'error'),
+                                   ('sample', 'sample'),
+                                   ('warn', 'warn')]
+        self.coerce_bad_values = ['warning']
+        self.to_primitive_values = self.coerce_good_values[0:1]
+        self.from_primitive_values = self.coerce_good_values[0:1]
+
+    def test_stringify(self):
+        self.assertEqual("'warn'", self.field.stringify('warn'))
+
+    def test_stringify_invalid(self):
+        self.assertRaises(ValueError, self.field.stringify, 'warning')
 
 
-class TestIPV6Network(TestField):
+class TestNotificationPhase(TestField):
     def setUp(self):
-        super(TestIPV6Network, self).setUp()
-        self.field = fields.Field(fields.IPV6Network())
-        good = ['::1/128', '::1/64', '::1/0']
-        self.coerce_good_values = [(x, netaddr.IPNetwork(x)) for x in good]
-        self.coerce_bad_values = ['192.168.0.0/f', '192.168.0.0/foo',
-                                  '::1/129', '192.168.0.0/-1']
-        self.to_primitive_values = [(netaddr.IPNetwork(x), x)
-                                    for x in good]
-        self.from_primitive_values = [(x, netaddr.IPNetwork(x))
-                                      for x in good]
+        super(TestNotificationPhase, self).setUp()
+        self.field = fields.NotificationPhaseField()
+        self.coerce_good_values = [('start', 'start'),
+                                   ('end', 'end'),
+                                   ('error', 'error')]
+        self.coerce_bad_values = ['begin']
+        self.to_primitive_values = self.coerce_good_values[0:1]
+        self.from_primitive_values = self.coerce_good_values[0:1]
+
+    def test_stringify(self):
+        self.assertEqual("'error'", self.field.stringify('error'))
+
+    def test_stringify_invalid(self):
+        self.assertRaises(ValueError, self.field.stringify, 'begin')
+
+
+class TestNotificationAction(TestField):
+    def setUp(self):
+        super(TestNotificationAction, self).setUp()
+        self.field = fields.NotificationActionField()
+        self.coerce_good_values = [('update', 'update')]
+        self.coerce_bad_values = ['magic']
+        self.to_primitive_values = self.coerce_good_values[0:1]
+        self.from_primitive_values = self.coerce_good_values[0:1]
+
+    def test_stringify(self):
+        self.assertEqual("'update'", self.field.stringify('update'))
+
+    def test_stringify_invalid(self):
+        self.assertRaises(ValueError, self.field.stringify, 'magic')
+
+
+class TestUSBAddress(TestField):
+    def setUp(self):
+        super(TestUSBAddress, self).setUp()
+        self.field = fields.Field(fields.USBAddressField())
+        self.coerce_good_values = [('0:0', '0:0')]
+        self.coerce_bad_values = [
+            '00',
+            '0:',
+            '0.0',
+            '-.0',
+        ]
+        self.to_primitive_values = self.coerce_good_values
+        self.from_primitive_values = self.coerce_good_values
+
+
+class TestSCSIAddress(TestField):
+    def setUp(self):
+        super(TestSCSIAddress, self).setUp()
+        self.field = fields.Field(fields.SCSIAddressField())
+        self.coerce_good_values = [('1:0:2:0', '1:0:2:0')]
+        self.coerce_bad_values = [
+                '1:0:2',
+                '-:0:2:0',
+                '1:-:2:0',
+                '1:0:-:0',
+                '1:0:2:-',
+        ]
+        self.to_primitive_values = self.coerce_good_values
+        self.from_primitive_values = self.coerce_good_values
+
+
+class TestIDEAddress(TestField):
+    def setUp(self):
+        super(TestIDEAddress, self).setUp()
+        self.field = fields.Field(fields.IDEAddressField())
+        self.coerce_good_values = [('0:0', '0:0')]
+        self.coerce_bad_values = [
+            '0:2',
+            '00',
+            '0',
+        ]
+        self.to_primitive_values = self.coerce_good_values
+        self.from_primitive_values = self.coerce_good_values
+
+
+class TestXenAddress(TestField):
+    def setUp(self):
+        super(TestXenAddress, self).setUp()
+        self.field = fields.Field(fields.XenAddressField())
+        self.coerce_good_values = [('000100', '000100'),
+                                   ('768', '768')]
+        self.coerce_bad_values = [
+            '1',
+            '00100',
+        ]
+        self.to_primitive_values = self.coerce_good_values
+        self.from_primitive_values = self.coerce_good_values
+
+
+class TestMemEncryptionModel(TestField):
+    def setUp(self):
+        super(TestMemEncryptionModel, self).setUp()
+        self.field = fields.MemEncryptionModel()
+        self.coerce_good_values = [('amd-sev', 'amd-sev'),
+                                   ('amd-sev-es', 'amd-sev-es'),
+                                   ('amd-sev-snp', 'amd-sev-snp')]
+        self.coerce_bad_values = ['amd-sev-foo']
+        self.to_primitive_values = self.coerce_good_values[0:1]
+        self.from_primitive_values = self.coerce_good_values[0:1]
+
+    def test_stringify(self):
+        self.assertEqual("'amd-sev'", self.field.stringify('amd-sev'))
+
+    def test_stringify_invalid(self):
+        self.assertRaises(ValueError, self.field.stringify, 'amd-sev-foo')
+
+
+class TestSecureBoot(TestField):
+    def setUp(self):
+        super(TestSecureBoot, self).setUp()
+        self.field = fields.SecureBoot()
+        self.coerce_good_values = [('required', 'required'),
+                                   ('disabled', 'disabled'),
+                                   ('optional', 'optional')]
+        self.coerce_bad_values = ['enabled']
+        self.to_primitive_values = self.coerce_good_values[0:1]
+        self.from_primitive_values = self.coerce_good_values[0:1]
+
+    def test_stringify(self):
+        self.assertEqual("'required'", self.field.stringify('required'))
+
+    def test_stringify_invalid(self):
+        self.assertRaises(ValueError, self.field.stringify, 'enabled')
+
+
+class TestSchemaGeneration(test.NoDBTestCase):
+    def test_address_base_get_schema(self):
+        field = FakeAddressField()
+        expected = {'type': ['string'], 'pattern': '[a-z]+[0-9]+',
+                    'readonly': False}
+        self.assertEqual(expected, field.get_schema())
+
+
+class TestNotificationSource(test.NoDBTestCase):
+    def test_get_source_by_binary(self):
+        self.assertEqual('nova-api',
+                         fields.NotificationSource.get_source_by_binary(
+                             'nova-osapi_compute'))
+        self.assertEqual('nova-metadata',
+                         fields.NotificationSource.get_source_by_binary(
+                             'nova-metadata'))

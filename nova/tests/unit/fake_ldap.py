@@ -24,8 +24,6 @@ library to work with nova.
 import fnmatch
 
 from oslo_serialization import jsonutils
-import six
-from six.moves import range
 
 
 class Store(object):
@@ -123,12 +121,12 @@ def _match_query(query, attrs):
     inner = query[1:-1]
     if inner.startswith('&'):
         # cut off the &
-        l, r = _paren_groups(inner[1:])
-        return _match_query(l, attrs) and _match_query(r, attrs)
+        left, right = _paren_groups(inner[1:])
+        return _match_query(left, attrs) and _match_query(right, attrs)
     if inner.startswith('|'):
         # cut off the |
-        l, r = _paren_groups(inner[1:])
-        return _match_query(l, attrs) or _match_query(r, attrs)
+        left, right = _paren_groups(inner[1:])
+        return _match_query(left, attrs) or _match_query(right, attrs)
     if inner.startswith('!'):
         # cut off the ! and the nested parentheses
         return not _match_query(query[2:-1], attrs)
@@ -313,11 +311,11 @@ class FakeLDAP(object):
             # get the attributes from the store
             attrs = store.hgetall(key)
             # turn the values from the store into lists
-            attrs = {k: _from_json(v) for k, v in six.iteritems(attrs)}
+            attrs = {k: _from_json(v) for k, v in attrs.items()}
             # filter the objects by query
             if not query or _match_query(query, attrs):
                 # filter the attributes by fields
-                attrs = {k: v for k, v in six.iteritems(attrs)
+                attrs = {k: v for k, v in attrs.items()
                          if not fields or k in fields}
                 objects.append((key[len(self.__prefix):], attrs))
         return objects
